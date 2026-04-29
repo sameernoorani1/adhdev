@@ -1,0 +1,41 @@
+node_modules/
+.next/
+.adhdev/uploads/
+.adhdev/terminal-history/
+.claude-tmp/
+*.tsbuildinfo
+
+# Board state — keep all internal product discussions out of the repo
+.adhdev/board.json
+.adhdev/chat.json
+.adhdev/config.json
+
+# Private strategy docs — never goes to the repo
+docs/
+
+# Atomic-write temp files
+.adhdev/board.json.tmp-*
+
+# System / env
+*.log
+.DS_Store
+.env
+.env.local
+
+# Leftover dev state
+pending-mentions.json
+.claude-preview/
+
+# User-specific generated output (regenerated per-project by `adhdev init`)
+ADHDEV.md
+CLAUDE.md
+
+# Stray dev artifacts
+Codebase 1.zip
+.relates.txt
+.tags.txt
+*.bak
+─────────────────────────────────────────────────────────────────
+
+# Per-user Claude Code permissions (shared settings.json, if any, stays tracked)
+.claude/settings.local.json

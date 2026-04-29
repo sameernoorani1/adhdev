@@ -1,0 +1,200 @@
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   ADHDev — Theme Variables (CSS Custom Properties)
+   Dark theme is default.
+   ============================================================ */
+:root {
+  --vd-bg-primary: 10 10 10;
+  --vd-bg-secondary: 20 20 20;
+  --vd-bg-tertiary: 30 30 30;
+  --vd-bg-hover: 38 38 38;
+  --vd-bg-input: 17 17 17;
+  --vd-text-primary: 236 236 236;
+  --vd-text-secondary: 153 153 153;
+  --vd-text-tertiary: 102 102 102;
+  --vd-text-inverse: 10 10 10;
+  --vd-border: 31 31 31;
+  --vd-border-light: 42 42 42;
+}
+
+/* ============================================================
+   ADHDev — Global Base Styles
+   ============================================================ */
+@layer base {
+  html {
+    @apply antialiased;
+  }
+
+  body {
+    @apply bg-vd-bg-primary text-vd-text-primary font-sans;
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--vd-border));
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--vd-border-light));
+}
+
+@keyframes vd-restack {
+  0% {
+    opacity: 0.35;
+    transform: translateY(10px) scale(0.985);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.vd-restack-active .vd-restack-column,
+.vd-restack-column.vd-restack-active {
+  animation: vd-restack 0.7s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* AD-053: shimmer sweep over cards that are currently being worked on by a coding agent */
+@keyframes adhdev-card-shimmer-sweep {
+  0%   { transform: translateX(-120%); }
+  100% { transform: translateX(120%); }
+}
+.adhdev-card-shimmer {
+  position: relative;
+}
+.adhdev-card-shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    105deg,
+    transparent 35%,
+    rgba(96, 165, 250, 0.12) 48%,
+    rgba(96, 165, 250, 0.2) 50%,
+    rgba(96, 165, 250, 0.12) 52%,
+    transparent 65%
+  );
+  transform: translateX(-120%);
+  animation: adhdev-card-shimmer-sweep 2.4s linear infinite;
+}
+
+/* 8-bit agent mascot — clips the 4-frame sprite to one frame at a time and
+   steps through them in a loop. Each mascot component owns its duration via
+   inline `animationDuration`. `image-rendering: pixelated` keeps the 8-bit
+   chunk at any scale. AD-147: dark rounded backdrop separates the character
+   from the card's tint/shimmer so it reads against any skin. */
+.adhdev-mascot {
+  position: relative;
+  image-rendering: pixelated;
+  image-rendering: -moz-crisp-edges;
+  /* AD-152: backdrop now feathers to transparent at the edges instead of a
+     hard-edged rounded rectangle. Radial gradient fades from ~65% opacity at
+     the center to 0% at the edges so the mascot blends into the card chrome.
+     The gradient uses the current mode's bg-tertiary so it works in both
+     dark and light. No more sharp patch shape. */
+  background: radial-gradient(ellipse at center,
+    rgb(var(--vd-bg-tertiary) / 0.65) 0%,
+    rgb(var(--vd-bg-tertiary) / 0.35) 55%,
+    rgb(var(--vd-bg-tertiary) / 0)    100%);
+  /* No overflow:hidden — we want the sprite's steps() animation to clip via
+     the inner wrapper only (see .adhdev-mascot-clip). No shadow either; the
+     feathered backdrop does the visual separation without a hard drop. */
+}
+/* The sprite needs its own clip so the four-frame strip still only reveals
+   one frame at a time. Previously .adhdev-mascot did double duty (backdrop +
+   clip). Now they're separated. */
+.adhdev-mascot-clip {
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+}
+.adhdev-mascot-sprite {
+  display: block;
+  animation-name: adhdev-mascot-step;
+  animation-duration: 1.2s;
+  animation-timing-function: steps(4);
+  animation-iteration-count: infinite;
+  will-change: transform;
+}
+@keyframes adhdev-mascot-step {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-100%); }
+}
+
+/* AD-143: coach-mark entry animation — slight slide + fade for flare without drawing too much attention. */
+@keyframes adhdev-coach-enter {
+  0%   { opacity: 0; transform: translateY(6px) scale(0.96); }
+  100% { opacity: 1; transform: translateY(0)   scale(1);    }
+}
+.adhdev-coach-enter {
+  animation: adhdev-coach-enter 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* AD-165: loading screen personality — slow brain glow + tagline crossfade + bouncing pixel dots. */
+@keyframes adhdev-loading-glow {
+  0%, 100% { opacity: 0.55; transform: scale(1);    filter: drop-shadow(0 0 6px rgba(245, 185, 127, 0.25)); }
+  50%      { opacity: 1;    transform: scale(1.04); filter: drop-shadow(0 0 18px rgba(245, 185, 127, 0.55)); }
+}
+.adhdev-loading-glow {
+  animation: adhdev-loading-glow 2.4s ease-in-out infinite;
+  color: #F5B97F;
+}
+@keyframes adhdev-loading-fade {
+  0%, 100% { opacity: 0; transform: translateY(2px); }
+  18%, 82% { opacity: 1; transform: translateY(0);   }
+}
+.adhdev-loading-tagline {
+  animation: adhdev-loading-fade 3.6s ease-in-out infinite;
+}
+@keyframes adhdev-loading-bounce {
+  0%, 80%, 100% { transform: translateY(0);   opacity: 0.45; }
+  40%           { transform: translateY(-6px); opacity: 1;    }
+}
+.adhdev-loading-dot {
+  width: 6px;
+  height: 6px;
+  background: #F5B97F;
+  image-rendering: pixelated;
+  animation: adhdev-loading-bounce 1.1s ease-in-out infinite;
+}
+.adhdev-loading-dot:nth-child(2) { animation-delay: 0.15s; }
+.adhdev-loading-dot:nth-child(3) { animation-delay: 0.30s; }
+
+/* AD-126 reopen: dedicated class for unread AI responses. The previous
+   approach (`bg-vd-accent-gold/[0.06]`) produced a tint so faint users
+   reported it as "not highlighted". This overlay uses a bolder gold gradient
+   via ::before, a solid 3px gold left strip, and a soft accent ring — all
+   composable with the default card bg and the executing shimmer. */
+.adhdev-card-unread {
+  box-shadow: inset 3px 0 0 0 #F5B97F, 0 0 0 1px rgba(245, 185, 127, 0.28);
+}
+.adhdev-card-unread::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    100deg,
+    rgba(245, 185, 127, 0.18) 0%,
+    rgba(245, 185, 127, 0.08) 35%,
+    transparent 70%
+  );
+}

@@ -1,0 +1,59 @@
+{
+  "name": "adhdev",
+  "version": "0.1.0",
+  "description": "AI agent control plane for developers — track, trigger, and review AI coding work from a single board.",
+  "bin": {
+    "adhdev": "./cli/index.mjs"
+  },
+  "files": [
+    "cli",
+    "server",
+    "public",
+    ".next",
+    "next.config.mjs",
+    "tsconfig.json",
+    "ADHDEV.md",
+    "README.md"
+  ],
+  "scripts": {
+    "dev": "next dev -p 3111",
+    "dev:full": "node server/terminal.mjs & next dev -p 3111",
+    "terminal": "node server/terminal.mjs",
+    "build": "next build",
+    "start": "next start -p 3111",
+    "lint": "next lint",
+    "prepack": "next build",
+    "upgrade-claude": "npm i -g @anthropic-ai/claude-code@latest"
+  },
+  "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/xterm": "^6.0.0",
+    "exit": "^0.1.2",
+    "next": "^15.3.0",
+    "node-pty": "^1.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "autoprefixer": "^10.4.27",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^3.4.19",
+    "typescript": "^5.7.0"
+  },
+  "keywords": [
+    "claude-code",
+    "ai",
+    "developer-tools",
+    "kanban",
+    "agent"
+  ],
+  "license": "Apache-2.0"
+}

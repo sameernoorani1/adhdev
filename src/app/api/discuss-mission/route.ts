@@ -21,6 +21,7 @@ export async function POST(request: NextRequest) {
             missionId,
         }, { status: result.success ? 200 : 409 });
     } catch (err) {
+        console.error('[ADHDev] POST /api/discuss-mission error:', err);
         return NextResponse.json({ error: String(err) }, { status: 500 });
     }
 }

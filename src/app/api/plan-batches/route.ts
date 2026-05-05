@@ -19,6 +19,7 @@ export async function POST(request: NextRequest) {
             ticketIds: normalizedTicketIds,
         }, { status: result.success ? 200 : 409 });
     } catch (err) {
+        console.error('[ADHDev] POST /api/plan-batches error:', err);
         return NextResponse.json({ error: String(err) }, { status: 500 });
     }
 }

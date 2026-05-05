@@ -1,5 +1,9 @@
-import { readFeedback, resolveTicketById, writeFeedback, type FeedbackTicket } from './core';
+import { readFeedback, resolveTicketById, writeFeedback, withFeedbackLock, type FeedbackTicket } from './core';
 import { buildAgentStartupGuidance, buildRunPrompt } from './runPrompt';
+import { boardSizeWarning } from './boardSizeWarning';
+import { terminalAuthHeaders } from './sessionToken';
+import { getCurrentGitSha } from './gitDiff';
+import { getActiveProject, getProjectById } from './registry';
 
 const TERMINAL_URL = 'http://localhost:3112';
 
@@ -97,7 +101,8 @@ export async function executeAgentPrompt(
     try {
         const executeRes = await fetch(`${TERMINAL_URL}/execute`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            // AD-204: forward the session token to the terminal server.
+            headers: { 'Content-Type': 'application/json', ...terminalAuthHeaders() },
             body: JSON.stringify({
                 command: trimmedPrompt,
                 // AD-141: pin the command to the caller's project so two tabs
@@ -114,7 +119,8 @@ export async function executeAgentPrompt(
         if (!executeRes.ok) {
             throw new Error(`Terminal server responded with ${executeRes.status}`);
         }
-    } catch {
+    } catch (err) {
+        console.error('[ADHDev] executeAgentPrompt /execute error:', err);
         return {
             success: false,
             terminal: true,
@@ -146,7 +152,7 @@ export async function executeAgentPrompt(
 
 export async function executeRunPrompt(ticketIds: string[], projectId?: string | null): Promise<RunExecutionResult> {
     const ids = Array.from(new Set(ticketIds.map(id => id.trim()).filter(Boolean)));
-    const prompt = buildRunPrompt(ids);
+    const prompt = buildRunPrompt(ids, boardSizeWarning());
 
     if (ids.length === 0) {
         return {
@@ -159,100 +165,107 @@ export async function executeRunPrompt(ticketIds: string[], projectId?: string |
         };
     }
 
-    const data = readFeedback(projectId);
-    const resolvedTickets: Array<{ index: number; ticket: FeedbackTicket }> = [];
+    return withFeedbackLock(projectId, async () => {
+        const data = readFeedback(projectId);
+        const resolvedTickets: Array<{ index: number; ticket: FeedbackTicket }> = [];
 
-    for (const ticketId of ids) {
-        const resolved = resolveTicketById(data, ticketId);
-        if (!resolved.ok) {
+        for (const ticketId of ids) {
+            const resolved = resolveTicketById(data, ticketId);
+            if (!resolved.ok) {
+                return {
+                    success: false,
+                    terminal: false,
+                    agentReady: false,
+                    ticketIds: ids,
+                    prompt,
+                    message: resolved.error || `Ticket ${ticketId} not found.`,
+                };
+            }
+
+            resolvedTickets.push({ index: resolved.index!, ticket: resolved.ticket! });
+        }
+
+        // AD-149: pass the resolved ids through so the terminal server can
+        // populate activeRunTicketIds — the live /api/terminal-status poll becomes
+        // authoritative and every affected card lights up, regardless of status.
+        const executionResult = await executeAgentPrompt(prompt, projectId, ids);
+        if (!executionResult.success) {
             return {
-                success: false,
-                terminal: false,
-                agentReady: false,
+                ...executionResult,
                 ticketIds: ids,
-                prompt,
-                message: resolved.error || `Ticket ${ticketId} not found.`,
             };
         }
 
-        resolvedTickets.push({ index: resolved.index!, ticket: resolved.ticket! });
-    }
+        // AD-184: reports of "coding agent isn't working" toasts firing
+        // even when the prompt visibly executed. Root cause: the AD-156 gate
+        // below was using the same brittle pattern-match detection that AD-149
+        // already removed from the execute step. The prompt has already been
+        // sent at this point — refusing to claim the ticket because detection
+        // missed leaves the user with the worst of both worlds (work happens,
+        // toast says it didn't).
+        //
+        // Trust the click. If the shell is connected and /execute succeeded,
+        // run the claim flow. If detection wasn't sure, surface that as an
+        // informational toast (already set in executeAgentPrompt's message),
+        // not as a failure. Worst case the prompt sits in a bare shell — same
+        // outcome as before, but no false-failure toast.
+        const now = new Date().toISOString();
+        const actor = executionResult.agentName || 'Coding Agent';
+        // AD-240: capture HEAD SHA so the done-time diff has a baseline.
+        // Silent null when the project isn't a git repo.
+        const project = getProjectById(projectId) || getActiveProject();
+        const startedRef = project ? (getCurrentGitSha(project.path) ?? undefined) : undefined;
+        const updatedTickets: FeedbackTicket[] = [];
 
-    // AD-149: pass the resolved ids through so the terminal server can
-    // populate activeRunTicketIds — the live /api/terminal-status poll becomes
-    // authoritative and every affected card lights up, regardless of status.
-    const executionResult = await executeAgentPrompt(prompt, projectId, ids);
-    if (!executionResult.success) {
-        return {
-            ...executionResult,
-            ticketIds: ids,
-        };
-    }
-
-    // AD-184: reports of "coding agent isn't working" toasts firing
-    // even when the prompt visibly executed. Root cause: the AD-156 gate
-    // below was using the same brittle pattern-match detection that AD-149
-    // already removed from the execute step. The prompt has already been
-    // sent at this point — refusing to claim the ticket because detection
-    // missed leaves the user with the worst of both worlds (work happens,
-    // toast says it didn't).
-    //
-    // Trust the click. If the shell is connected and /execute succeeded,
-    // run the claim flow. If detection wasn't sure, surface that as an
-    // informational toast (already set in executeAgentPrompt's message),
-    // not as a failure. Worst case the prompt sits in a bare shell — same
-    // outcome as before, but no false-failure toast.
-    const now = new Date().toISOString();
-    const actor = executionResult.agentName || 'Coding Agent';
-    const updatedTickets: FeedbackTicket[] = [];
-
-    for (const { index, ticket } of resolvedTickets) {
-        const planComment = {
-            id: `c-${Date.now().toString(36)}-${index}`,
-            author: actor,
-            authorType: 'ai' as const,
-            content: `**Claiming ticket.** Run triggered from ADHDev for ${ticket.id}. Will inspect the ticket, implement the requested change, and report back here.`,
-            images: [],
-            createdAt: now,
-        };
-        const updatedTicket: FeedbackTicket = {
-            ...ticket,
-            comments: [...(ticket.comments || []), planComment],
-            execution: {
-                runId: `run-${Date.now().toString(36)}-${index}`,
-                actor,
-                actorType: 'ai',
-                status: 'in_progress',
-                startedAt: now,
+        for (const { index, ticket } of resolvedTickets) {
+            const planComment = {
+                id: `c-${Date.now().toString(36)}-${index}`,
+                author: actor,
+                authorType: 'ai' as const,
+                content: `**Claiming ticket.** Run triggered from ADHDev for ${ticket.id}. Will inspect the ticket, implement the requested change, and report back here.`,
+                images: [],
+                createdAt: now,
+            };
+            const updatedTicket: FeedbackTicket = {
+                ...ticket,
+                comments: [...(ticket.comments || []), planComment],
+                execution: {
+                    runId: `run-${Date.now().toString(36)}-${index}`,
+                    actor,
+                    actorType: 'ai',
+                    status: 'in_progress',
+                    startedAt: now,
+                    updatedAt: now,
+                    completedAt: null,
+                    plan: '',
+                    summary: '',
+                    filesTouched: [],
+                    verification: [],
+                    blocker: null,
+                    startedRef,
+                },
+                activity: [
+                    ...(ticket.activity || []),
+                    { action: 'run_triggered', by: actor, byType: 'ai', at: now },
+                    { action: 'execution_started', by: actor, byType: 'ai', at: now },
+                ],
                 updatedAt: now,
-                completedAt: null,
-                plan: '',
-                summary: '',
-                filesTouched: [],
-                verification: [],
-                blocker: null,
-            },
-            activity: [
-                ...(ticket.activity || []),
-                { action: 'run_triggered', by: actor, byType: 'ai', at: now },
-                { action: 'execution_started', by: actor, byType: 'ai', at: now },
-            ],
-            updatedAt: now,
+            };
+
+            data.tickets[index] = updatedTicket;
+            updatedTickets.push(updatedTicket);
+        }
+
+        writeFeedback(data, projectId);
+
+        return {
+            success: true,
+            terminal: true,
+            agentReady: true,
+            ticketIds: ids,
+            prompt,
+            message: ids.length === 1 ? `Sent ${ids[0]} to ${actor}.` : `Sent ${ids.length} tickets to ${actor}.`,
+            updatedTickets,
         };
-
-        data.tickets[index] = updatedTicket;
-        updatedTickets.push(updatedTicket);
-    }
-
-    writeFeedback(data, projectId);
-
-    return {
-        success: true,
-        terminal: true,
-        agentReady: true,
-        ticketIds: ids,
-        prompt,
-        message: ids.length === 1 ? `Sent ${ids[0]} to ${actor}.` : `Sent ${ids.length} tickets to ${actor}.`,
-        updatedTickets,
-    };
+    });
 }

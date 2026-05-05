@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { readFeedback, resolveTicketById, writeFeedback, checkAdmin, getDefaultAgentRules } from '@/lib/feedback/core';
+import { readFeedback, resolveTicketById, writeFeedback, withFeedbackLock, checkAdmin, getDefaultAgentRules } from '@/lib/feedback/core';
 
 function getProjectId(request: NextRequest): string | null {
     return request.headers.get('x-adhdev-project');
@@ -43,7 +43,9 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        const data = readFeedback(getProjectId(request));
+        const projectId = getProjectId(request);
+        return await withFeedbackLock(projectId, async () => {
+        const data = readFeedback(projectId);
         const rules = data.agentRules || getDefaultAgentRules();
         const resolved = resolveTicketById(data, ticketId);
         if (!resolved.ok) {
@@ -100,21 +102,23 @@ export async function POST(request: NextRequest) {
         };
 
         ticket.comments.push(comment);
-        ticket.execution = {
-            runId: ticket.execution?.runId || `exec-${Date.now().toString(36)}`,
-            actor: agent,
-            actorType: 'ai',
-            status: 'in_progress',
-            startedAt: ticket.execution?.startedAt || now,
-            updatedAt: now,
-            completedAt: null,
-            plan: plan || ticket.execution?.plan || '',
-            summary: ticket.execution?.summary || '',
-            filesTouched: ticket.execution?.filesTouched || [],
-            verification: ticket.execution?.verification || [],
-            result: ticket.execution?.result,
-            blocker: null,
-        };
+
+        // AD-247: heartbeat-ONLY. agent-claim was the third remaining creator
+        // of in_progress executions after the AD-232 / AD-244 fixes. It used
+        // to flip the ticket to running on every claim — but Sameer's spec
+        // is that Running comes from the UI Run button alone. If the ticket
+        // already has an in_progress execution, refresh the heartbeat (and
+        // capture the agent's plan if provided) so the indicator stays alive
+        // while the agent works. Otherwise leave execution untouched —
+        // claim is just a comment + activity entry.
+        const priorExec = ticket.execution;
+        if (priorExec?.status === 'in_progress') {
+            ticket.execution = {
+                ...priorExec,
+                updatedAt: now,
+                plan: plan || priorExec.plan || '',
+            };
+        }
 
         // Log activity
         if (!ticket.activity) ticket.activity = [];
@@ -127,7 +131,7 @@ export async function POST(request: NextRequest) {
 
         ticket.updatedAt = now;
         data.tickets[index] = ticket;
-        writeFeedback(data, getProjectId(request));
+        writeFeedback(data, projectId);
 
         // Build status instruction for the agent
         const statusInstruction = rules.statusInstructions[ticket.status] || '';
@@ -144,7 +148,9 @@ export async function POST(request: NextRequest) {
             },
             claimed: true,
         });
-    } catch {
+        });
+    } catch (err) {
+        console.error('[ADHDev] POST /api/feedback/agent-claim error:', err);
         return NextResponse.json({ error: 'Failed to claim ticket' }, { status: 500 });
     }
 }

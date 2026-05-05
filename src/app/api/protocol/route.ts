@@ -15,7 +15,8 @@ export async function GET() {
             projectPath: path.join(projectRoot, 'ADHDEV.md'),
             content: protocol,
         });
-    } catch {
+    } catch (err) {
+        console.error('[ADHDev] GET /api/protocol error:', err);
         return NextResponse.json({
             filename: 'ADHDEV.md',
             projectPath: 'ADHDEV.md',

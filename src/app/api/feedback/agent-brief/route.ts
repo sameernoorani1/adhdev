@@ -19,7 +19,8 @@ export async function GET(request: Request) {
             workQueue,
             summary,
         });
-    } catch {
+    } catch (err) {
+        console.error('[ADHDev] GET /api/feedback/agent-brief error:', err);
         return NextResponse.json({ error: 'Failed to generate agent brief' }, { status: 500 });
     }
 }

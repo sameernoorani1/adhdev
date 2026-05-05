@@ -7,6 +7,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkAdmin } from '@/lib/feedback/core';
 import { readChat, writeChat, newChatMessageId, type ChatMessage } from '@/lib/feedback/chat';
+import { terminalAuthHeaders } from '@/lib/feedback/sessionToken';
 
 const TERMINAL_URL = 'http://localhost:3112';
 
@@ -63,7 +64,8 @@ export async function POST(request: NextRequest) {
         // if the agent silently fails.
         try {
             appendSystemMessage(`🤖 Processing ${unaddressed.length} message(s) — your connected agent is on it.`, projectId);
-        } catch {
+        } catch (err) {
+            console.error('[ADHDev] POST /api/chat/process system-row error:', err);
             // Non-fatal: continue even if the system row can't be written.
         }
         // Send the prompt to the connected agent via the terminal server's
@@ -71,7 +73,8 @@ export async function POST(request: NextRequest) {
         try {
             const executeRes = await fetch(`${TERMINAL_URL}/execute`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                // AD-204: forward the session token to the terminal server.
+                headers: { 'Content-Type': 'application/json', ...terminalAuthHeaders() },
                 body: JSON.stringify({
                     command: prompt,
                     projectId: projectId ?? undefined,
@@ -79,6 +82,7 @@ export async function POST(request: NextRequest) {
             });
             if (!executeRes.ok) throw new Error(`terminal server ${executeRes.status}`);
         } catch (err) {
+            console.error('[ADHDev] POST /api/chat/process /execute error:', err);
             return NextResponse.json({
                 success: false,
                 message: 'Failed to send prompt to the coding agent. Is your agent running?',
@@ -91,6 +95,7 @@ export async function POST(request: NextRequest) {
             message: `Sent ${unaddressed.length} unaddressed message(s) to the coding agent.`,
         });
     } catch (err) {
+        console.error('[ADHDev] POST /api/chat/process error:', err);
         return NextResponse.json({ error: String(err) }, { status: 500 });
     }
 }

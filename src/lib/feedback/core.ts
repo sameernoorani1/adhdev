@@ -334,6 +334,81 @@ export function readFeedback(projectId?: string | null): FeedbackData {
 // is enough. Different projectIds get independent chains.
 const feedbackLocks = new Map<string, Promise<unknown>>();
 
+// AD-232: Next.js-side sweep that mirrors server/terminal.mjs's
+// recoverStaleInProgressTickets. Normalizes execution.status when it has
+// drifted out of sync with ticket.status (mascot animation reads
+// execution.status directly without a freshness gate, so stuck records
+// keep otters dancing forever). Mutates the data in place. Returns true
+// if anything changed.
+//
+// Two normalizations:
+//   - ticket.status ∈ {done, reviewed} AND execution=in_progress
+//       → execution.status='done', completedAt set, result='success'.
+//         The work is done (status says so); the data was just out of
+//         sync (auto-claim race after a status=done flip, or a hard
+//         server crash mid-run).
+//   - ticket.status ∈ {backlog, todo, reopen, deferred, observe} AND
+//     execution=in_progress AND updatedAt staler than STALE_RUN_MS
+//       → execution.status='blocked' with a 'Recovered: stale in_progress
+//         without active session' blocker. Same shape terminal.mjs uses.
+const STALE_RUN_MS = 5 * 60 * 1000;
+const TERMINAL_STATUSES = new Set(['done', 'reviewed']);
+const ACTIVE_WORK_STATUSES = new Set(['in_progress']);
+
+export function sweepStaleExecutions(data: FeedbackData): boolean {
+    if (!Array.isArray(data?.tickets)) return false;
+    const now = new Date().toISOString();
+    const nowMs = Date.now();
+    let changed = false;
+    for (const ticket of data.tickets) {
+        const exec = ticket.execution;
+        if (!exec || exec.status !== 'in_progress') continue;
+
+        if (TERMINAL_STATUSES.has(ticket.status)) {
+            ticket.execution = {
+                ...exec,
+                status: 'done',
+                completedAt: exec.completedAt || now,
+                result: exec.result || 'success',
+                updatedAt: now,
+            };
+            ticket.updatedAt = now;
+            changed = true;
+            continue;
+        }
+
+        if (!ACTIVE_WORK_STATUSES.has(ticket.status)) {
+            const updatedAtMs = exec.updatedAt ? new Date(exec.updatedAt).getTime() : 0;
+            if (Number.isFinite(updatedAtMs) && nowMs - updatedAtMs > STALE_RUN_MS) {
+                ticket.execution = {
+                    ...exec,
+                    status: 'blocked',
+                    blocker: exec.blocker || 'Recovered: stale in_progress without active session.',
+                    updatedAt: now,
+                };
+                ticket.updatedAt = now;
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+// AD-232: per-project sweep rate-limit. The /api/feedback GET hits often
+// (page load, polling); sweeping on every request would burn IO. 30 s
+// is short enough that stuck states clear within one polling cycle and
+// long enough that the cost is negligible.
+const SWEEP_INTERVAL_MS = 30 * 1000;
+const lastSweepAt = new Map<string, number>();
+
+export function shouldSweepNow(projectId: string | null | undefined): boolean {
+    const key = projectId ?? '__default__';
+    const last = lastSweepAt.get(key) ?? 0;
+    if (Date.now() - last < SWEEP_INTERVAL_MS) return false;
+    lastSweepAt.set(key, Date.now());
+    return true;
+}
+
 export async function withFeedbackLock<T>(
     projectId: string | null | undefined,
     fn: () => T | Promise<T>,

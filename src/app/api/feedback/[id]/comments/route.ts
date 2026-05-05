@@ -3,7 +3,6 @@ import { readFeedback, resolveTicketById, writeFeedback, withFeedbackLock, check
 import { addPendingMention, clearPendingMention } from '@/lib/feedback/pendingMentions';
 import { readUserDisplayName, DEFAULT_USER_DISPLAY_NAME } from '@/lib/feedback/protocol';
 import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
-import { getCurrentGitSha } from '@/lib/feedback/gitDiff';
 
 // AD-011: resolve user display name from project config, replacing the
 // previously hardcoded 'Sameer' literal in author/activity defaults.
@@ -77,49 +76,29 @@ export async function POST(
             data.tickets[index].updatedAt = now;
             if (!data.tickets[index].activity) data.tickets[index].activity = [];
 
-            // AD-149 / AD-154 / AD-223: AI comment effects on execution state.
-            //   - status === 'in_progress': bump updatedAt only (heartbeat
-            //     keep-alive). Same as before — don't reset metadata mid-run.
-            //   - any other status (including no execution at all): start a
-            //     fresh execution record so the board flips into running
-            //     state. AD-223: the agent working a ticket via direct
-            //     terminal chat (no Run-button click) posts an AI claim/plan
-            //     comment first; that comment is now the start signal for
-            //     the running pill + mascot, identical to what the Run-flow
-            //     gets from the terminal-server's captureTicketIds. Prior
-            //     concern from AD-149 (comments resurrecting completed runs)
-            //     is intentional now: a fresh AI claim AFTER a 'done' run is
-            //     a new run — start a new exec record (new runId, blank
-            //     summary/files) so the previous run's metadata doesn't
-            //     bleed in.
+            // AD-232: AI comments only HEARTBEAT an already-running execution
+            // ON A TICKET WHOSE STATUS INDICATES ACTIVE WORK. They no longer
+            // START executions, and they no longer keep stale ones alive.
+            // The double guard (execution=in_progress AND ticket.status active)
+            // closes the regression where an auto-claim comment landing on an
+            // already-done ticket bumped updatedAt and resurrected the
+            // running indicator. Sameer's call: running state must be linked
+            // to UI triggers alone (Run button → /api/run / /api/run-terminal),
+            // not to the existence of any AI comment.
             if (body.authorType === 'ai') {
                 const t = data.tickets[index];
                 const prior = t.execution as Record<string, unknown> | undefined;
                 const priorStatus = prior?.status as string | undefined;
-                if (priorStatus === 'in_progress' && prior) {
+                const ticketActive = t.status === 'todo' || t.status === 'in_progress' || t.status === 'reopen';
+                if (priorStatus === 'in_progress' && prior && ticketActive) {
+                    // Heartbeat keep-alive — keeps the running indicator from
+                    // decaying while the agent is mid-run posting comments.
                     t.execution = { ...prior, updatedAt: now } as typeof t.execution;
-                } else {
-                    // AD-240: capture HEAD SHA so the done-time diff has a
-                    // baseline. Silent null when the project isn't a git
-                    // repo — done-handler falls back to agent self-report.
-                    const project = getProjectById(projectId) || getActiveProject();
-                    const startedRef = project ? (getCurrentGitSha(project.path) ?? undefined) : undefined;
-                    t.execution = {
-                        runId: `exec-${Date.now().toString(36)}`,
-                        actor: body.author || displayName,
-                        actorType: 'ai',
-                        status: 'in_progress',
-                        startedAt: now,
-                        updatedAt: now,
-                        completedAt: null,
-                        plan: '',
-                        summary: '',
-                        filesTouched: [],
-                        verification: [],
-                        blocker: null,
-                        startedRef,
-                    } as typeof t.execution;
                 }
+                // Otherwise: leave execution untouched. Tickets worked via
+                // direct terminal chat without first clicking Run won't show
+                // running state, and stale executions on done/backlog/reopen
+                // tickets won't be resurrected by an AI comment.
             }
 
             // Targeted AI mention detection — supports @claude, @codex, @chatgpt, and @ai

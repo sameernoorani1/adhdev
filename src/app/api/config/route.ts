@@ -65,6 +65,7 @@ export async function PATCH(request: NextRequest) {
             userDisplayName: cfg.userDisplayName || DEFAULT_USER_DISPLAY_NAME,
         });
     } catch (err) {
+        console.error('[ADHDev] PATCH /api/config error:', err);
         return NextResponse.json({ error: String(err) }, { status: 500 });
     }
 }

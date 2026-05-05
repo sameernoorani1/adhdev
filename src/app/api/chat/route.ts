@@ -52,7 +52,8 @@ export async function POST(request: NextRequest) {
         store.messages.push(msg);
         writeChat(store, projectId);
         return NextResponse.json(msg, { status: 201 });
-    } catch {
+    } catch (err) {
+        console.error('[ADHDev] POST /api/chat error:', err);
         return NextResponse.json({ error: 'Failed to add message' }, { status: 500 });
     }
 }
@@ -79,7 +80,8 @@ export async function PATCH(request: NextRequest) {
         store.messages[idx] = next;
         writeChat(store, projectId);
         return NextResponse.json(next);
-    } catch {
+    } catch (err) {
+        console.error('[ADHDev] PATCH /api/chat error:', err);
         return NextResponse.json({ error: 'Failed to update message' }, { status: 500 });
     }
 }
@@ -98,7 +100,8 @@ export async function DELETE(request: NextRequest) {
         if (store.messages.length === before) return NextResponse.json({ error: 'Message not found' }, { status: 404 });
         writeChat(store, projectId);
         return NextResponse.json({ ok: true });
-    } catch {
+    } catch (err) {
+        console.error('[ADHDev] DELETE /api/chat error:', err);
         return NextResponse.json({ error: 'Failed to delete message' }, { status: 500 });
     }
 }

@@ -21,6 +21,7 @@ export async function POST(request: NextRequest) {
             target,
         }, { status: result.success ? 200 : 409 });
     } catch (err) {
+        console.error('[ADHDev] POST /api/run-batch error:', err);
         return Response.json({ error: String(err) }, { status: 500 });
     }
 }

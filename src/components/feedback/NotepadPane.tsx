@@ -1,6 +1,8 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 
 interface NotepadPaneProps {
     onClose: () => void;
@@ -48,24 +50,16 @@ export function NotepadPane({ onClose }: NotepadPaneProps) {
         saveContent(newContent);
     }, [saveContent]);
 
-    // Simple markdown to HTML converter for basic preview
+    // AD-206: replace the homegrown regex-based renderer with marked +
+    // DOMPurify. The old version applied replacements without HTML-escaping
+    // the input, then injected via dangerouslySetInnerHTML — a note containing
+    // <img src=x onerror="alert(1)"> was executable. marked produces HTML
+    // and DOMPurify strips unsafe attributes (onerror, onclick, javascript:
+    // URLs, etc.) and unsafe tags (<script>, <iframe>, ...). The output is
+    // safe to render via dangerouslySetInnerHTML below.
     const markdownToHtml = useCallback((md: string) => {
-        return md
-            // Headers
-            .replace(/^### (.*$)/gim, '<h3>$1</h3>')
-            .replace(/^## (.*$)/gim, '<h2>$1</h2>')
-            .replace(/^# (.*$)/gim, '<h1>$1</h1>')
-            // Bold and italic
-            .replace(/\*\*(.*)\*\*/g, '<strong>$1</strong>')
-            .replace(/\*(.*)\*/g, '<em>$1</em>')
-            // Code blocks (basic)
-            .replace(/```([^`]*)```/g, '<pre><code>$1</code></pre>')
-            .replace(/`([^`]*)`/g, '<code>$1</code>')
-            // Lists (basic)
-            .replace(/^\- (.*$)/gim, '<li>$1</li>')
-            .replace(/(<li>[\s\S]*?<\/li>)/g, '<ul>$1</ul>')
-            // Line breaks
-            .replace(/\n/g, '<br>');
+        const rawHtml = marked.parse(md, { async: false }) as string;
+        return DOMPurify.sanitize(rawHtml, { USE_PROFILES: { html: true } });
     }, []);
 
     // Handle Escape key to close

@@ -11,11 +11,87 @@
 
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { shouldAutoCompleteOnClear } from './clearActiveRunRules.mjs';
 
 const PORT = parseInt(process.env.TERMINAL_PORT || '3112', 10);
+
+// AD-202/AD-203/AD-204: security perimeter for the terminal server.
+//   - CORS: replace wildcard with an explicit allowlist of the board origins.
+//   - Origin checks: every mutating HTTP endpoint + the WS upgrade reject
+//     anything that didn't come from the board.
+//   - Session token: random 32-byte hex token generated at boot and written to
+//     ~/.adhdev/session-token with mode 0o600. Required as the x-adhdev-token
+//     header on every HTTP endpoint and as ?token=<value> on WS connect.
+//     The Next.js process reads the same file and forwards the token on every
+//     server-to-server fetch.
+//
+// Bind the server to 127.0.0.1 (AD-201) — the gate alone is not enough; the
+// interface itself must not be reachable from the wider network.
+const ALLOWED_ORIGINS = new Set([
+    `http://localhost:3111`,
+    `http://127.0.0.1:3111`,
+]);
+const SESSION_TOKEN_PATH = path.join(os.homedir(), '.adhdev', 'session-token');
+
+function getOrCreateSessionToken() {
+    try {
+        const dir = path.dirname(SESSION_TOKEN_PATH);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        if (fs.existsSync(SESSION_TOKEN_PATH)) {
+            const existing = fs.readFileSync(SESSION_TOKEN_PATH, 'utf-8').trim();
+            if (/^[0-9a-f]{64}$/i.test(existing)) return existing;
+        }
+        const token = crypto.randomBytes(32).toString('hex');
+        // Write then chmod (chmod is a no-op on Windows but keeps Unix safe).
+        fs.writeFileSync(SESSION_TOKEN_PATH, token + '\n', { mode: 0o600 });
+        try { fs.chmodSync(SESSION_TOKEN_PATH, 0o600); } catch {}
+        return token;
+    } catch (err) {
+        console.error('Failed to read/create session token:', err.message);
+        // Fail closed: a random in-memory token. Next.js side won't know it,
+        // so all requests will 401 — which beats silently leaving the server
+        // unauthenticated.
+        return crypto.randomBytes(32).toString('hex');
+    }
+}
+const SESSION_TOKEN = getOrCreateSessionToken();
+
+function isAllowedOrigin(req) {
+    const origin = req.headers && req.headers.origin;
+    if (!origin) {
+        // Same-origin server-to-server fetches (Next.js -> terminal) don't
+        // send Origin. We allow these and rely on the token check + localhost
+        // bind as the gate. Browser cross-origin fetches always send Origin.
+        return true;
+    }
+    return ALLOWED_ORIGINS.has(origin);
+}
+
+function isTokenValid(req, urlObj) {
+    const headerToken = req.headers && req.headers['x-adhdev-token'];
+    if (typeof headerToken === 'string' && headerToken === SESSION_TOKEN) return true;
+    if (urlObj) {
+        const queryToken = urlObj.searchParams.get('token');
+        if (queryToken === SESSION_TOKEN) return true;
+    }
+    return false;
+}
+
+function applyCorsHeaders(req, res) {
+    const origin = req.headers && req.headers.origin;
+    if (origin && ALLOWED_ORIGINS.has(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Vary', 'Origin');
+    }
+    // No header at all when origin is not allowlisted -- the browser will
+    // refuse to read the response.
+    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-adhdev-token');
+}
 
 // Use cmd.exe on Windows (PowerShell breaks many things), bash on unix
 const SHELL = process.env.ADHDEV_SHELL
@@ -73,7 +149,6 @@ let uiContext = {
     groupedBy: 'none',
     showBatchPane: false,
     showActivityFeed: false,
-    showProgressPage: false,
 };
 
 const clients = new Set();
@@ -357,6 +432,13 @@ function markTicketsInterrupted(projectId, ticketIds) {
 //    abort — has a richer semantic).
 const HEARTBEAT_INTERVAL_MS = 10 * 1000;
 
+// AD-221: hard ceiling on a single in_progress run. If the agent's natural
+// completion signal (PATCH to done/blocked, shell exit, both timers
+// agreeing) never lands, the heartbeat-based mascot would haunt forever.
+// 60 min is well above any realistic single-ticket run; the watchdog
+// only fires for genuinely stuck/forgotten executions.
+const MAX_RUN_DURATION_MS = 60 * 60 * 1000;
+
 // AD-156 reopen #2: if no agent-detection marker has fired in this many ms,
 // the agent has exited and we should stop reporting it as active. Claude Code
 // repaints `bypass permissions on` while idle and `esc to interrupt` while
@@ -380,6 +462,14 @@ function expireStaleAgent(session, reason = 'detection_stale') {
     return true;
 }
 
+// AD-247: heartbeat-ONLY. Mirrors AD-232 (comments route) and AD-244
+// (terminal-status poll + captureHeartbeat). This path used to CREATE a fresh
+// in_progress execution if the ticket had none — which meant any ticket the
+// terminal session merely *saw* (typed-in ID, /execute call) would flip into a
+// false Running state. Per Sameer's spec on AD-232: Running must come from an
+// explicit UI Run button (/api/run → runExecution.ts already writes the
+// in_progress record before /execute is called). Polling/heartbeat never
+// creates execution rows; it only keeps alive what's already alive.
 function bumpExecutionForActiveTickets(projectId, ticketIds) {
     if (!ticketIds?.length) return;
     const boardData = readBoard(projectId);
@@ -391,27 +481,13 @@ function bumpExecutionForActiveTickets(projectId, ticketIds) {
 
     for (const ticket of boardData.tickets) {
         if (!ids.has(String(ticket.id || '').toUpperCase())) continue;
-        const prior = ticket.execution || {};
-        // If the agent has explicitly completed or blocked this run, the
-        // heartbeat does NOT resurrect the indicator. It only keeps alive
-        // what was already alive.
-        if (prior.status === 'done' || prior.status === 'blocked') continue;
+        const prior = ticket.execution;
+        // Heartbeat-only: only refresh updatedAt on tickets already running.
+        // Tickets without an in_progress execution stay idle — Run button is
+        // the sole creator (runExecution.ts).
+        if (prior?.status !== 'in_progress') continue;
 
-        ticket.execution = {
-            ...prior,
-            runId: prior.runId || `exec-${Date.now().toString(36)}`,
-            actorType: prior.actorType || 'ai',
-            status: 'in_progress',
-            startedAt: prior.startedAt || now,
-            updatedAt: now,
-            completedAt: null,
-            plan: prior.plan || '',
-            summary: prior.summary || '',
-            filesTouched: Array.isArray(prior.filesTouched) ? prior.filesTouched : [],
-            verification: Array.isArray(prior.verification) ? prior.verification : [],
-            blocker: null,
-            actor: prior.actor || 'Coding Agent',
-        };
+        ticket.execution = { ...prior, updatedAt: now };
         ticket.updatedAt = now;
         changed = true;
     }
@@ -466,8 +542,35 @@ function startHeartbeat(session) {
             stopHeartbeat(session);
             return;
         }
+        // AD-221: max-runtime watchdog. If any active execution has been
+        // in_progress longer than MAX_RUN_DURATION_MS, the agent has
+        // either crashed silently or was forgotten — the timer-based
+        // signals never fired. Clear with `max_runtime_exceeded` so the
+        // mascot drops instead of haunting the board indefinitely.
+        try {
+            if (anyActiveRunExceededMaxDuration(session.projectId, ids)) {
+                clearActiveRunTickets(session, 'max_runtime_exceeded');
+                return;
+            }
+        } catch {}
         try { bumpExecutionForActiveTickets(session.projectId, ids); } catch {}
     }, HEARTBEAT_INTERVAL_MS);
+}
+
+function anyActiveRunExceededMaxDuration(projectId, ticketIds) {
+    if (!ticketIds?.length) return false;
+    const boardData = readBoard(projectId);
+    if (!boardData?.tickets?.length) return false;
+    const ids = new Set(ticketIds.map(id => String(id).toUpperCase()));
+    const cutoff = Date.now() - MAX_RUN_DURATION_MS;
+    for (const ticket of boardData.tickets) {
+        if (!ids.has(String(ticket.id || '').toUpperCase())) continue;
+        const startedAt = ticket.execution?.startedAt;
+        if (!startedAt) continue;
+        const startedMs = new Date(startedAt).getTime();
+        if (Number.isFinite(startedMs) && startedMs < cutoff) return true;
+    }
+    return false;
 }
 
 function stopHeartbeat(session) {
@@ -553,32 +656,21 @@ function markDeclaredRun(projectId, ticketIds, actorName) {
             createdAt: now,
         });
 
-        ticket.execution = {
-            runId: ticket.execution?.runId || `run-${Date.now().toString(36)}-${ticket.id}`,
-            actor: actorName || ticket.execution?.actor || 'Coding Agent',
-            actorType: 'ai',
-            status: 'in_progress',
-            startedAt: ticket.execution?.startedAt || now,
-            updatedAt: now,
-            completedAt: null,
-            plan: ticket.execution?.plan || '',
-            summary: ticket.execution?.summary || '',
-            filesTouched: Array.isArray(ticket.execution?.filesTouched) ? ticket.execution.filesTouched : [],
-            verification: Array.isArray(ticket.execution?.verification) ? ticket.execution.verification : [],
-            result: ticket.execution?.result,
-            blocker: null,
-            batchId: ticket.execution?.batchId,
-        };
+        // AD-247: heartbeat-ONLY. The declaration comment + activity trail
+        // record that the agent referenced this ticket in the terminal, but
+        // it does NOT promote the ticket to running. Sameer's spec on AD-232
+        // is that Running = UI Run button only. If the ticket already has an
+        // in_progress execution (someone clicked Run), refresh the heartbeat
+        // so the indicator stays alive while the agent posts. Otherwise leave
+        // execution untouched.
+        const priorExec = ticket.execution;
+        if (priorExec?.status === 'in_progress') {
+            ticket.execution = { ...priorExec, updatedAt: now };
+        }
 
         if (!Array.isArray(ticket.activity)) ticket.activity = [];
         ticket.activity.push({
             action: 'terminal_run_declared',
-            by: actorName || 'Coding Agent',
-            byType: 'ai',
-            at: now,
-        });
-        ticket.activity.push({
-            action: 'execution_started',
             by: actorName || 'Coding Agent',
             byType: 'ai',
             at: now,
@@ -595,7 +687,29 @@ function scheduleActiveRunClear(session) {
     if (session.clearActiveRunTimeout) clearTimeout(session.clearActiveRunTimeout);
     if (session.activeRunTicketIds.length > 0) {
         session.clearActiveRunTimeout = setTimeout(() => {
-            clearActiveRunTickets(session, 'timed_out');
+            // AD-221: 2 minutes of shell-quiet does NOT mean the agent is
+            // done. Claude in particular goes silent while it's thinking,
+            // between tool calls, or when the user has paused mid-turn —
+            // and the mascot was dropping after exactly that window.
+            //   * If the agent is still posting UI markers, treat the gap as
+            //     `agent_idle` (clears the active set + stops the heartbeat,
+            //     but does NOT auto-complete — execution.status stays
+            //     in_progress until the agent's own PATCH lands or
+            //     detection-stale fires).
+            //   * If detection has been quiet for >60s on top of the
+            //     2-minute shell-quiet window, the agent really has gone —
+            //     fall through as `detection_stale` and auto-complete.
+            //   * Last-resort fallback when we never observed an agent on
+            //     this session at all (legacy / unrecognized runner): keep
+            //     the old `timed_out` behavior so dead runs still self-heal.
+            const agentEverDetected = !!session.agentState?.lastDetectedAt;
+            if (isAgentDetectionStale(session)) {
+                clearActiveRunTickets(session, 'detection_stale');
+            } else if (agentEverDetected && session.agentState?.active) {
+                clearActiveRunTickets(session, 'agent_idle');
+            } else {
+                clearActiveRunTickets(session, 'timed_out');
+            }
         }, ACTIVE_RUN_TTL_MS);
     }
 }
@@ -625,19 +739,11 @@ function setActiveRunTickets(session, ticketIds = []) {
 //     exited (see AD-156 reopen #2).
 //   - timed_out: ACTIVE_RUN_TTL_MS (2 min) of no shell output at all — strong
 //     signal the run is dead.
-// Heuristic triggers (`shell_prompt`, `agent_idle`) used to auto-complete too,
-// but in practice they fired mid-run: a chunk happened to end with
-// a shell-prompt-shaped string, or the busy markers paused briefly between
-// tickets — and the FE running pill dropped on tickets the agent hadn't
-// finished posting comments/PATCH for. Now those reasons just clear the active
-// set + stop the heartbeat; execution.status stays `in_progress` until the
-// agent's own PATCH lands. The reliable reasons keep auto-completing as a
-// crashed-agent safety net.
-const AUTO_COMPLETE_ON_CLEAR_REASONS = new Set([
-    'shell_exited',
-    'detection_stale',
-    'timed_out',
-]);
+//   - max_runtime_exceeded: AD-221 60-min watchdog inside the heartbeat
+//     for runs that never naturally complete (silent crash, forgotten run).
+// AD-216: AUTO_COMPLETE_ON_CLEAR_REASONS + shouldAutoCompleteOnClear live in
+// `./clearActiveRunRules.mjs` so the rules can be unit-tested without booting
+// the WS server. Single source of truth for what counts as "agent is gone".
 
 function clearActiveRunTickets(session, reason = 'cleared') {
     if (!session) return;
@@ -659,11 +765,7 @@ function clearActiveRunTickets(session, reason = 'cleared') {
     // AD-178 — they fire mid-run). 'cleared' (the default) is also skipped
     // because callers that pass no reason haven't asserted the agent is gone.
     stopHeartbeat(session);
-    if (
-        reason !== 'interrupted'
-        && priorIds.length > 0
-        && AUTO_COMPLETE_ON_CLEAR_REASONS.has(reason)
-    ) {
+    if (priorIds.length > 0 && shouldAutoCompleteOnClear(reason)) {
         try { autoCompleteTickets(session.projectId, priorIds, reason); } catch {}
     }
 }
@@ -754,37 +856,44 @@ function detectAgentOutput(session, data) {
     // output mentioned them (e.g. a conversation about agent mascots
     // flipped the session to Codex because the reply referenced Codex as a
     // robot). Keep only phrases that a foreign agent would not print casually.
+    // AD-221: match against the rolling 4 KB tail (`normalized`), not just
+    // the current chunk. Two reasons: (a) PTY writes can split a marker
+    // across two chunks (`bypass permis`/`sions on`) — neither half matches
+    // `chunk.includes` even though the phrase is on screen; (b) during long
+    // quiet tool calls the TUI emits sparse spinner ticks without re-printing
+    // the marker phrase, but the previous repaint is still in the tail —
+    // that's "the agent is alive, just busy", not "the agent is gone".
     if (
-        chunk.includes('esc to interrupt') ||
-        chunk.includes('summarize code changes after completion') ||
-        chunk.includes('press ctrl-c again to quit') ||
-        chunk.includes('claude code v') ||
+        normalized.includes('esc to interrupt') ||
+        normalized.includes('summarize code changes after completion') ||
+        normalized.includes('press ctrl-c again to quit') ||
+        normalized.includes('claude code v') ||
         // AD-156 / AD-139 reopen: Claude Code's input prompt repaints
         // `>> bypass permissions on (shift+tab to cycle)` every frame while
         // it's idle/listening. Without this marker, detection missed in
         // user sessions — so Run reported "Sent to Coding Agent" while
         // the prompt actually landed in bare cmd.exe.
-        chunk.includes('bypass permissions on') ||
-        chunk.includes('shift+tab to cycle')
+        normalized.includes('bypass permissions on') ||
+        normalized.includes('shift+tab to cycle')
     ) {
         setAgentActive(session, 'Claude Code');
         return;
     }
 
     if (
-        chunk.includes('approving:') ||
-        chunk.includes('codex cli') ||
-        chunk.includes('codex v') ||
-        chunk.includes('full auto mode') ||
-        chunk.includes('ctrl+e to explain')
+        normalized.includes('approving:') ||
+        normalized.includes('codex cli') ||
+        normalized.includes('codex v') ||
+        normalized.includes('full auto mode') ||
+        normalized.includes('ctrl+e to explain')
     ) {
         setAgentActive(session, 'Codex');
         return;
     }
 
     if (
-        chunk.includes('aider v') ||
-        (chunk.includes('model:') && chunk.includes('aider'))
+        normalized.includes('aider v') ||
+        (normalized.includes('model:') && normalized.includes('aider'))
     ) {
         setAgentActive(session, 'Aider');
         return;
@@ -795,28 +904,30 @@ function detectAgentOutput(session, data) {
     // privacy/auth screens print "google ai" lines. Keep markers narrow so
     // foreign agents don't false-trigger (see AD-144 reopen #2).
     if (
-        chunk.includes('gemini cli') ||
-        chunk.includes('gemini.md file') ||
-        chunk.includes('workspace (/directory)') ||
-        (chunk.includes('google ai') && chunk.includes('gemini'))
+        normalized.includes('gemini cli') ||
+        normalized.includes('gemini.md file') ||
+        normalized.includes('workspace (/directory)') ||
+        (normalized.includes('google ai') && normalized.includes('gemini'))
     ) {
         setAgentActive(session, 'Gemini CLI');
         return;
     }
 
     if (
-        chunk.includes('cursor agent') ||
-        chunk.includes('cursor-agent v')
+        normalized.includes('cursor agent') ||
+        normalized.includes('cursor-agent v')
     ) {
         setAgentActive(session, 'Cursor Agent');
         return;
     }
 
-    // AD-156 reopen #2: if the agent's detection markers have been silent for
-    // > AGENT_DETECTION_STALE_MS while output is still flowing, the agent has
-    // exited and the shell-prompt regex below missed it (e.g., the exit chunk
-    // didn't end with `>`). Clear here so Run can't lie afterwards.
-    if (expireStaleAgent(session, 'detection_stale')) return;
+    // AD-221: removed the aggressive in-stream `expireStaleAgent('detection_stale')`
+    // that previously fired here. It was the load-bearing cause of mascots
+    // dropping mid-run: any non-marker chunk arriving 60s+ after the last
+    // marker hit would trigger auto-complete, even while the agent was still
+    // genuinely working (long tool call, spinner-only output). The
+    // timer-fired path in `scheduleActiveRunClear` (which requires BOTH
+    // 2-min shell-quiet AND fingerprint-stale) handles this correctly.
 
     // Shell prompt detection — only check the LATEST chunk (not accumulated tail)
     // to avoid false positives from agent output that contains > or $ characters.
@@ -1100,10 +1211,25 @@ function snapshotSessionStatus(session) {
     };
 }
 
+// AD-203: gate every mutating endpoint on Origin + token. Returns true if the
+// request is authorised; false (and writes a 403) if it is not. Read-only /status
+// is allowed without the gate so the OnboardingWizard etc. can poll.
+function requireGate(req, res, urlObj) {
+    if (!isAllowedOrigin(req)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Origin not allowed' }));
+        return false;
+    }
+    if (!isTokenValid(req, urlObj)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing or invalid x-adhdev-token' }));
+        return false;
+    }
+    return true;
+}
+
 const httpServer = createServer((req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    applyCorsHeaders(req, res);
 
     if (req.method === 'OPTIONS') {
         res.writeHead(200);
@@ -1125,6 +1251,7 @@ const httpServer = createServer((req, res) => {
     }
 
     if (req.method === 'POST' && req.url === '/ui-context') {
+        if (!requireGate(req, res, new URL(req.url, `http://localhost:${PORT}`))) return;
         let body = '';
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
@@ -1146,6 +1273,7 @@ const httpServer = createServer((req, res) => {
     }
 
     if (req.method === 'POST' && req.url === '/stop-run') {
+        if (!requireGate(req, res, new URL(req.url, `http://localhost:${PORT}`))) return;
         let body = '';
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
@@ -1163,6 +1291,7 @@ const httpServer = createServer((req, res) => {
     }
 
     if (req.method === 'POST' && req.url === '/execute') {
+        if (!requireGate(req, res, new URL(req.url, `http://localhost:${PORT}`))) return;
         let body = '';
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
@@ -1189,15 +1318,64 @@ const httpServer = createServer((req, res) => {
                             : [];
                 setActiveRunTickets(session, normalizedTicketIds);
 
-                // AD-184: previously this was two separate writes
-                // (command, then '\r'). On Windows ConPTY the trailing '\r'
-                // could race with the running app's input handler and the
-                // command would land "typed but not entered". Combine into
-                // a single write so the prompt and its enter ship together.
-                const commandWithEnter = (command.endsWith('\r') || command.endsWith('\n'))
-                    ? command
-                    : command + '\r';
-                session.shell.write(commandWithEnter);
+                // AD-184 → AD-140 (round 2): the 80ms-gap fix from round 1
+                // was insufficient — reports kept coming in of the failure
+                // mode where the prompt sits in Claude Code's input box but
+                // Enter never fires. Five real causes (most → least common):
+                //
+                //   1. Claude's startup permissions dialog ("bypass permissions
+                //      on / shift+tab to cycle") is still up; until dismissed,
+                //      Claude is not listening to prompt input. A bare CR that
+                //      arrives while it's up dismisses the dialog instead of
+                //      submitting our prompt.
+                //   2. Multi-line edit mode swallows the Enter — embedded \n in
+                //      our prompt puts Claude in multi-line mode, where a bare
+                //      CR is treated as "add a line" not "submit."
+                //   3. Slow-machine race — the prior 80ms wasn't always enough.
+                //   4. Windows ConPTY can split a single write into multiple
+                //      reads; the trailing CR may land in a different cycle.
+                //   5. Some Windows console apps expect CRLF, not just CR.
+                //
+                // Round-2 fix — defense-in-depth:
+                //   (a) Wrap the prompt in bracketed-paste mode markers
+                //       (ESC [ 200 ~ ... ESC [ 201 ~). Modern TUIs treat
+                //       everything between those markers as a single paste,
+                //       NOT as multi-line edit, so the in-buffer \n's are no
+                //       longer ambiguous. Closes #2.
+                //   (b) Bump the delay between paste and Enter to 250ms.
+                //       Closes #3 and most of #4.
+                //   (c) Send Enter twice with a 150ms gap. If Enter #1 lands
+                //       while Claude's startup dialog is still up, it
+                //       dismisses the dialog; Enter #2 submits the prompt.
+                //       Closes #1. Stray-second-Enter at a bash/cmd prompt
+                //       just produces one blank line — cheap.
+                //
+                // Bracketed paste is the load-bearing fix; the timing changes
+                // are belt-and-suspenders.
+                //
+                // AD-243: BPM tells the receiver "this is a paste," not
+                //   "replace existing input." If the user (or a prior failed
+                //   Run) left half-typed text in Claude Code's prompt buffer,
+                //   the new BPM paste gets *appended* to that stale text and
+                //   submitted as one merged prompt — silent prompt poisoning.
+                //   Fix: prepend Ctrl+U (\x15, the universal readline kill-
+                //   line) to wipe whatever's in the input box before pasting.
+                //   Empty buffer → no-op; non-empty → cleared. Honored by
+                //   Ink-based TUIs (Claude Code) and bash/zsh alike.
+                const stripped = command.replace(/[\r\n]+$/, '');
+                const BPM_OPEN = '\x1b[200~';
+                const BPM_CLOSE = '\x1b[201~';
+                const CTRL_U = '\x15';
+                session.shell.write(CTRL_U);
+                setTimeout(() => {
+                    try { session.shell.write(BPM_OPEN + stripped + BPM_CLOSE); } catch {}
+                }, 50);
+                setTimeout(() => {
+                    try { session.shell.write('\r'); } catch { /* shell torn down between writes */ }
+                }, 300);
+                setTimeout(() => {
+                    try { session.shell.write('\r'); } catch { /* same */ }
+                }, 450);
 
                 const identifier = batchId || ticketId || normalizedTicketIds.join(', ') || 'unknown';
                 console.log(`Terminal execution started for project ${projectId}, ${batchId ? 'batch' : 'ticket'} ${identifier}`);
@@ -1215,6 +1393,7 @@ const httpServer = createServer((req, res) => {
     // AD-144: explicit history wipe — called by Reset Session so a deliberate
     // reset actually starts with an empty scrollback on next launch.
     if (req.method === 'POST' && req.url && req.url.startsWith('/reset-history')) {
+        if (!requireGate(req, res, new URL(req.url, `http://localhost:${PORT}`))) return;
         let body = '';
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
@@ -1247,8 +1426,12 @@ const httpServer = createServer((req, res) => {
 
 const wss = new WebSocketServer({ server: httpServer });
 
-httpServer.listen(PORT, () => {
-    console.log(`Terminal server running on http://localhost:${PORT} (WebSocket + HTTP)`);
+// AD-201: bind to 127.0.0.1 explicitly. The wider machine network must not be
+// able to reach this server -- combined with the Origin/token gate (AD-202/203/
+// 204) this is defense in depth.
+httpServer.listen(PORT, '127.0.0.1', () => {
+    console.log(`Terminal server running on http://127.0.0.1:${PORT} (WebSocket + HTTP)`);
+    console.log(`Session token: ${SESSION_TOKEN_PATH}`);
     // AD-149 permanent fix: any in_progress executions left over from a prior
     // crash / kill are now definitionally stale — the server owning them is
     // freshly restarted. Mark them as blocked so the indicator doesn't haunt.
@@ -1262,6 +1445,16 @@ wss.on('connection', (ws, req) => {
     // so caused cross-tab state bleed — the last-connected tab would reshape
     // the /execute + /status routing for every other tab.
     const url = new URL(req.url || '/', `http://localhost:${PORT}`);
+    // AD-203 + AD-204: gate the WS upgrade on Origin and token. Reject before
+    // we spin up any per-session state.
+    if (!isAllowedOrigin(req)) {
+        try { ws.close(1008, 'Origin not allowed'); } catch {}
+        return;
+    }
+    if (!isTokenValid(req, url)) {
+        try { ws.close(1008, 'Missing or invalid token'); } catch {}
+        return;
+    }
     const projectId = normalizeProjectId(url.searchParams.get('project'));
     ws.projectId = projectId;
     if (!currentProjectId) currentProjectId = projectId;

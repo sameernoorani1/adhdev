@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { allocateTicketId, readFeedback, resolveTicketById, writeFeedback, withFeedbackLock, checkAdmin, getDefaultAgentRules } from '@/lib/feedback/core';
+import { allocateTicketId, readFeedback, resolveTicketById, writeFeedback, withFeedbackLock, checkAdmin, getDefaultAgentRules, sweepStaleExecutions, shouldSweepNow } from '@/lib/feedback/core';
 import { normalizeRelations, diffRelations, applyInverse } from '@/lib/feedback/relations';
 import { getDefaultExecutionContract, readUserDisplayName, DEFAULT_USER_DISPLAY_NAME } from '@/lib/feedback/protocol';
 import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
@@ -183,6 +183,20 @@ export async function GET(request: NextRequest) {
 
     try {
         const projectId = getProjectId(request);
+        // AD-232: sweep stuck execution.status='in_progress' records before
+        // serving the board. Catches the case where the terminal server
+        // hasn't been restarted (its boot-time recoverStaleInProgressTickets
+        // is the only other sweep path) but the data has drifted out of
+        // sync. Rate-limited to once per 30s per project so the cost is
+        // negligible. Behind the lock so it can't race a concurrent PATCH.
+        if (shouldSweepNow(projectId)) {
+            await withFeedbackLock(projectId, () => {
+                const swept = readFeedback(projectId);
+                if (sweepStaleExecutions(swept)) {
+                    writeFeedback(swept, projectId);
+                }
+            });
+        }
         const data = readFeedback(projectId);
         // AD-138: first board view after init — write-once.
         recordOnboardingEvent('firstBoardViewAt', projectId);

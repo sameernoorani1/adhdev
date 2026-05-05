@@ -1,19 +1,27 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { readFeedback, writeFeedback } from '@/lib/feedback/core';
+import { readFeedback, writeFeedback, withFeedbackLock } from '@/lib/feedback/core';
+import { applyCaptureHeartbeat } from '@/lib/feedback/captureHeartbeat';
 
 const TERMINAL_URL = 'http://localhost:3112';
 
-// AD-154: Next.js-side heartbeat. The terminal server on local dev machines
-// hasn't been restarted with the heartbeat code, so live runs have nothing
-// bumping execution.updatedAt and the 45 s client freshness backstop hides
-// the indicator after a minute. This route runs INSIDE Next.js (hot-reloaded
-// on every file change), so we can piggy-back on the 2 s poll the client
-// already makes and bump updatedAt for any ticket the terminal server is
-// actively capturing. Debounced by ticket so we don't write on every poll.
+// AD-154 / AD-244: Next.js-side heartbeat for live runs. Bumps
+// execution.updatedAt for tickets the terminal server reports as capturing,
+// so the client's 45 s freshness backstop keeps the indicator visible even
+// when an older terminal-server build (without its own heartbeat) is still
+// running. Debounced per ticket so we don't write on every 2 s poll.
+//
+// AD-244: heartbeat-ONLY. This path used to also CREATE a fresh
+// `status: in_progress` execution if the ticket had none — which meant any
+// ticket the terminal flagged as capturing (whether or not Run had been
+// clicked) would flip into a false-running state on the next poll. Mirrors
+// the AD-232 heartbeat-only contract from `feedback/[id]/comments/route.ts`:
+// running state must come from an explicit Run (UI button → /api/run, or
+// terminal-server's own `bumpExecutionForActiveTickets` on /execute with
+// ticketIds). Polling never creates execution rows.
 const lastBumpMs = new Map<string, number>();
 const HEARTBEAT_DEBOUNCE_MS = 5_000;
 
-function bumpCaptureTickets(projectId: string | null, ticketIds: string[]): void {
+async function bumpCaptureTickets(projectId: string | null, ticketIds: string[]): Promise<void> {
     if (!Array.isArray(ticketIds) || ticketIds.length === 0) return;
     const now = Date.now();
     const toBump = ticketIds.filter(id => {
@@ -26,33 +34,12 @@ function bumpCaptureTickets(projectId: string | null, ticketIds: string[]): void
     if (toBump.length === 0) return;
 
     try {
-        const data = readFeedback(projectId);
-        const nowIso = new Date(now).toISOString();
-        const idSet = new Set(toBump.map(id => String(id).toUpperCase()));
-        let changed = false;
-        for (const ticket of data.tickets) {
-            if (!idSet.has(String(ticket.id || '').toUpperCase())) continue;
-            const prior = ticket.execution;
-            // Respect explicit agent completion — heartbeat doesn't resurrect.
-            if (prior?.status === 'done' || prior?.status === 'blocked') continue;
-            ticket.execution = {
-                runId: (prior?.runId) || `exec-${Date.now().toString(36)}`,
-                actor: (prior?.actor) || 'Coding Agent',
-                actorType: 'ai',
-                status: 'in_progress',
-                startedAt: prior?.startedAt || nowIso,
-                updatedAt: nowIso,
-                completedAt: null,
-                plan: (prior?.plan) || '',
-                summary: (prior?.summary) || '',
-                filesTouched: Array.isArray(prior?.filesTouched) ? prior!.filesTouched : [],
-                verification: Array.isArray(prior?.verification) ? prior!.verification : [],
-                blocker: null,
-            };
-            ticket.updatedAt = nowIso;
-            changed = true;
-        }
-        if (changed) writeFeedback(data, projectId);
+        await withFeedbackLock(projectId, () => {
+            const data = readFeedback(projectId);
+            const nowIso = new Date(now).toISOString();
+            const changed = applyCaptureHeartbeat(data, toBump, nowIso);
+            if (changed) writeFeedback(data, projectId);
+        });
     } catch {
         // Heartbeat is best-effort — never throw into the status response.
     }
@@ -83,7 +70,7 @@ export async function GET(request: NextRequest) {
             // ticket the terminal server reports as capturing, so the client's
             // freshness backstop keeps showing the indicator even when the
             // old terminal-server code (pre-heartbeat) is still running.
-            bumpCaptureTickets(projectId, Array.isArray(data.captureTicketIds) ? data.captureTicketIds : []);
+            await bumpCaptureTickets(projectId, Array.isArray(data.captureTicketIds) ? data.captureTicketIds : []);
             return NextResponse.json({
                 connected: true,
                 capturing: data.capturing || false,
@@ -111,7 +98,8 @@ export async function GET(request: NextRequest) {
             requestUpdatedAt: null,
             lastEvent: null,
         });
-    } catch {
+    } catch (err) {
+        console.error('[ADHDev] GET /api/terminal-status error:', err);
         return NextResponse.json({
             connected: false,
             capturing: false,

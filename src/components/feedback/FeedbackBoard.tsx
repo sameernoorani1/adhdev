@@ -3333,6 +3333,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         setNewTicketDefaultStatus(undefined);
                         setShowNewTicket(true);
                     }}
+                    // AD-251: clicking a linked-ticket row in the modal
+                    // swaps the modal to that ticket. Resolve case-insensitively
+                    // because the relations graph stores ids in upper-case.
+                    onSelectTicket={(linkedId) => {
+                        const target = (data?.tickets || []).find(t => t.id.toUpperCase() === linkedId.toUpperCase());
+                        if (target) setSelectedTicket(target);
+                    }}
                     onUpdate={handleUpdateTicket}
                     onAddComment={handleAddComment}
                     onDelete={handleDeleteTicket}

@@ -261,11 +261,17 @@ interface TicketDetailModalProps {
     onCoachMarkSeen?: (key: string) => void;
     onHideAllTips?: () => void;
     // AD-180 follow-up: full ticket list for the Linked panel's title-search.
-    allTickets?: Pick<Ticket, 'id' | 'title' | 'status'>[];
+    // AD-251: also exposes priority + ticketType so the rendered row can
+    // surface them next to status without a second lookup.
+    allTickets?: Pick<Ticket, 'id' | 'title' | 'status' | 'priority' | 'ticketType'>[];
     // Open a sub-task quick-create with this ticket pre-filled as parent.
     onCreateSubtask?: (parentTicketId: string) => void;
     // AD-186: open the Brain Dump panel and scroll to a chat message id.
     onOpenChatMessage?: (messageId: string) => void;
+    // AD-251: switch the modal to a different ticket when the user clicks a
+    // linked row in the Linked Tickets panel. The parent (FeedbackBoard)
+    // resolves the id and sets selectedTicket; we just hand it the id.
+    onSelectTicket?: (ticketId: string) => void;
 }
 
 /** VD-190: Description block with "See more" truncation for long descriptions */
@@ -351,6 +357,7 @@ export function TicketDetailModal({
     allTickets = [],
     onCreateSubtask,
     onOpenChatMessage,
+    onSelectTicket,
 }: TicketDetailModalProps) {
     const [commentText, setCommentText] = useState('');
     const [commentImages, setCommentImages] = useState<UploadedFile[]>([]);
@@ -1188,6 +1195,7 @@ export function TicketDetailModal({
                             onUpdate={onUpdate}
                             allTickets={allTickets}
                             onCreateSubtask={onCreateSubtask}
+                            onSelectTicket={onSelectTicket}
                         />
 
 
@@ -1519,16 +1527,38 @@ export function TicketDetailModal({
 // `+ New sub-task` shortcut that creates a fresh ticket with this ticket
 // pre-filled as parent. Bidirectional bookkeeping happens server-side in
 // the PATCH handler.
+// AD-251: status pill colors mirror the kanban-column accents so a glance
+// at the linked panel reads the same as a glance at the board. Kept inline
+// (no shared map) to avoid a circular import on FeedbackBoard's column
+// config — the values are stable across the AI-allowed status set.
+const LINKED_STATUS_STYLE: Record<string, string> = {
+    backlog: 'bg-rose-500/15 text-rose-300 border-rose-400/25',
+    todo: 'bg-amber-500/15 text-amber-300 border-amber-400/25',
+    reopen: 'bg-purple-500/15 text-purple-300 border-purple-400/25',
+    done: 'bg-emerald-500/15 text-emerald-300 border-emerald-400/25',
+    reviewed: 'bg-sky-500/15 text-sky-300 border-sky-400/25',
+    observe: 'bg-cyan-500/15 text-cyan-300 border-cyan-400/25',
+    deferred: 'bg-slate-500/15 text-slate-300 border-slate-400/25',
+};
+const LINKED_PRIORITY_STYLE: Record<string, string> = {
+    low: 'text-slate-400',
+    medium: 'text-amber-400',
+    high: 'text-orange-400',
+    critical: 'text-red-400',
+};
+
 function LinkedTicketsPanel({
     ticket,
     onUpdate,
     allTickets = [],
     onCreateSubtask,
+    onSelectTicket,
 }: {
     ticket: Ticket;
     onUpdate: (id: string, updates: Partial<Ticket>) => void;
-    allTickets?: Pick<Ticket, 'id' | 'title' | 'status'>[];
+    allTickets?: Pick<Ticket, 'id' | 'title' | 'status' | 'priority' | 'ticketType'>[];
     onCreateSubtask?: (parentTicketId: string) => void;
+    onSelectTicket?: (ticketId: string) => void;
 }) {
     const [addKind, setAddKind] = useState<RelationKind>('subtask');
     const [searchTerm, setSearchTerm] = useState('');
@@ -1590,39 +1620,70 @@ function LinkedTicketsPanel({
             <h4 className="text-xs text-vd-text-tertiary uppercase tracking-wider mb-2">Linked Tickets</h4>
 
             {hasAny && (
-                <div className="space-y-2 mb-2">
+                // AD-251: list view (one row per linked ticket) instead of
+                // the prior chip view. Each row leads with a status pill so
+                // the reader can see at a glance which links are still open
+                // vs already shipped, and the whole row is clickable to
+                // switch the modal to that ticket. The chip view kept
+                // truncating titles and made it impossible to gauge whether
+                // a parent / sub-task was still in flight.
+                <div className="space-y-3 mb-2">
                     {RELATION_KINDS.filter(k => grouped[k].length > 0).map(kind => (
-                        // AD-193: relation kind label was too dim to read; bumped
-                        // size, weight, and accent color so the kind ("Sub-task
-                        // of", "Parent", "Blocks", etc.) is unmissable next to
-                        // the linked ticket chips.
-                        <div key={kind} className="flex flex-wrap items-center gap-1.5">
-                            <span className="text-[11px] font-semibold text-vd-accent-gold/80 uppercase tracking-wider min-w-[80px]">
+                        <div key={kind}>
+                            <div className="text-[10px] font-semibold text-vd-accent-gold/80 uppercase tracking-wider mb-1">
                                 {RELATION_LABEL[kind]}
-                            </span>
-                            {grouped[kind].map(rel => {
-                                const linkedTicket = ticketById.get(rel.ticketId.toUpperCase());
-                                return (
-                                    <span
-                                        key={`${rel.kind}:${rel.ticketId}`}
-                                        className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded bg-vd-bg-tertiary border border-vd-border text-vd-text-secondary max-w-full"
-                                        title={linkedTicket?.title || rel.ticketId}
-                                    >
-                                        <span className="font-mono shrink-0">{rel.ticketId}</span>
-                                        {linkedTicket?.title && (
-                                            <span className="truncate text-vd-text-tertiary max-w-[200px]">— {linkedTicket.title}</span>
-                                        )}
-                                        <button
-                                            type="button"
-                                            onClick={() => handleRemove(rel)}
-                                            className="text-vd-text-tertiary hover:text-red-400 leading-none shrink-0"
-                                            title="Remove link"
+                            </div>
+                            <ul className="space-y-1">
+                                {grouped[kind].map(rel => {
+                                    const linkedTicket = ticketById.get(rel.ticketId.toUpperCase());
+                                    const status = linkedTicket?.status || 'unknown';
+                                    const priority = linkedTicket?.priority;
+                                    const statusClass = LINKED_STATUS_STYLE[status] || 'bg-vd-bg-tertiary text-vd-text-tertiary border-vd-border';
+                                    const priorityClass = priority ? LINKED_PRIORITY_STYLE[priority] : '';
+                                    const isClickable = !!onSelectTicket && !!linkedTicket;
+                                    return (
+                                        <li
+                                            key={`${rel.kind}:${rel.ticketId}`}
+                                            className={
+                                                'group/linked flex items-center gap-2 px-2 py-1.5 rounded border border-vd-border bg-vd-bg-tertiary/50 ' +
+                                                (isClickable ? 'cursor-pointer hover:bg-vd-bg-tertiary hover:border-vd-accent-gold/40' : '')
+                                            }
+                                            onClick={() => { if (isClickable) onSelectTicket!(rel.ticketId.toUpperCase()); }}
+                                            role={isClickable ? 'button' : undefined}
+                                            tabIndex={isClickable ? 0 : undefined}
+                                            onKeyDown={e => {
+                                                if (!isClickable) return;
+                                                if (e.key === 'Enter' || e.key === ' ') {
+                                                    e.preventDefault();
+                                                    onSelectTicket!(rel.ticketId.toUpperCase());
+                                                }
+                                            }}
+                                            title={linkedTicket ? `Open ${rel.ticketId}` : `Linked ticket ${rel.ticketId} not loaded`}
                                         >
-                                            ×
-                                        </button>
-                                    </span>
-                                );
-                            })}
+                                            <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide shrink-0 ${statusClass}`}>
+                                                {status}
+                                            </span>
+                                            <span className="font-mono text-[11px] text-vd-text-secondary shrink-0">{rel.ticketId}</span>
+                                            <span className="text-[12px] text-vd-text-primary flex-1 truncate">
+                                                {linkedTicket?.title || <span className="italic text-vd-text-tertiary">(not loaded)</span>}
+                                            </span>
+                                            {priority && (
+                                                <span className={`text-[10px] font-semibold uppercase tracking-wide shrink-0 ${priorityClass}`} title="Priority">
+                                                    {priority}
+                                                </span>
+                                            )}
+                                            <button
+                                                type="button"
+                                                onClick={e => { e.stopPropagation(); handleRemove(rel); }}
+                                                className="text-vd-text-tertiary hover:text-red-400 leading-none shrink-0 opacity-0 group-hover/linked:opacity-100 transition-opacity"
+                                                title="Remove link"
+                                            >
+                                                ×
+                                            </button>
+                                        </li>
+                                    );
+                                })}
+                            </ul>
                         </div>
                     ))}
                 </div>

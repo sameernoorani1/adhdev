@@ -1,20 +1,23 @@
-export function buildRunPrompt(ticketIds: string[]): string {
+// AD-064: when the board file is large enough that a blind read will trip the
+// agent's per-tool token cap, surface that fact in the Run prompt itself —
+// not just in ADHDEV.md. The dynamic per-board size warning lives in
+// `./boardSizeWarning` (server-only — uses `node:fs`/`node:path`); callers
+// from the server pass the computed string in via `sizeNote`. Client callers
+// (FeedbackBoard, TicketDetailModal) just omit it — the static "don't read
+// the whole thing if it's large" instruction in the prompt body still fires.
+
+export function buildRunPrompt(ticketIds: string[], sizeNote: string = ''): string {
     const ids = Array.from(new Set(ticketIds.map(id => id.trim()).filter(Boolean)));
-    // AD-146: the address-by-name directive lives in the contract, not the
-    // Run prompt. ADHDEV.md's "The User" section, the per-ticket
-    // _executionContract, and the terminal auto-context injection all carry
-    // it already. The Run / Copy for AI prompt stays light — it's a pointer
-    // to the contract, not a restatement.
 
     if (ids.length === 0) {
-        return 'Read ADHDEV.md. Inspect only the relevant entries in .adhdev/board.json or use targeted search if the board file is large. Follow the ADHDev execution contract and work on all actionable tickets. Add this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Prompt ADHDev Guidance.';
+        return `Read ADHDEV.md. Inspect only the relevant entries in .adhdev/board.json or use targeted search if the board file is large. Follow the ADHDev execution contract and work on all actionable tickets.${sizeNote}\nAdd this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Prompt ADHDev Guidance.`;
     }
 
     if (ids.length === 1) {
-        return `Work on ticket ${ids[0]}.\nRead ADHDEV.md and the full ${ids[0]} entry in .adhdev/board.json, including the hidden execution contract, all comments, all activity, and current execution state. Do not read the entire board file if it is large; resolve only the full entry for ${ids[0]}.\nAdd this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Prompt ADHDev Guidance.`;
+        return `Work on ticket ${ids[0]}.\nRead ADHDEV.md and the full ${ids[0]} entry in .adhdev/board.json, including the hidden execution contract, all comments, all activity, and current execution state. Do not read the entire board file if it is large; resolve only the full entry for ${ids[0]}.${sizeNote}\nAdd this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Prompt ADHDev Guidance.`;
     }
 
-    return `Work on these tickets: ${ids.join(', ')}.\nRead ADHDEV.md and the full entry for each referenced ticket in .adhdev/board.json, including the hidden execution contract, all comments, all activity, and current execution state. Do not read the entire board file if it is large; resolve only the full entries for the referenced tickets.\nAdd this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Prompt ADHDev Guidance.`;
+    return `Work on these tickets: ${ids.join(', ')}.\nRead ADHDEV.md and the full entry for each referenced ticket in .adhdev/board.json, including the hidden execution contract, all comments, all activity, and current execution state. Do not read the entire board file if it is large; resolve only the full entries for the referenced tickets.${sizeNote}\nAdd this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Prompt ADHDev Guidance.`;
 }
 
 export function buildBatchPlanningPrompt(mode: 'full' | 'incremental', ticketIds?: string[]): string {

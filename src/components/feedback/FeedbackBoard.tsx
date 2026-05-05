@@ -282,6 +282,15 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // Drives the re-probe loop that auto-dismisses the banner once `claude` is
     // detected after the install completes (or after a 3-minute timeout).
     const [claudeInstallInProgress, setClaudeInstallInProgress] = useState(false);
+    // AD-236: session-only tip dismissal. Replaces the previous permanent
+    // hideTips flip — that was destructive (one click, no undo from the UI).
+    // Now the tip popover button hides tips for the current session only;
+    // they return on next launch. Permanent dismissal still lives in
+    // Settings → "Hide tips" toggle for users who genuinely want them gone.
+    const [tipsHiddenThisSession, setTipsHiddenThisSession] = useState<boolean>(() => {
+        if (typeof window === 'undefined') return false;
+        return sessionStorage.getItem('adhdev-tips-hidden-session') === '1';
+    });
     const [newProjectPath, setNewProjectPath] = useState('');
     const [newProjectName, setNewProjectName] = useState('');
     const [newProjectPrefix, setNewProjectPrefix] = useState('AD');
@@ -3155,6 +3164,41 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         })()}
                         <p className="text-center text-[10px] text-vd-text-tertiary pt-1">Swipe left/right to change column</p>
                     </div>
+                ) : (data?.tickets?.length ?? 0) === 0 ? (
+                    /* ---- AD-234: empty-board state (folder selected, 0 tickets) ----
+                       Replaces the 5-column kanban with a full-width CTA so the
+                       user has a single clear next action instead of five "No
+                       tickets" placeholders that read as "ADHDev is broken." */
+                    <div className="flex-1 flex items-center justify-center px-6">
+                        <div className="max-w-md w-full text-center space-y-6 py-12">
+                            <div>
+                                <div className="w-14 h-14 mx-auto mb-3 rounded-full bg-vd-accent-gold/10 border border-vd-accent-gold/30 flex items-center justify-center">
+                                    <svg className="w-7 h-7 text-vd-accent-gold" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                                        <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+                                    </svg>
+                                </div>
+                                <h2 className="text-base font-semibold text-vd-text-primary">Your board is ready.</h2>
+                                <p className="text-xs text-vd-text-tertiary mt-1">Add the first ticket — or scan this codebase for ones already lurking.</p>
+                            </div>
+                            <div className="flex flex-col gap-2">
+                                <button
+                                    onClick={() => handleAddTicketToColumn('todo')}
+                                    className="px-4 py-2 text-sm font-medium bg-vd-accent-gold text-vd-text-inverse rounded-md hover:opacity-90"
+                                >
+                                    Create your first ticket
+                                </button>
+                                <button
+                                    onClick={() => setShowOnboardingWizard(true)}
+                                    className="px-4 py-2 text-sm font-medium border border-vd-accent-gold/40 text-vd-accent-gold rounded-md hover:bg-vd-accent-gold/10"
+                                >
+                                    Run codebase scan
+                                </button>
+                            </div>
+                            <p className="text-[10px] text-vd-text-tertiary">
+                                Tip: the <span className="text-vd-text-secondary font-medium">+ New Ticket</span> button in the header does the same as the first option.
+                            </p>
+                        </div>
+                    </div>
                 ) : (
                     /* ---- DESKTOP: Kanban columns with DnD ---- */
                     <DndContext
@@ -3304,11 +3348,16 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     terminalVisible={showTerminal && !isMobile}
                     terminalPlacement={termPlacement}
                     coachMarks={onboardingState.coachMarks || {}}
-                    hideTips={!!onboardingState.hideTips}
+                    hideTips={!!onboardingState.hideTips || tipsHiddenThisSession}
                     onCoachMarkSeen={(key) => {
                         void patchOnboardingState({ coachMarks: { ...(onboardingState.coachMarks || {}), [key]: true } });
                     }}
-                    onHideAllTips={() => { void patchOnboardingState({ hideTips: true }); }}
+                    onHideAllTips={() => {
+                        // AD-236: session-only dismissal. Tips return on next launch.
+                        // Persistent dismissal lives in Settings.
+                        setTipsHiddenThisSession(true);
+                        try { sessionStorage.setItem('adhdev-tips-hidden-session', '1'); } catch { /* ignore */ }
+                    }}
                 />
             </ErrorBoundary>
 
@@ -3347,6 +3396,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     && !!onboardingState.welcomeSeen
                     && !onboardingState.coachMarks?.drag
                     && !onboardingState.hideTips
+                    && !tipsHiddenThisSession
                     && !isMobile
                     && !selectedTicket  // never stack a board-level hint behind an open ticket modal
                 }
@@ -3355,7 +3405,11 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 title="Pro tip"
                 message="Grab any card and drop it in another column. ADHDev tracks the move as activity so nothing slips through."
                 onSeen={() => { void patchOnboardingState({ coachMarks: { ...(onboardingState.coachMarks || {}), drag: true } }); }}
-                onHideAll={() => { void patchOnboardingState({ hideTips: true }); }}
+                onHideAll={() => {
+                    // AD-236: session-only dismissal. Tips return on next launch.
+                    setTipsHiddenThisSession(true);
+                    try { sessionStorage.setItem('adhdev-tips-hidden-session', '1'); } catch { /* ignore */ }
+                }}
             />
 
             {/* AD-166: 4-step onboarding wizard. Takes precedence over the

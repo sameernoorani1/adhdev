@@ -1,5 +1,8 @@
 import { NextRequest } from 'next/server';
-import { readFeedback, writeFeedback, resolveTicketById } from '@/lib/feedback/core';
+import { readFeedback, writeFeedback, withFeedbackLock, resolveTicketById } from '@/lib/feedback/core';
+import { terminalAuthHeaders } from '@/lib/feedback/sessionToken';
+import { getCurrentGitSha } from '@/lib/feedback/gitDiff';
+import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
 
 /**
  * POST /api/run-terminal
@@ -18,51 +21,63 @@ export async function POST(request: NextRequest) {
         // AD-141: scope reads and the downstream /execute call to the caller's
         // project so tabs on different boards don't cross-wire.
         const projectId = request.headers.get('x-adhdev-project');
-        const data = readFeedback(projectId);
-        const resolved = resolveTicketById(data, ticketId);
-        if (!resolved.ok) return Response.json({ error: resolved.error }, { status: resolved.status || 404 });
+        const lockResult = await withFeedbackLock(projectId, () => {
+            const data = readFeedback(projectId);
+            const resolved = resolveTicketById(data, ticketId);
+            if (!resolved.ok) {
+                return { error: { message: resolved.error, status: resolved.status || 404 } };
+            }
 
-        const ticket = resolved.ticket!;
+            const ticket = resolved.ticket!;
+            const now = new Date().toISOString();
+            const idx = resolved.index!;
+            data.tickets[idx].comments = [
+                ...(data.tickets[idx].comments || []),
+                {
+                    id: `c-${Date.now().toString(36)}`,
+                    author: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
+                    authorType: 'ai',
+                    content: `**Claiming ticket.** Terminal run declared for ${ticket.id}. Will inspect the ticket, work the request, and post a completion update here.`,
+                    images: [],
+                    createdAt: now,
+                },
+            ];
+            // AD-240: capture git HEAD as the diff baseline.
+            const project = getProjectById(projectId) || getActiveProject();
+            const startedRef = project ? (getCurrentGitSha(project.path) ?? undefined) : undefined;
+            data.tickets[idx].execution = {
+                runId: `run-${Date.now().toString(36)}`,
+                actor: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
+                actorType: 'ai',
+                status: 'in_progress',
+                startedAt: now,
+                updatedAt: now,
+                filesTouched: [],
+                verification: [],
+                startedRef,
+            };
+            if (!data.tickets[idx].activity) data.tickets[idx].activity = [];
+            data.tickets[idx].activity.push({
+                action: 'claimed',
+                by: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
+                byType: 'ai',
+                at: now
+            });
+            data.tickets[idx].activity.push({
+                action: 'execution_started',
+                by: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
+                byType: 'ai',
+                at: now
+            });
+            data.tickets[idx].updatedAt = now;
+            writeFeedback(data, projectId);
+            return { ticket };
+        });
 
-        // Mark ticket as in-progress
-        const now = new Date().toISOString();
-        const idx = resolved.index!;
-        data.tickets[idx].comments = [
-            ...(data.tickets[idx].comments || []),
-            {
-                id: `c-${Date.now().toString(36)}`,
-                author: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
-                authorType: 'ai',
-                content: `**Claiming ticket.** Terminal run declared for ${ticket.id}. Will inspect the ticket, work the request, and post a completion update here.`,
-                images: [],
-                createdAt: now,
-            },
-        ];
-        data.tickets[idx].execution = {
-            runId: `run-${Date.now().toString(36)}`,
-            actor: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
-            actorType: 'ai',
-            status: 'in_progress',
-            startedAt: now,
-            updatedAt: now,
-            filesTouched: [],
-            verification: [],
-        };
-        if (!data.tickets[idx].activity) data.tickets[idx].activity = [];
-        data.tickets[idx].activity.push({
-            action: 'claimed',
-            by: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
-            byType: 'ai',
-            at: now
-        });
-        data.tickets[idx].activity.push({
-            action: 'execution_started',
-            by: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
-            byType: 'ai',
-            at: now
-        });
-        data.tickets[idx].updatedAt = now;
-        writeFeedback(data, projectId);
+        if (lockResult.error) {
+            return Response.json({ error: lockResult.error.message }, { status: lockResult.error.status });
+        }
+        const ticket = lockResult.ticket!;
 
         // Build prompt from ticket context
         const prompt = [
@@ -100,7 +115,8 @@ export async function POST(request: NextRequest) {
         try {
             const response = await fetch('http://localhost:3112/execute', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                // AD-204: forward the session token to the terminal server.
+                headers: { 'Content-Type': 'application/json', ...terminalAuthHeaders() },
                 body: JSON.stringify({ command, ticketId, projectId: projectId ?? undefined }),
             });
 
@@ -108,6 +124,7 @@ export async function POST(request: NextRequest) {
                 throw new Error(`Terminal server responded with ${response.status}`);
             }
         } catch (err) {
+            console.error('[ADHDev] POST /api/run-terminal terminal-server fallback:', err);
             // Fallback: return the command for manual execution
             return Response.json({
                 success: false,
@@ -124,6 +141,7 @@ export async function POST(request: NextRequest) {
             message: 'Command sent to terminal'
         });
     } catch (err) {
+        console.error('[ADHDev] POST /api/run-terminal error:', err);
         return Response.json({ error: String(err) }, { status: 500 });
     }
 }

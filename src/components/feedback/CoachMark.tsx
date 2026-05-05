@@ -154,8 +154,10 @@ export function CoachMark({ show, targetRef, message, title, placement = 'bottom
                             <button onClick={onSeen} className="font-semibold px-2 py-0.5 rounded bg-black/15 hover:bg-black/25 transition-colors">
                                 Got it
                             </button>
-                            <button onClick={onHideAll} className="opacity-80 hover:opacity-100 hover:underline">
-                                Don&apos;t show tips
+                            {/* AD-236: session-only dismissal — tips return on next launch.
+                                Permanent dismissal lives in Settings → "Hide tips". */}
+                            <button onClick={onHideAll} className="opacity-80 hover:opacity-100 hover:underline" title="Tips return next launch. To hide them permanently, use Settings.">
+                                Hide for this session
                             </button>
                         </div>
                     </div>

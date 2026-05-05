@@ -546,9 +546,32 @@ async function start() {
 
   const registry = readRegistry();
   if (registry.projects.length === 0) {
-    console.log('  No projects registered. Initializing current directory...\n');
-    initProjectDir(process.cwd());
-    registerProject(process.cwd());
+    // AD-239: prompt before silently initializing in cwd. If the user runs
+    // `adhdev` from the wrong folder by mistake (Desktop, home dir, etc.),
+    // we'd otherwise pollute that folder with .adhdev/ + use the folder's
+    // basename as the project name. One Y/n confirmation + an optional name
+    // override is cheap insurance.
+    const cwd = process.cwd();
+    const defaultName = basename(cwd);
+    const interactive = process.stdin.isTTY && !args.includes('--yes') && !args.includes('-y');
+
+    if (interactive) {
+      const proceed = await prompt(`  Initialize ADHDev in ${cwd}? Project name will be "${defaultName}". (Y/n): `, 'Y');
+      if (/^n/i.test(String(proceed).trim())) {
+        console.log('  Aborted. Run `adhdev init` from inside a project directory to start.\n');
+        process.exit(0);
+      }
+      const customName = await prompt(`  Custom project name (Enter to keep "${defaultName}"): `, defaultName);
+      console.log('');
+      initProjectDir(cwd);
+      registerProject(cwd, String(customName).trim() || defaultName);
+    } else {
+      // No TTY or --yes flag → non-interactive auto-init (preserves the
+      // CI / scripted-install path).
+      console.log('  No projects registered. Initializing current directory...\n');
+      initProjectDir(cwd);
+      registerProject(cwd);
+    }
   }
 
   const active = registry.projects.find(p => p.id === registry.activeProjectId) || registry.projects[0];
@@ -609,16 +632,22 @@ async function start() {
   const isSourceCheckout = existsSync(join(pkgDir, '.git'));
   const hasPrebuild = existsSync(join(pkgDir, '.next', 'BUILD_ID'));
   const useProd = !isSourceCheckout && hasPrebuild;
+  // AD-201: bind to 127.0.0.1 so the dev/prod server is not reachable from the
+  // wider network. The terminal server is similarly bound (server/terminal.mjs).
   const nextArgs = useProd
-    ? ['next', 'start', '-p', String(port)]
-    : ['next', 'dev', '-p', String(port)];
+    ? ['next', 'start', '-H', '127.0.0.1', '-p', String(port)]
+    : ['next', 'dev', '-H', '127.0.0.1', '-p', String(port)];
   console.log(`  ✓ Board starting on http://localhost:${port} (${useProd ? 'prod' : 'dev'} mode)\n`);
 
-  const nextChild = spawn('npx', nextArgs, {
+  // AD-238: drop `shell: true` to silence DEP0190 and remove the (unused
+  // here) command-injection surface. On Windows `npx` is `npx.cmd`; we
+  // resolve to the right shim explicitly so spawn doesn't fail to find it
+  // when shell resolution is off.
+  const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+  const nextChild = spawn(npxCmd, nextArgs, {
     cwd: pkgDir,
     env: { ...process.env, PORT: String(port) },
     stdio: 'inherit',
-    shell: true,
   });
 
   // Auto-open browser once ready — single attempt via polling

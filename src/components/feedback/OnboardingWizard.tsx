@@ -370,12 +370,12 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
         setStep(prev);
     };
 
-    const totalSteps = folderSource === 'new' ? 3 : 4;
-    const visualStep = (() => {
-        if (folderSource !== 'new') return step;
-        if (step <= 2) return step;
-        return 3; // collapse step 4 into "step 3 of 3" for the new-folder path
-    })();
+    // AD-235: total step count is always 4. The new-folder path skips Step 3
+    // (scan), but we don't redenominate — that made the indicator drift from
+    // "1 of 4" to "1 of 3" mid-flow, which read as glitchy. With a fixed
+    // total of 4 and a 4-dot progress indicator, the user always sees the
+    // same shape regardless of path.
+    const totalSteps = 4;
 
     return (
         <div className="fixed inset-0 z-[70] flex items-center justify-center" onClick={(e) => e.stopPropagation()}>
@@ -385,7 +385,28 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
                 <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-vd-border">
                     <div>
                         <h2 className="text-sm font-semibold text-vd-text-primary">Welcome to ADHDev</h2>
-                        <p className="text-[10px] text-vd-text-tertiary mt-0.5">Step {visualStep} of {totalSteps}</p>
+                        {/* AD-235: 4-dot progress indicator. Stays four dots regardless of
+                            folder-source path (new-folder skips Step 3 silently). */}
+                        <div className="flex items-center gap-1 mt-1.5">
+                            {Array.from({ length: totalSteps }).map((_, i) => {
+                                const stepNum = i + 1;
+                                const isActive = step === stepNum;
+                                const isPast = step > stepNum;
+                                return (
+                                    <span
+                                        key={i}
+                                        className={`h-1.5 rounded-full transition-all ${
+                                            isActive
+                                                ? 'w-6 bg-vd-accent-gold'
+                                                : isPast
+                                                    ? 'w-1.5 bg-vd-accent-gold/60'
+                                                    : 'w-1.5 bg-vd-border'
+                                        }`}
+                                    />
+                                );
+                            })}
+                            <span className="ml-2 text-[10px] text-vd-text-tertiary">Step {step} of {totalSteps}</span>
+                        </div>
                     </div>
                     <button
                         onClick={handleSkipAll}

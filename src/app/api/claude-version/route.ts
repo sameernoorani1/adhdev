@@ -20,19 +20,25 @@ export async function GET() {
         const outdated = Number.isFinite(major) && major < 2;
         return NextResponse.json({ ok: true, version, outdated });
     } catch (err) {
+        console.error('[ADHDev] GET /api/claude-version error:', err);
         return NextResponse.json({ ok: false, error: String(err) });
     }
 }
 
 function probeClaudeVersion(): Promise<{ version: string | null; error: string | null }> {
     return new Promise(resolve => {
+        // AD-238: drop `shell: true` (DEP0190 + command-injection surface).
+        // On Windows the `claude` shim is `claude.cmd`; we resolve to it
+        // explicitly so spawn doesn't fail to find it without shell PATHEXT
+        // resolution.
+        const claudeCmd = process.platform === 'win32' ? 'claude.cmd' : 'claude';
         let child;
         try {
-            child = spawn('claude', ['--version'], {
-                shell: true,
+            child = spawn(claudeCmd, ['--version'], {
                 windowsHide: true,
             });
-        } catch {
+        } catch (err) {
+            console.error('[ADHDev] GET /api/claude-version probe spawn error:', err);
             resolve({ version: null, error: 'spawn_failed' });
             return;
         }

@@ -96,6 +96,16 @@ export interface TicketExecution {
     result?: 'success' | 'blocked';
     blocker?: string | null;
     batchId?: string;
+    // AD-240: git HEAD SHA captured when the run started; ground-truth diff
+    // baseline. Optional because runs that started before AD-240 shipped
+    // won't have it — the PATCH handler falls back to agent self-report
+    // when this is missing.
+    startedRef?: string;
+    // AD-240: 'git-diff' when filesTouched was overwritten by git ground-truth
+    // at done-time; 'agent' when the agent's self-report was kept (e.g. project
+    // not in git, or no startedRef captured). The UI can use this to label
+    // the file list honestly.
+    filesTouchedSource?: 'git-diff' | 'agent';
 }
 
 export interface FeedbackBatch {
@@ -216,7 +226,7 @@ function normalizeComment(comment: FeedbackTicket['comments'][number]): Feedback
 //      identical-looking pile-ups for things that were obviously written later.
 // We never invent earlier times — we only push fudged AI timestamps forward to
 // `prev + 1ms` so order is preserved without claiming false precision.
-function fixupCommentTimestamps(
+export function fixupCommentTimestamps(
     comments: FeedbackTicket['comments'],
     ticketCreatedAt: string | undefined,
 ): FeedbackTicket['comments'] {
@@ -258,11 +268,17 @@ function normalizeTicket(ticket: FeedbackTicket): FeedbackTicket {
     }
 
     const contractVersion = ticket.contractVersion || getDefaultExecutionContract().version;
+    // AD-211: _executionContract is computed at read-time (see readFeedback)
+    // and stripped before persistence (see writeFeedback) so the field stops
+    // creating noisy board.json diffs whenever the contract notice changes.
+    // We preserve any inline value through normalize so callers that mutate
+    // a ticket and inspect it after writeFeedback still see the field on the
+    // in-memory copy.
     return {
         id: ticket.id,
         title: ticket.title,
         contractVersion,
-        _executionContract: buildInlineContractNotice(getDefaultExecutionContract()),
+        ...(ticket._executionContract ? { _executionContract: ticket._executionContract } : {}),
         description: ticket.description,
         status: ticket.status,
         priority: ticket.priority,
@@ -298,7 +314,40 @@ export function readFeedback(projectId?: string | null): FeedbackData {
     }
     ensureAdhdevProtocol(path.dirname(dir));
     const raw = fs.readFileSync(feedbackPath, 'utf-8');
-    return normalizeFeedbackData(JSON.parse(raw));
+    const data = normalizeFeedbackData(JSON.parse(raw));
+    // AD-211: enrich with _executionContract at read-time so API responses
+    // still expose the inline contract to agents, while the persisted file
+    // (see writeFeedback) stays free of it.
+    const contractNotice = buildInlineContractNotice(getDefaultExecutionContract());
+    if (Array.isArray(data.tickets)) {
+        for (const ticket of data.tickets) {
+            ticket._executionContract = contractNotice;
+        }
+    }
+    return data;
+}
+
+// AD-209: per-project async lock around read-modify-write. Two PATCHes racing
+// the same board would each `readFeedback`, mutate, then `writeFeedback` —
+// last writer wins, first writer's changes silently lost. The single-process
+// Next.js dev server doesn't need OS-level locks; chaining promises in a Map
+// is enough. Different projectIds get independent chains.
+const feedbackLocks = new Map<string, Promise<unknown>>();
+
+export async function withFeedbackLock<T>(
+    projectId: string | null | undefined,
+    fn: () => T | Promise<T>,
+): Promise<T> {
+    const key = projectId ?? '__default__';
+    const previous = feedbackLocks.get(key) ?? Promise.resolve();
+    const next = previous.then(fn, fn);
+    // tail never rejects, so the next waiter chains even if fn threw.
+    const tail: Promise<unknown> = next.catch(() => undefined);
+    feedbackLocks.set(key, tail);
+    tail.then(() => {
+        if (feedbackLocks.get(key) === tail) feedbackLocks.delete(key);
+    });
+    return next;
 }
 
 // AD-175: write-temp-then-rename so a kill mid-flush leaves the existing
@@ -309,7 +358,18 @@ export function readFeedback(projectId?: string | null): FeedbackData {
 export function writeFeedback(data: FeedbackData | Record<string, unknown>, projectId?: string | null) {
     const feedbackPath = getFeedbackPath(projectId);
     const normalized = isFeedbackData(data) ? normalizeFeedbackData(data) : data;
-    const payload = JSON.stringify(normalized, null, 2) + '\n';
+    // AD-211: strip _executionContract from the on-disk shape only; the
+    // in-memory `data` keeps it so PATCH responses still carry the field.
+    const persistShape = isFeedbackData(normalized as FeedbackData)
+        ? {
+            ...(normalized as FeedbackData),
+            tickets: (normalized as FeedbackData).tickets.map(ticket => {
+                const { _executionContract: _omit, ...rest } = ticket;
+                return rest as FeedbackTicket;
+            }),
+        }
+        : normalized;
+    const payload = JSON.stringify(persistShape, null, 2) + '\n';
     const tmp = `${feedbackPath}.tmp-${process.pid}-${Date.now().toString(36)}`;
     try {
         fs.writeFileSync(tmp, payload, 'utf-8');

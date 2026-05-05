@@ -367,8 +367,15 @@ function scopedKey(base: string, projectId?: string | null) {
     return projectId ? `${base}:${projectId}` : base;
 }
 
+// AD-237: emerald is the project's intended default accent. The previous
+// default of `'default'` (keep the skin's own gold) was a regression — fresh
+// installs were rendering peach/orange instead of the design-system emerald.
+// Using `'emerald'` here means: never-configured users see green; existing
+// users with an explicit palette stored in localStorage keep their pick.
+const DEFAULT_PALETTE_ID: PaletteId = 'emerald';
+
 function getSaved(projectId?: string | null): { skinId: string; mode: Mode; paletteId: PaletteId } {
-    if (typeof window === 'undefined') return { skinId: 'default', mode: 'dark', paletteId: 'default' };
+    if (typeof window === 'undefined') return { skinId: 'default', mode: 'dark', paletteId: DEFAULT_PALETTE_ID };
     // AD-127: prefer project-scoped settings, fall back to global keys (also
     // the prior default for existing users so behavior is preserved).
     const skinId = (projectId && localStorage.getItem(scopedKey(SKIN_KEY, projectId)))
@@ -379,7 +386,7 @@ function getSaved(projectId?: string | null): { skinId: string; mode: Mode; pale
         || 'dark') as Mode;
     const paletteId = ((projectId && localStorage.getItem(scopedKey(PALETTE_KEY, projectId)))
         || localStorage.getItem(PALETTE_KEY)
-        || 'default') as PaletteId;
+        || DEFAULT_PALETTE_ID) as PaletteId;
     return { skinId, mode, paletteId };
 }
 

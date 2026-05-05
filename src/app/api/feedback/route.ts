@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { allocateTicketId, readFeedback, resolveTicketById, writeFeedback, checkAdmin, getDefaultAgentRules } from '@/lib/feedback/core';
+import { allocateTicketId, readFeedback, resolveTicketById, writeFeedback, withFeedbackLock, checkAdmin, getDefaultAgentRules } from '@/lib/feedback/core';
 import { normalizeRelations, diffRelations, applyInverse } from '@/lib/feedback/relations';
 import { getDefaultExecutionContract, readUserDisplayName, DEFAULT_USER_DISPLAY_NAME } from '@/lib/feedback/protocol';
 import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
 import { validateAgentTransition } from '@/lib/feedback/transitions';
 import { recordOnboardingEvent } from '@/lib/feedback/onboardingEvents';
+import { getDiffFiles } from '@/lib/feedback/gitDiff';
 
 const ALLOWED_PRIORITIES = new Set(['low', 'medium', 'high', 'critical']);
 const ALLOWED_TICKET_TYPES = new Set(['normal', 'discussion', 'issue', 'idea', 'onboarding']);
@@ -31,6 +32,12 @@ const AI_ALLOWED_UPDATE_FIELDS = new Set([
     // AD-186: AI sets this on tickets spawned from Brain Dump triage; also
     // used to backfill historical chat-spawned tickets.
     'sourceMessageId',
+    // AD-199 follow-up: low-risk organizational metadata. Reported via
+    // AD-199 — AI agents should be able to tag waves + sessions on tickets
+    // they create as part of mission planning so the table view stays
+    // organised. These are pure labels — they don't affect transitions or
+    // execution gating.
+    'wave', 'session',
 ]);
 
 function getProjectId(request: NextRequest): string | null {
@@ -198,7 +205,9 @@ export async function POST(request: NextRequest) {
 
     try {
         const body = await request.json();
-        const data = readFeedback(getProjectId(request));
+        const projectId = getProjectId(request);
+        return await withFeedbackLock(projectId, async () => {
+        const data = readFeedback(projectId);
         const validationError = validateTicketFields(data, body);
         if (validationError) {
             return NextResponse.json({ error: validationError }, { status: 400 });
@@ -209,7 +218,7 @@ export async function POST(request: NextRequest) {
         const now = new Date().toISOString();
         const title = body.title || 'Untitled';
         const description = body.description || '';
-        const reporter = body.reporter || resolveDisplayName(getProjectId(request)).toLowerCase();
+        const reporter = body.reporter || resolveDisplayName(projectId).toLowerCase();
         const createdByType = body.reporterType || body.createdByType || body.authorType || (reporter === 'system' ? 'system' : 'human');
         const tags = normalizeTags(body.tags);
         if ((createdByType === 'ai' || createdByType === 'system' || reporter === 'system') && !tags.includes('ai')) {
@@ -269,7 +278,7 @@ export async function POST(request: NextRequest) {
 
         // AD-138: first non-onboarding ticket the human actually authored.
         if (ticket.ticketType !== 'onboarding' && createdByType !== 'system' && createdByType !== 'ai') {
-            recordOnboardingEvent('firstUserTicketAt', getProjectId(request));
+            recordOnboardingEvent('firstUserTicketAt', projectId);
         }
 
         // AD-135: onboarding ticket AD-2 ("Create your first real ticket") auto-resolves
@@ -293,14 +302,28 @@ export async function POST(request: NextRequest) {
             }
         }
 
-        writeFeedback(data, getProjectId(request));
+        writeFeedback(data, projectId);
 
         return NextResponse.json(ticket, { status: 201 });
-    } catch {
+        });
+    } catch (err) {
+        console.error('[ADHDev] POST /api/feedback error:', err);
         return NextResponse.json({ error: 'Failed to create ticket' }, { status: 500 });
     }
 }
 
+// AD-208 SECURITY: `actorType` is trusted from the request body on every PATCH.
+// In the local single-user model that ADHDev ships in today, this is fine —
+// only code on the local machine (the board UI, the agent terminal, the CLI)
+// can reach this endpoint, and the same trust boundary already applies to
+// every other field in the body. The `actorType` value drives transition gating
+// (AI cannot move a ticket to `reviewed`/`observe`/`deferred`; humans can move
+// to anything). If a future hosted/team/multi-user deployment is ever shipped,
+// this becomes the central auth boundary and must be replaced with a
+// server-derived identity (signed session, OAuth subject, etc.) BEFORE that
+// deployment is exposed beyond a single trusted user. See AD-208 / MS-007 for
+// the audit context.
+//
 // PATCH — update ticket fields OR column config
 export async function PATCH(request: NextRequest) {
     const auth = await checkAdmin();
@@ -309,6 +332,7 @@ export async function PATCH(request: NextRequest) {
     try {
         const body = await request.json();
         const projectId = getProjectId(request);
+        return await withFeedbackLock(projectId, async () => {
         const data = readFeedback(projectId);
 
         // Update batches array
@@ -382,6 +406,24 @@ export async function PATCH(request: NextRequest) {
                 updatedAt: now,
             }
             : ticket.execution;
+
+        // AD-240: ground-truth filesTouched via `git diff` when an AI flips
+        // the ticket to done. If the project is in a git repo and we
+        // captured a baseline at run-start (execution.startedRef), the
+        // diff list overrides whatever the agent self-reported. Otherwise
+        // we keep the self-report and label the source so the UI can be
+        // honest about provenance.
+        if (mergedExecution && actorType === 'ai' && updates.status === 'done') {
+            const project = getProjectById(projectId) || getActiveProject();
+            const startedRef = (mergedExecution as { startedRef?: string }).startedRef;
+            const diff = project ? getDiffFiles(project.path, startedRef) : null;
+            if (diff !== null) {
+                (mergedExecution as { filesTouched: string[] }).filesTouched = diff;
+                (mergedExecution as { filesTouchedSource?: string }).filesTouchedSource = 'git-diff';
+            } else {
+                (mergedExecution as { filesTouchedSource?: string }).filesTouchedSource = 'agent';
+            }
+        }
         const syntheticComments: typeof ticket.comments = [];
         const nextComments = [...(ticket.comments || [])];
 
@@ -430,7 +472,7 @@ export async function PATCH(request: NextRequest) {
             // AD-138: first ticket to reach done. Skip onboarding tickets —
             // the funnel is about user-authored work, not the guided loop.
             if (ticket.ticketType !== 'onboarding') {
-                recordOnboardingEvent('firstDoneAt', getProjectId(request));
+                recordOnboardingEvent('firstDoneAt', projectId);
             }
         }
         if (mergedExecution) {
@@ -514,7 +556,9 @@ export async function PATCH(request: NextRequest) {
         writeFeedback(data, projectId);
 
         return NextResponse.json(data.tickets[index]);
-    } catch {
+        });
+    } catch (err) {
+        console.error('[ADHDev] PATCH /api/feedback error:', err);
         return NextResponse.json({ error: 'Failed to update' }, { status: 500 });
     }
 }
@@ -531,17 +575,20 @@ export async function DELETE(request: NextRequest) {
         }
 
         const projectId = getProjectId(request);
-        const data = readFeedback(projectId);
-        const resolved = resolveTicketById(data, id);
-        if (!resolved.ok) {
-            return NextResponse.json({ error: resolved.error }, { status: resolved.status });
-        }
+        return await withFeedbackLock(projectId, async () => {
+            const data = readFeedback(projectId);
+            const resolved = resolveTicketById(data, id);
+            if (!resolved.ok) {
+                return NextResponse.json({ error: resolved.error }, { status: resolved.status });
+            }
 
-        data.tickets.splice(resolved.index!, 1);
-        writeFeedback(data, projectId);
+            data.tickets.splice(resolved.index!, 1);
+            writeFeedback(data, projectId);
 
-        return NextResponse.json({ deleted: id });
-    } catch {
+            return NextResponse.json({ deleted: id });
+        });
+    } catch (err) {
+        console.error('[ADHDev] DELETE /api/feedback error:', err);
         return NextResponse.json({ error: 'Failed to delete' }, { status: 500 });
     }
 }

@@ -327,7 +327,7 @@ export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessage
                     className="px-3 py-1 text-[11px] font-medium rounded border border-vd-accent-gold/40 text-vd-accent-gold hover:bg-vd-accent-gold/10 disabled:opacity-40 disabled:cursor-not-allowed"
                     title={unaddressedCount === 0 ? 'Nothing to process' : 'Send unaddressed messages to the coding agent'}
                 >
-                    {processing ? '… Running' : '▶ Run Chat'}
+                    {processing ? '… Processing' : '▶ Process'}
                 </button>
             </div>
 

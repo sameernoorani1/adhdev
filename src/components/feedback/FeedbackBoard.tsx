@@ -24,9 +24,6 @@ import type { Mission } from './MissionDetailModal';
 import { SettingsModal, initSkin } from './SettingsModal';
 import { TerminalPane, getSavedPlacement, type TerminalPlacement } from './TerminalPane';
 import { ActivityFeed } from './ActivityFeed';
-import { NotesApp } from '../notes/NotesApp';
-import { PhaseStatusBar } from './PhaseStatusBar';
-import { ProgressPage } from './ProgressPage';
 import { buildRunPrompt } from '@/lib/feedback/runPrompt';
 // AD-162: ambient completion signals (tab title + favicon + Notification + sound).
 import {
@@ -46,6 +43,7 @@ import { CoachMark } from './CoachMark';
 import { ErrorBoundary } from './ErrorBoundary';
 import { ChatPane } from './ChatPane';
 import { OnboardingWizard } from './OnboardingWizard';
+import { fetchWithAdhdevToken } from '@/lib/api/sessionToken';
 
 // ADHDev brand icon — detailed brain with multi-directional arrows (VD-113, v2 SVG)
 function ADHDevIcon({ className = 'w-6 h-6' }: { className?: string }) {
@@ -280,6 +278,10 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         if (typeof window === 'undefined') return false;
         return sessionStorage.getItem('adhdev-claude-banner-dismissed') === '1';
     });
+    // AD-228: Install-in-progress state for the friendly first-run install card.
+    // Drives the re-probe loop that auto-dismisses the banner once `claude` is
+    // detected after the install completes (or after a 3-minute timeout).
+    const [claudeInstallInProgress, setClaudeInstallInProgress] = useState(false);
     const [newProjectPath, setNewProjectPath] = useState('');
     const [newProjectName, setNewProjectName] = useState('');
     const [newProjectPrefix, setNewProjectPrefix] = useState('AD');
@@ -351,8 +353,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // the welcome modal flashes on every page load before the fetch resolves.
     const [onboardingLoaded, setOnboardingLoaded] = useState(false);
     const [showActivityFeed, setShowActivityFeed] = useState(false);
-    const [activeView, setActiveView] = useState<'board' | 'notes' | 'missions'>('board');
-    const [showProgressPage, setShowProgressPage] = useState(false);
+    const [activeView, setActiveView] = useState<'board' | 'missions'>('board');
     const broadcastRef = useRef<BroadcastChannel | null>(null);
     const selectedTicketIdRef = useRef<string | null>(null);
     const pendingMutationCountRef = useRef(0);
@@ -951,6 +952,25 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // command so the user isn't debugging phantom "prompt ignored" issues (AD-133).
     useEffect(() => {
         let cancelled = false;
+        // AD-228: ?simulate-claude=not_found|outdated|broken|ok lets us exercise
+        // every banner state without uninstalling Claude Code. Critical for
+        // verifying the fresh-machine "never detected" path without needing a
+        // real fresh-machine sandbox each iteration.
+        if (typeof window !== 'undefined') {
+            const sim = new URLSearchParams(window.location.search).get('simulate-claude');
+            if (sim) {
+                const simulated =
+                    sim === 'not_found' ? { ok: false, version: null, outdated: false, error: 'not_found' as string | null } :
+                    sim === 'outdated' ? { ok: true, version: '1.0.128', outdated: true, error: null } :
+                    sim === 'broken' ? { ok: false, version: null, outdated: false, error: 'spawn_failed' as string | null } :
+                    sim === 'ok' ? { ok: true, version: '2.5.0', outdated: false, error: null } :
+                    null;
+                if (simulated) {
+                    setClaudeHealth(simulated);
+                    return () => { cancelled = true; };
+                }
+            }
+        }
         fetch('/api/claude-version')
             .then(r => r.json())
             .then(d => {
@@ -967,6 +987,41 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             });
         return () => { cancelled = true; };
     }, []);
+
+    // AD-228: re-probe loop after the user kicks off the embedded install.
+    // Polls /api/claude-version every 5s for up to 3 minutes; once the probe
+    // returns ok+!outdated, the banner auto-dismisses by virtue of the
+    // updated claudeHealth state. Caps at 36 attempts to avoid running forever
+    // if the install fails silently.
+    useEffect(() => {
+        if (!claudeInstallInProgress) return;
+        let cancelled = false;
+        let attempts = 0;
+        const intervalId = setInterval(() => {
+            if (cancelled) return;
+            attempts++;
+            if (attempts > 36) {
+                setClaudeInstallInProgress(false);
+                return;
+            }
+            fetch('/api/claude-version')
+                .then(r => r.json())
+                .then(d => {
+                    if (cancelled) return;
+                    setClaudeHealth({
+                        ok: !!d.ok,
+                        version: d.version ?? null,
+                        outdated: !!d.outdated,
+                        error: d.error ?? null,
+                    });
+                    if (d.ok && !d.outdated) {
+                        setClaudeInstallInProgress(false);
+                    }
+                })
+                .catch(() => { /* keep polling */ });
+        }, 5000);
+        return () => { cancelled = true; clearInterval(intervalId); };
+    }, [claudeInstallInProgress]);
 
     // Poll explicit terminal runtime state for UI status.
     // AD-141: scope the probe to the current board's project so two tabs on
@@ -1119,6 +1174,22 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         }
     }, [groupedBy, stackBy]);
 
+    // AD-222: when entering a mission, auto-switch the board's primary
+    // grouping to Wave (since waves are the mission's planned sequence).
+    // Leaving a mission (filter cleared back to 'all' or '__none__') reverts
+    // to the default Status grouping. Switching between missions counts as a
+    // re-entry, so each mission gets its Wave default. The user can manually
+    // override during a mission session — we only fire on transitions.
+    const prevMissionFilterRef = useRef(missionFilter);
+    useEffect(() => {
+        const prev = prevMissionFilterRef.current;
+        if (prev === missionFilter) return;
+        prevMissionFilterRef.current = missionFilter;
+        const isInMission = (v: string) => v !== 'all' && v !== '__none__';
+        if (isInMission(missionFilter)) setStackBy('wave');
+        else if (isInMission(prev)) setStackBy('status');
+    }, [missionFilter]);
+
     const handleTouchStart = useCallback((e: React.TouchEvent) => {
         touchStartX.current = e.touches[0].clientX;
         touchStartY.current = e.touches[0].clientY;
@@ -1194,11 +1265,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             if (e.key === 'b' && !selectedTicket && !showNewTicket && !isInput) {
                 e.preventDefault();
                 setShowBatchPane(prev => !prev);
-            }
-            // P to open notes (when no modal is open and not in an input)
-            if (e.key === 'p' && !selectedTicket && !showNewTicket && !isInput) {
-                e.preventDefault();
-                setActiveView(activeView === 'notes' ? 'board' : 'notes');
             }
         };
         window.addEventListener('keydown', handleKeyDown);
@@ -1357,12 +1423,16 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 ? missionFilter
                 : null;
 
-        fetch('http://localhost:3112/ui-context', {
+        // AD-204: forward the session token to the terminal server. The token
+        // is cached after first fetch so this doesn't add a round-trip per call.
+        // fetchWithAdhdevToken auto-recovers if the terminal server restarted
+        // and rotated the token (one 401 → invalidate cache → retry).
+        fetchWithAdhdevToken('http://localhost:3112/ui-context', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 activeProjectId,
-                view: showProgressPage ? 'progress' : showActivityFeed ? 'activity' : activeView,
+                view: showActivityFeed ? 'activity' : activeView,
                 missionFilter: missionFilter !== 'all' ? missionFilter : null,
                 selectedMissionId,
                 selectedTicketId: selectedTicket?.id || null,
@@ -1371,7 +1441,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 groupedBy,
                 showBatchPane,
                 showActivityFeed,
-                showProgressPage,
             }),
             signal: controller.signal,
         }).catch(() => {});
@@ -1387,7 +1456,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         selectedTicket,
         showActivityFeed,
         showBatchPane,
-        showProgressPage,
         stackBy,
     ]);
 
@@ -1999,34 +2067,77 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             onDragLeave={handleBoardDragLeave}
             onDrop={handleBoardDrop}
         >
-            {/* AD-128: Claude Code upgrade banner — only when we detect a real problem */}
-            {!claudeBannerDismissed && claudeHealth && (!claudeHealth.ok || claudeHealth.outdated) && (
-                <div className={`flex-shrink-0 px-4 py-2 text-xs flex items-center gap-3 border-b ${claudeHealth.outdated ? 'bg-amber-500/10 border-amber-500/30 text-amber-300' : 'bg-red-500/10 border-red-500/30 text-red-300'}`}>
+            {/* AD-128 / AD-228: Claude Code health banner — three distinct states.
+                State A (`not_found`)  → friendly first-run install card (blue, helpful tone).
+                State B (`outdated`)   → amber upgrade banner with copy-to-clipboard (live REPL may be running).
+                State C (other errors) → red dismissable broken banner.
+                State D (working)      → no banner at all. */}
+            {!claudeBannerDismissed && claudeHealth && claudeHealth.error === 'not_found' && (
+                <div className="flex-shrink-0 px-4 py-2.5 text-xs flex items-center gap-3 border-b bg-blue-500/10 border-blue-500/30 text-blue-100">
+                    <svg className="w-5 h-5 flex-shrink-0 text-blue-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-3-3v6m9-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <div className="flex-1 leading-snug">
+                        <span className="font-semibold">To run agents on your tickets, install Claude Code.</span>
+                        {' '}
+                        <span className="opacity-90">
+                            {claudeInstallInProgress
+                                ? 'Installing — watch the terminal pane. This banner will dismiss itself once Claude Code is detected.'
+                                : 'One click — we\'ll run the install in the embedded terminal.'}
+                        </span>
+                    </div>
+                    <button
+                        disabled={claudeInstallInProgress}
+                        onClick={async () => {
+                            if (claudeInstallInProgress) return;
+                            setShowTerminal(true);
+                            setClaudeInstallInProgress(true);
+                            try {
+                                const r = await fetch('/api/install-claude', { method: 'POST' });
+                                if (!r.ok) {
+                                    const d = await r.json().catch(() => ({} as { error?: string; command?: string }));
+                                    try { await navigator.clipboard.writeText(d.command || 'npm i -g @anthropic-ai/claude-code@latest'); } catch {}
+                                    showToast(d.error || 'Auto-install failed — command copied; paste it in the terminal.', 7000);
+                                    setClaudeInstallInProgress(false);
+                                } else {
+                                    showToast('Installing Claude Code — banner will dismiss when it\'s detected.', 5000);
+                                }
+                            } catch {
+                                try { await navigator.clipboard.writeText('npm i -g @anthropic-ai/claude-code@latest'); } catch {}
+                                showToast('Could not reach the terminal server. Command copied — paste it in the terminal.', 8000);
+                                setClaudeInstallInProgress(false);
+                            }
+                        }}
+                        className="flex-shrink-0 px-3 py-1 rounded border border-blue-400/40 hover:bg-blue-400/15 disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-medium"
+                    >
+                        {claudeInstallInProgress ? 'Installing…' : 'Install Claude Code'}
+                    </button>
+                    <button
+                        onClick={() => {
+                            setClaudeBannerDismissed(true);
+                            try { sessionStorage.setItem('adhdev-claude-banner-dismissed', '1'); } catch {}
+                        }}
+                        className="flex-shrink-0 opacity-70 hover:opacity-100"
+                        title="Dismiss for this session"
+                    >
+                        &times;
+                    </button>
+                </div>
+            )}
+            {!claudeBannerDismissed && claudeHealth && claudeHealth.ok && claudeHealth.outdated && (
+                <div className="flex-shrink-0 px-4 py-2 text-xs flex items-center gap-3 border-b bg-amber-500/10 border-amber-500/30 text-amber-300">
                     <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                         <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
                     </svg>
                     <div className="flex-1 leading-snug">
-                        {claudeHealth.ok && claudeHealth.outdated ? (
-                            <>
-                                <span className="font-semibold">Your Claude Code is old (version {claudeHealth.version}).</span>
-                                {' '}This version crashes on <code className="px-1 bg-black/30 rounded">/model</code> and can't use Claude 4.x.
-                            </>
-                        ) : claudeHealth.error === 'not_found' ? (
-                            <>
-                                <span className="font-semibold">Claude Code isn't installed.</span>
-                            </>
-                        ) : (
-                            <>
-                                <span className="font-semibold">Claude Code is broken</span>
-                                {claudeHealth.error ? ` (${claudeHealth.error})` : ''}.
-                            </>
-                        )}
-                        {' '}<span className="opacity-90">To fix: (1) close Claude if it's running — type <code className="px-1 bg-black/30 rounded">/exit</code> in the terminal. (2) Click <b>Upgrade now</b> to paste the install command, then press Enter.</span>
+                        <span className="font-semibold">Your Claude Code is old (version {claudeHealth.version}).</span>
+                        {' '}This version crashes on <code className="px-1 bg-black/30 rounded">/model</code> and can't use Claude 4.x.
+                        {' '}<span className="opacity-90">To fix: (1) close Claude if it's running — type <code className="px-1 bg-black/30 rounded">/exit</code> in the terminal. (2) Click <b>Copy upgrade</b> to copy the install command, then paste and press Enter.</span>
                     </div>
                     <button
                         onClick={async () => {
                             const cmd = 'npm i -g @anthropic-ai/claude-code@latest';
-                            // AD-128 follow-up: copy the command and open/focus the terminal
+                            // AD-128: copy the command and open/focus the terminal
                             // so the next click+paste is all that's needed. We DON'T auto-send
                             // because Claude's REPL may still be alive (just crashing), and
                             // typing an npm install into a live REPL would feed it as a prompt.
@@ -2041,6 +2152,43 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         className="flex-shrink-0 px-2 py-0.5 rounded border border-current/30 hover:bg-current/10 transition-colors font-medium"
                     >
                         Copy upgrade
+                    </button>
+                    <button
+                        onClick={() => {
+                            setClaudeBannerDismissed(true);
+                            try { sessionStorage.setItem('adhdev-claude-banner-dismissed', '1'); } catch {}
+                        }}
+                        className="flex-shrink-0 opacity-70 hover:opacity-100"
+                        title="Dismiss for this session"
+                    >
+                        &times;
+                    </button>
+                </div>
+            )}
+            {!claudeBannerDismissed && claudeHealth && !claudeHealth.ok && claudeHealth.error !== 'not_found' && (
+                <div className="flex-shrink-0 px-4 py-2 text-xs flex items-center gap-3 border-b bg-red-500/10 border-red-500/30 text-red-300">
+                    <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                    </svg>
+                    <div className="flex-1 leading-snug">
+                        <span className="font-semibold">Claude Code isn't responding</span>
+                        {claudeHealth.error ? ` (${claudeHealth.error})` : ''}.
+                        {' '}<span className="opacity-90">Try reinstalling — copy the command and run it in the terminal.</span>
+                    </div>
+                    <button
+                        onClick={async () => {
+                            const cmd = 'npm i -g @anthropic-ai/claude-code@latest';
+                            setShowTerminal(true);
+                            try {
+                                await navigator.clipboard.writeText(cmd);
+                                showToast('Copied. Paste it in the terminal and press Enter.', 6000);
+                            } catch {
+                                showToast('Copy failed — run this in a terminal: npm i -g @anthropic-ai/claude-code@latest', 8000);
+                            }
+                        }}
+                        className="flex-shrink-0 px-2 py-0.5 rounded border border-current/30 hover:bg-current/10 transition-colors font-medium"
+                    >
+                        Copy reinstall
                     </button>
                     <button
                         onClick={() => {
@@ -2243,10 +2391,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         <button
                             onClick={() => {
                                 setActiveView('board');
-                                setShowProgressPage(false);
                                 setShowActivityFeed(false);
                             }}
-                            className={`rounded-lg flex items-center gap-2.5 ${activeView === 'board' && !showProgressPage && !showActivityFeed ? 'bg-vd-accent-gold/10 text-vd-accent-gold' : 'text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary'} ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
+                            className={`rounded-lg flex items-center gap-2.5 ${activeView === 'board' && !showActivityFeed ? 'bg-vd-accent-gold/10 text-vd-accent-gold' : 'text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary'} ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
                             title="Board">
                             <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 4.5v15m6-15v15m-10.875 0h15.75c.621 0 1.125-.504 1.125-1.125V5.625c0-.621-.504-1.125-1.125-1.125H4.125C3.504 4.5 3 5.004 3 5.625v12.75c0 .621.504 1.125 1.125 1.125z" />
@@ -2258,7 +2405,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         <button
                             onClick={() => {
                                 setShowActivityFeed(!showActivityFeed);
-                                setShowProgressPage(false);
                                 if (!showActivityFeed) setActiveView('board');
                             }}
                             className={`rounded-lg flex items-center gap-2.5 transition-colors ${showActivityFeed ? 'bg-vd-accent-gold/10 text-vd-accent-gold' : 'text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary'} ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
@@ -2275,7 +2421,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                             onClick={() => {
                                 setActiveView('missions');
                                 setShowActivityFeed(false);
-                                setShowProgressPage(false);
                             }}
                             className={`rounded-lg flex items-center gap-2.5 transition-colors ${activeView === 'missions' ? 'bg-vd-accent-gold/10 text-vd-accent-gold' : 'text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary'} ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
                             title="Missions"
@@ -2288,36 +2433,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                 <path strokeLinecap="round" strokeLinejoin="round" d="M15.59 14.37a6 6 0 01-5.84 7.38v-4.8m5.84-2.58a14.98 14.98 0 006.16-12.12A14.98 14.98 0 009.631 8.41m5.96 5.96a14.926 14.926 0 01-5.841 2.58m-.119-8.54a6 6 0 00-7.381 5.84h4.8m2.581-5.84a14.927 14.927 0 00-2.58 5.84m2.699 2.7c-.103.021-.207.041-.311.06a15.09 15.09 0 01-2.448-2.448 14.9 14.9 0 01.06-.312m-2.24 2.39a4.493 4.493 0 00-1.757 4.306 4.493 4.493 0 004.306-1.758M16.5 9a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0z" />
                             </svg>
                             {sidebarExpanded && <span className="text-xs font-medium">Missions</span>}
-                        </button>
-
-                        {/* Progress */}
-                        <button
-                            onClick={() => {
-                                setShowProgressPage(!showProgressPage);
-                                setShowActivityFeed(false);
-                                if (!showProgressPage) setActiveView('board');
-                            }}
-                            className={`rounded-lg flex items-center gap-2.5 transition-colors ${showProgressPage ? 'bg-vd-accent-gold/10 text-vd-accent-gold' : 'text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary'} ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
-                            title="Progress"
-                        >
-                            <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z" />
-                            </svg>
-                            {sidebarExpanded && <span className="text-xs font-medium">Progress</span>}
-                        </button>
-
-                        {/* Notes */}
-                        <button
-                            onClick={() => {
-                                setActiveView(activeView === 'notes' ? 'board' : 'notes');
-                            }}
-                            className={`rounded-lg flex items-center gap-2.5 transition-colors ${activeView === 'notes' ? 'bg-vd-accent-gold/10 text-vd-accent-gold' : 'text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary'} ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
-                            title="Notes"
-                        >
-                            <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L6.832 19.82a4.5 4.5 0 01-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 011.13-1.897L16.863 4.487zm0 0L19.5 7.125" />
-                            </svg>
-                            {sidebarExpanded && <span className="text-xs font-medium">Notes</span>}
                         </button>
                     </nav>
 
@@ -2828,7 +2943,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">Ctrl+F</kbd> Search</span>
                     <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">B</kbd> Batches</span>
                     <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">N</kbd> New ticket</span>
-                    <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">P</kbd> Notepad</span>
                     <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">Ctrl+Shift+F</kbd> Terminal fullscreen</span>
                     <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">Esc</kbd> Close</span>
                 </div>
@@ -2864,7 +2978,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     order={termOrder}
                 />
             )}
-            {/* Board, Missions, Notes, or Progress Page */}
+            {/* Board or Missions */}
             {activeView === 'missions' && data ? (
                 <MissionPage
                     missions={data.missions || []}
@@ -2884,15 +2998,8 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         setMissionFilter(missionId);
                         setActiveView('board');
                         setShowActivityFeed(false);
-                        setShowProgressPage(false);
                     }}
                 />
-            ) : activeView === 'notes' ? (
-                <div className="flex-1 min-h-0 min-w-0 overflow-hidden">
-                    <NotesApp />
-                </div>
-            ) : showProgressPage && data ? (
-                <ProgressPage tickets={data.tickets} onClose={() => setShowProgressPage(false)} />
             ) : (
             <div className="px-4 pb-4 flex-1 min-h-0 flex flex-col min-w-0">
                 {missionFilter !== 'all' && data && (() => {

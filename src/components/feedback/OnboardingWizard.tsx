@@ -38,8 +38,21 @@ interface OnboardingWizardProps {
     onClose: () => void;
 }
 
-interface ScanCandidate { title: string; source: string }
-interface ScanResult { candidates: ScanCandidate[]; files: string[]; cappedAt: number }
+type ScanKind =
+    | 'task-file' | 'todo-comment' | 'fixme-comment'
+    | 'md-checklist' | 'md-heading'
+    | 'package-script' | 'missing-file' | 'github-issue';
+interface ScanCandidate { title: string; source: string; kind?: ScanKind }
+interface ScanResult { candidates: ScanCandidate[]; files: string[]; cappedAt: number; breakdown?: Partial<Record<ScanKind, number>> }
+
+// AD-241: map scanner kind to a closed taxonomy tag where the mapping is
+// clean. Sameer's rule: only `fixme-comment` → bug and `missing-file` → polish;
+// the rest stay untagged so we don't pollute the taxonomy.
+function tagForCandidate(kind: ScanKind | undefined): string[] {
+    if (kind === 'fixme-comment') return ['bug'];
+    if (kind === 'missing-file') return ['polish'];
+    return [];
+}
 
 const RECOGNISED_CLIS: Array<{ id: string; label: string; installHint: string; runCommand: string }> = [
     { id: 'Claude Code', label: 'Claude Code', installHint: 'npm i -g @anthropic-ai/claude-code', runCommand: 'claude' },
@@ -58,14 +71,96 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
     const [folderName, setFolderName] = useState<string>('');
     const [creating, setCreating] = useState(false);
     const [createError, setCreateError] = useState<string | null>(null);
+    // AD-230: native folder picker availability + per-path validation. The
+    // capability probe runs once on mount; if the OS dialog tool is missing
+    // (no PowerShell on Windows / no zenity on Linux), the Browse button
+    // hides and the typed-path input is the only way forward.
+    const [pickerAvailable, setPickerAvailable] = useState<boolean>(false);
+    const [picking, setPicking] = useState(false);
+    const [pathValidation, setPathValidation] = useState<{
+        valid: boolean;
+        exists: boolean;
+        isDirectory: boolean;
+        writable: boolean;
+        hasAdhdev: boolean;
+        error: string | null;
+    } | null>(null);
+    const [validating, setValidating] = useState(false);
     const [agentDetected, setAgentDetected] = useState<string | null>(initialState.agentDetected || null);
     const [scanResult, setScanResult] = useState<ScanResult | null>(null);
     const [scanning, setScanning] = useState(false);
     const [scanError, setScanError] = useState<string | null>(null);
+    // AD-241: per-row selection for the import-as-tickets action. Default to
+    // all-checked when scan results land. After a successful import we record
+    // the count + disable the button so the user can't double-import.
+    const [selectedIdx, setSelectedIdx] = useState<Set<number>>(new Set());
+    const [importing, setImporting] = useState(false);
+    const [importError, setImportError] = useState<string | null>(null);
+    const [importResult, setImportResult] = useState<{ imported: number; failed: number } | null>(null);
     const [gitPosture, setGitPosture] = useState<'experiment' | 'github' | 'remote' | null>(initialState.gitPosture || null);
     const [remoteUrl, setRemoteUrl] = useState<string>(initialState.remoteUrl || '');
     const [finishing, setFinishing] = useState(false);
     const [finishError, setFinishError] = useState<string | null>(null);
+
+    // AD-230: probe whether the native folder dialog is reachable on this
+    // platform. Runs once. If false, the Browse button hides and the user
+    // falls back to typing the path.
+    useEffect(() => {
+        let cancelled = false;
+        fetch('/api/onboarding/pick-folder')
+            .then(r => r.json())
+            .then(d => { if (!cancelled) setPickerAvailable(!!d?.available); })
+            .catch(() => { /* leave false */ });
+        return () => { cancelled = true; };
+    }, []);
+
+    // AD-230: validate the typed/picked path on change (debounced). Drives the
+    // inline ✓/✗ indicator and gates Next.
+    useEffect(() => {
+        if (folderSource !== 'existing') {
+            setPathValidation(null);
+            return;
+        }
+        const trimmed = folderPath.trim();
+        if (!trimmed) {
+            setPathValidation(null);
+            return;
+        }
+        let cancelled = false;
+        setValidating(true);
+        const handle = setTimeout(async () => {
+            try {
+                const r = await fetch('/api/onboarding/validate-path', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ folderPath: trimmed }),
+                });
+                const d = await r.json();
+                if (!cancelled) setPathValidation(d);
+            } catch {
+                if (!cancelled) setPathValidation({ valid: false, exists: false, isDirectory: false, writable: false, hasAdhdev: false, error: 'server_error' });
+            } finally {
+                if (!cancelled) setValidating(false);
+            }
+        }, 350);
+        return () => { cancelled = true; clearTimeout(handle); };
+    }, [folderPath, folderSource]);
+
+    const handleBrowse = useCallback(async () => {
+        if (picking) return;
+        setPicking(true);
+        try {
+            const r = await fetch('/api/onboarding/pick-folder', { method: 'POST' });
+            const d = await r.json();
+            if (d?.folderPath) {
+                setFolderPath(d.folderPath);
+                setFolderSource('existing');
+            }
+            // 'cancelled' / other errors are silently swallowed — the user
+            // can just type the path or click Browse again.
+        } catch { /* ignore */ }
+        finally { setPicking(false); }
+    }, [picking]);
 
     // Step 2 — poll /api/terminal-status until we see an agentName. Lightweight
     // (every 2s) and only while the wizard is actually on Step 2.
@@ -92,7 +187,12 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
         return onPatchOnboarding(patch as Record<string, unknown>);
     }, [onPatchOnboarding]);
 
-    const canAdvanceFromStep1 = folderSource && folderPath.trim().length > 0;
+    // AD-230: existing-folder branch must also validate (exists + writable).
+    // The new-folder branch trusts /api/onboarding/create-folder's success path.
+    const canAdvanceFromStep1 =
+        !!folderSource &&
+        folderPath.trim().length > 0 &&
+        (folderSource === 'new' || (pathValidation?.valid ?? false));
 
     const handleCreateFolder = async () => {
         setCreateError(null);
@@ -125,6 +225,8 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
         setScanError(null);
         setScanning(true);
         setScanResult(null);
+        setImportResult(null);
+        setImportError(null);
         try {
             const res = await fetch('/api/onboarding/scan-tasks', {
                 method: 'POST',
@@ -137,6 +239,11 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
                 return;
             }
             setScanResult(data);
+            // AD-241: default to all-selected so the common case (import
+            // everything) is one click.
+            const all = new Set<number>();
+            for (let i = 0; i < (data?.candidates?.length || 0); i++) all.add(i);
+            setSelectedIdx(all);
         } catch (err) {
             setScanError(String(err));
         } finally {
@@ -144,19 +251,82 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
         }
     };
 
+    // AD-241: import the user-selected scan candidates as backlog tickets.
+    // POSTs to /api/feedback per candidate. We do this serially rather than
+    // in parallel so a partial failure surfaces in order and the board
+    // doesn't get hit with N concurrent writes through the lock.
+    const handleImport = async () => {
+        if (!scanResult || selectedIdx.size === 0 || importing) return;
+        setImportError(null);
+        setImporting(true);
+        let imported = 0;
+        let failed = 0;
+        try {
+            for (let i = 0; i < scanResult.candidates.length; i++) {
+                if (!selectedIdx.has(i)) continue;
+                const c = scanResult.candidates[i];
+                try {
+                    const r = await fetch('/api/feedback', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            title: c.title.slice(0, 200),
+                            description: `Source: ${c.source}\n\n_Auto-imported from onboarding scan (AD-229 / AD-241)._`,
+                            status: 'backlog',
+                            priority: 'medium',
+                            tags: tagForCandidate(c.kind),
+                            reporter: 'onboarding-scan',
+                            reporterType: 'system',
+                        }),
+                    });
+                    if (r.ok) imported++; else failed++;
+                } catch {
+                    failed++;
+                }
+            }
+            setImportResult({ imported, failed });
+        } catch (err) {
+            setImportError(String(err));
+        } finally {
+            setImporting(false);
+        }
+    };
+
+    const toggleSelected = (i: number) => {
+        setSelectedIdx(prev => {
+            const next = new Set(prev);
+            if (next.has(i)) next.delete(i); else next.add(i);
+            return next;
+        });
+    };
+    const selectAll = () => {
+        if (!scanResult) return;
+        const all = new Set<number>();
+        for (let i = 0; i < scanResult.candidates.length; i++) all.add(i);
+        setSelectedIdx(all);
+    };
+    const selectNone = () => setSelectedIdx(new Set());
+
     const handleFinish = async () => {
         setFinishError(null);
         setFinishing(true);
         try {
-            // Run the git posture endpoint if posture is set. "experiment"
-            // actually runs `git init` + writes .gitignore. The other two
-            // record intent only for now.
+            // AD-231: git-init now actually wires `experiment` (init + .gitignore)
+            // AND `remote` (init + .gitignore + remote add origin <url>). The
+            // `github` posture still defers — full OAuth + repo create is a
+            // post-launch Settings panel. Surface server errors instead of
+            // silently swallowing them so a bad remote URL is visible.
             if (gitPosture && folderPath) {
-                await fetch('/api/onboarding/git-init', {
+                const r = await fetch('/api/onboarding/git-init', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ folderPath, posture: gitPosture, remoteUrl }),
                 });
+                if (!r.ok) {
+                    const d = await r.json().catch(() => ({} as { error?: string }));
+                    setFinishError(d.error || 'Failed to apply git posture.');
+                    return;
+                }
             }
             await persist({
                 wizardCompleted: true,
@@ -164,7 +334,10 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
                 folderSource,
                 folderPath,
                 agentDetected,
-                populated: !!scanResult && scanResult.candidates.length > 0,
+                // AD-241: `populated` now means "scan results were actually
+                // imported as tickets" — not just "scan returned candidates".
+                // The board's empty-state UI (AD-234) will read this.
+                populated: !!importResult && importResult.imported > 0,
                 gitPosture,
                 remoteUrl: remoteUrl || null,
                 welcomeSeen: true,  // satisfies the existing AD-073 dismissal pattern
@@ -251,15 +424,56 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
 
                             {folderSource === 'existing' && (
                                 <div className="space-y-2">
-                                    <label className="text-[11px] text-vd-text-secondary">Absolute path to the folder</label>
-                                    <input
-                                        type="text"
-                                        autoFocus
-                                        value={folderPath}
-                                        onChange={(e) => setFolderPath(e.target.value)}
-                                        placeholder="C:\Codebases\my-project   or   /Users/you/code/my-project"
-                                        className="w-full px-3 py-2 text-[12px] bg-vd-bg-input border border-vd-border rounded-md text-vd-text-primary placeholder:text-vd-text-tertiary focus:border-vd-accent-gold/60 focus:outline-none"
-                                    />
+                                    <label className="text-[11px] text-vd-text-secondary">Folder for ADHDev</label>
+                                    <div className="flex items-stretch gap-2">
+                                        {pickerAvailable && (
+                                            <button
+                                                type="button"
+                                                disabled={picking}
+                                                onClick={handleBrowse}
+                                                className="flex-shrink-0 px-3 py-2 text-[11px] font-medium border border-vd-accent-gold/40 text-vd-accent-gold rounded-md hover:bg-vd-accent-gold/10 disabled:opacity-50"
+                                                title="Open a native folder picker"
+                                            >
+                                                {picking ? 'Opening…' : 'Browse…'}
+                                            </button>
+                                        )}
+                                        <input
+                                            type="text"
+                                            autoFocus
+                                            value={folderPath}
+                                            onChange={(e) => setFolderPath(e.target.value)}
+                                            placeholder="C:\Codebases\my-project   or   /Users/you/code/my-project"
+                                            className={`flex-1 px-3 py-2 text-[12px] bg-vd-bg-input border rounded-md text-vd-text-primary placeholder:text-vd-text-tertiary focus:outline-none ${
+                                                pathValidation == null
+                                                    ? 'border-vd-border focus:border-vd-accent-gold/60'
+                                                    : pathValidation.valid
+                                                        ? 'border-emerald-500/50 focus:border-emerald-500/70'
+                                                        : 'border-red-500/50 focus:border-red-500/70'
+                                            }`}
+                                        />
+                                    </div>
+                                    {/* Inline validation status */}
+                                    {folderPath.trim().length > 0 && (
+                                        <div className="text-[10px] flex items-center gap-1.5 min-h-[14px]">
+                                            {validating ? (
+                                                <span className="text-vd-text-tertiary">Checking path…</span>
+                                            ) : pathValidation?.valid ? (
+                                                <span className="text-emerald-400">
+                                                    ✓ Valid folder.
+                                                    {pathValidation.hasAdhdev ? ' Already has an .adhdev/ — you\'re re-opening this project.' : ' We\'ll create .adhdev/ here.'}
+                                                </span>
+                                            ) : pathValidation ? (
+                                                <span className="text-red-400">
+                                                    ✗ {pathValidation.error === 'not_absolute' ? 'Path must be absolute.' :
+                                                       pathValidation.error === 'not_found' ? 'Folder doesn\'t exist.' :
+                                                       pathValidation.error === 'not_a_directory' ? 'Path is not a directory.' :
+                                                       pathValidation.error === 'not_writable' ? 'Folder is not writable.' :
+                                                       pathValidation.error === 'empty' ? 'Enter a path.' :
+                                                       'Path is invalid.'}
+                                                </span>
+                                            ) : null}
+                                        </div>
+                                    )}
                                     <p className="text-[10px] text-vd-text-tertiary">Tip: pick somewhere outside Downloads / OneDrive — git history doesn't love sync conflicts.</p>
                                 </div>
                             )}
@@ -269,13 +483,35 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
                                     <div className="grid grid-cols-2 gap-2">
                                         <div>
                                             <label className="text-[11px] text-vd-text-secondary">Parent path</label>
-                                            <input
-                                                type="text"
-                                                value={parentPath}
-                                                onChange={(e) => setParentPath(e.target.value)}
-                                                placeholder="C:\Codebases   or   /Users/you/code"
-                                                className="w-full mt-1 px-3 py-2 text-[12px] bg-vd-bg-input border border-vd-border rounded-md text-vd-text-primary placeholder:text-vd-text-tertiary focus:border-vd-accent-gold/60 focus:outline-none"
-                                            />
+                                            <div className="flex items-stretch gap-2 mt-1">
+                                                {pickerAvailable && (
+                                                    <button
+                                                        type="button"
+                                                        disabled={picking}
+                                                        onClick={async () => {
+                                                            if (picking) return;
+                                                            setPicking(true);
+                                                            try {
+                                                                const r = await fetch('/api/onboarding/pick-folder', { method: 'POST' });
+                                                                const d = await r.json();
+                                                                if (d?.folderPath) setParentPath(d.folderPath);
+                                                            } catch { /* ignore */ }
+                                                            finally { setPicking(false); }
+                                                        }}
+                                                        className="flex-shrink-0 px-2 py-2 text-[11px] font-medium border border-vd-accent-gold/40 text-vd-accent-gold rounded-md hover:bg-vd-accent-gold/10 disabled:opacity-50"
+                                                        title="Open a native folder picker"
+                                                    >
+                                                        {picking ? '…' : 'Browse'}
+                                                    </button>
+                                                )}
+                                                <input
+                                                    type="text"
+                                                    value={parentPath}
+                                                    onChange={(e) => setParentPath(e.target.value)}
+                                                    placeholder="C:\Codebases   or   /Users/you/code"
+                                                    className="flex-1 px-3 py-2 text-[12px] bg-vd-bg-input border border-vd-border rounded-md text-vd-text-primary placeholder:text-vd-text-tertiary focus:border-vd-accent-gold/60 focus:outline-none"
+                                                />
+                                            </div>
                                         </div>
                                         <div>
                                             <label className="text-[11px] text-vd-text-secondary">Folder name</label>
@@ -352,19 +588,67 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
                             {scanError && <p className="text-[11px] text-red-400">{scanError}</p>}
 
                             {scanResult && scanResult.candidates.length > 0 && (
-                                <div className="border border-vd-border rounded-md max-h-56 overflow-y-auto bg-vd-bg-tertiary/30">
-                                    {scanResult.candidates.map((c, i) => (
-                                        <div key={i} className="px-3 py-1.5 border-b border-vd-border last:border-b-0 text-[11px]">
-                                            <div className="text-vd-text-primary">{c.title}</div>
-                                            <div className="text-[9px] text-vd-text-tertiary">{c.source}</div>
+                                <>
+                                    <div className="flex items-center justify-between text-[10px] text-vd-text-tertiary">
+                                        <div>
+                                            {selectedIdx.size} of {scanResult.candidates.length} selected
+                                            {scanResult.breakdown && (
+                                                <span className="ml-2 opacity-80">
+                                                    ({Object.entries(scanResult.breakdown).map(([k, v]) => `${v} ${k}`).join(' · ')})
+                                                </span>
+                                            )}
                                         </div>
-                                    ))}
-                                </div>
+                                        <div className="flex items-center gap-2">
+                                            <button onClick={selectAll} className="hover:text-vd-text-secondary">All</button>
+                                            <span>·</span>
+                                            <button onClick={selectNone} className="hover:text-vd-text-secondary">None</button>
+                                        </div>
+                                    </div>
+                                    <div className="border border-vd-border rounded-md max-h-56 overflow-y-auto bg-vd-bg-tertiary/30">
+                                        {scanResult.candidates.map((c, i) => (
+                                            <label
+                                                key={i}
+                                                className="flex items-start gap-2 px-3 py-1.5 border-b border-vd-border last:border-b-0 text-[11px] cursor-pointer hover:bg-vd-bg-tertiary/50"
+                                            >
+                                                <input
+                                                    type="checkbox"
+                                                    checked={selectedIdx.has(i)}
+                                                    onChange={() => toggleSelected(i)}
+                                                    disabled={!!importResult}
+                                                    className="mt-0.5 accent-vd-accent-gold flex-shrink-0"
+                                                />
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="text-vd-text-primary truncate">{c.title}</div>
+                                                    <div className="text-[9px] text-vd-text-tertiary truncate">
+                                                        {c.kind && <span className="opacity-80 mr-1">[{c.kind}]</span>}
+                                                        {c.source}
+                                                    </div>
+                                                </div>
+                                            </label>
+                                        ))}
+                                    </div>
+                                    <div className="flex items-center gap-3">
+                                        <button
+                                            disabled={importing || selectedIdx.size === 0 || !!importResult}
+                                            onClick={handleImport}
+                                            className="px-3 py-1.5 text-[11px] font-medium border border-vd-accent-gold/40 text-vd-accent-gold rounded-md hover:bg-vd-accent-gold/10 disabled:opacity-50"
+                                        >
+                                            {importing ? 'Importing…' : `Import ${selectedIdx.size} ticket${selectedIdx.size === 1 ? '' : 's'}`}
+                                        </button>
+                                        {importResult && (
+                                            <span className="text-[11px] text-emerald-400">
+                                                ✓ Imported {importResult.imported} ticket{importResult.imported === 1 ? '' : 's'}
+                                                {importResult.failed > 0 ? ` (${importResult.failed} failed)` : ''}.
+                                            </span>
+                                        )}
+                                        {importError && <span className="text-[11px] text-red-400">{importError}</span>}
+                                    </div>
+                                </>
                             )}
 
-                            {scanResult && (
+                            {scanResult && scanResult.candidates.length === 0 && (
                                 <p className="text-[10px] text-vd-text-tertiary">
-                                    Importing draft tickets is the next ticket I'll pick up — for now we just record the scan result. Click <em>Next</em> to continue.
+                                    No candidates found — that's fine, your board will start empty. Click <em>Next</em> to continue.
                                 </p>
                             )}
                         </div>
@@ -379,8 +663,8 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
                             <div className="space-y-2">
                                 {([
                                     { id: 'experiment', label: "I'm just experimenting", help: "Local-only git history. Nothing leaves your machine. We'll run `git init` and write a sensible `.gitignore`." },
-                                    { id: 'github',     label: "Hook up to GitHub now",  help: "Records your intent to publish to GitHub. (Actually creating the repo is wired in a follow-up — for now we just save your choice.)" },
-                                    { id: 'remote',     label: "I already have a remote", help: "Tell us the URL and we'll wire it up later. Your choice + URL get saved now." },
+                                    { id: 'remote',     label: "I already have a remote", help: "Tell us the URL — we'll initialise git here and wire `origin` to your remote." },
+                                    { id: 'github',     label: "Hook up to GitHub later", help: "Save the intent for now. We'll add a guided GitHub setup (create repo + push) in Settings post-launch." },
                                 ] as Array<{ id: 'experiment'|'github'|'remote'; label: string; help: string }>).map(opt => (
                                     <label
                                         key={opt.id}
@@ -433,7 +717,7 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
                         </button>
                     ) : (
                         <button
-                            disabled={finishing || !gitPosture}
+                            disabled={finishing || !gitPosture || (gitPosture === 'remote' && !remoteUrl.trim())}
                             onClick={handleFinish}
                             className="px-3 py-1.5 text-[11px] font-medium bg-vd-accent-gold text-vd-text-inverse rounded-md hover:opacity-90 disabled:opacity-30"
                         >

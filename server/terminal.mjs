@@ -325,47 +325,25 @@ function buildInjectedExecutionContract(ticketIds, boardData, projectId) {
         '- Add this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Embedded Contract Read.',
     ];
 
+    // AD-254: trim per-ticket scope to id/title/status/priority/description
+    // only. The full comments dump and activity log were the bulk of the
+    // injected fluff Sameer reported — and they're redundant: the contract
+    // above already tells the agent to read the full ticket entry from
+    // board.json before acting, which carries those fields authoritatively.
+    // Dropping the UI-context bits (view/mission/stackBy/groupedBy) for the
+    // same reason — the agent doesn't condition on board layout.
     if (tickets.length > 0) {
         lines.push('Ticket scope:');
         for (const ticket of tickets) {
             const metadata = [
                 ticket.status ? `status: ${ticket.status}` : null,
                 ticket.priority ? `priority: ${ticket.priority}` : null,
-                ticket.wave ? `wave: ${ticket.wave}` : null,
-                ticket.session ? `session: ${ticket.session}` : null,
-                ticket.contractVersion ? `contract: v${ticket.contractVersion}` : null,
             ].filter(Boolean).join(', ');
             lines.push(`- ${ticket.id}: ${ticket.title}${metadata ? ` (${metadata})` : ''}`);
             if (ticket.description) {
                 lines.push(`  Description: ${String(ticket.description).trim()}`);
             }
-            if (Array.isArray(ticket.comments) && ticket.comments.length > 0) {
-                lines.push('  Comments:');
-                for (const comment of ticket.comments) {
-                    lines.push(`  - [${comment.author} | ${comment.authorType} | ${comment.createdAt}] ${String(comment.content || '').trim()}`);
-                }
-            } else {
-                lines.push('  Comments: none');
-            }
-            if (Array.isArray(ticket.activity) && ticket.activity.length > 0) {
-                lines.push('  Activity:');
-                for (const activity of ticket.activity) {
-                    const fromTo = activity.from || activity.to ? ` (${activity.from || ''}${activity.to ? ` -> ${activity.to}` : ''})` : '';
-                    lines.push(`  - [${activity.by} | ${activity.byType} | ${activity.at}] ${activity.action}${fromTo}`);
-                }
-            } else {
-                lines.push('  Activity: none');
-            }
         }
-    }
-
-    const contextBits = [];
-    if (uiContext.view) contextBits.push(`view: ${uiContext.view}`);
-    if (uiContext.missionFilter) contextBits.push(`mission: ${uiContext.missionFilter}`);
-    if (uiContext.stackBy) contextBits.push(`stacked by: ${uiContext.stackBy}`);
-    if (uiContext.groupedBy && uiContext.groupedBy !== 'none') contextBits.push(`grouped by: ${uiContext.groupedBy}`);
-    if (contextBits.length > 0) {
-        lines.push(`UI context: ${contextBits.join(', ')}`);
     }
 
     return `\n\n${lines.join('\n')}`;

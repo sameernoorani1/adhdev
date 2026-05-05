@@ -1,42 +1,52 @@
 # ADHDev
 
-AI Agent Control Plane for developers. Track, trigger, and review AI coding work from a single Kanban board.
+The AI agent control plane for developers who don't want to babysit their agents.
 
-## Quick Start
+![ADHDev board](assets/board-screenshot.png)
+
+## Quick start
 
 ```bash
-npx adhdev init    # Initialize in your project
-npx adhdev start   # Open the board at localhost:3111
+npm install -g adhdev-board
+adhdev init
+adhdev start
 ```
 
-`adhdev init` creates `.adhdev/` plus `ADHDEV.md`, the shared operating protocol for humans and AI agents in the project.
+The board opens at `localhost:3111` and `.adhdev/` is created in your project. That's it.
 
 ## What it does
 
-- **Kanban board** for tracking AI agent work (backlog → todo → done → reviewed)
-- **One-click Run** — trigger Claude Code on any ticket from the board
-- **Live streaming** — watch AI responses flow into ticket comments
-- **Agent rules** — enforce transition gates (AI can't skip human review)
-- **Structured receipts** — every completed run records a **verified file list** (sourced from `git diff` against the run's baseline ref; falls back to agent self-report only when the project isn't a git repo, with the source labeled honestly), alongside an agent-claimed summary and verification notes
-- **File-based storage** — everything lives in `.adhdev/` in your project
+- **Tracks every agent run as a ticket.** Run, comment, status, files touched, verification — everything an AI did to your codebase, on a Kanban board you control.
+- **Auto-populates from your codebase on first run.** `adhdev init` scans for actionable signals — TODO/FIXME comments, broken tests, dead code — and lands them as draft tickets you can promote or trash.
+- **One-click Run on Claude Code.** Trigger an agent from any ticket; the board captures comments, ground-truthed file lists (via `git diff`), and the agent's verification claims automatically.
+- **Local-first.** Your board lives in `.adhdev/board.json` in your project. No accounts, no cloud, no telemetry.
 
-## For Claude Code users
+## Requirements
 
-ADHDev integrates with Claude Code via:
-- **Agent SDK** — run Claude Code programmatically from the board
-- **Hooks** — capture CLI activity back into tickets
-- **Agent Brief API** — `GET /api/agent-brief` returns prioritized work queue
+- Node.js 18+
+- [Claude Code](https://docs.anthropic.com/claude/docs/claude-code) for one-click Run (the board itself works without it)
+- Windows, macOS, or Linux
 
-## API
+## What's free vs paid
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/tickets` | GET | Full board data |
-| `/api/tickets` | POST | Create ticket |
-| `/api/tickets` | PATCH | Update ticket |
-| `/api/tickets` | DELETE | Delete ticket |
-| `/api/tickets/:id/comments` | POST | Add comment |
-| `/api/upload` | POST | Upload file |
-| `/api/agent-claim` | POST | AI claims a ticket |
-| `/api/agent-brief` | GET | Prioritized work queue |
-| `/api/run` | POST | Trigger Claude Code on a ticket |
+ADHDev is 100% free and open-source today. A hosted tier is on the roadmap for teams that want a shared board across machines.
+
+| Feature                              | OSS (free) | Cloud (coming soon) |
+|--------------------------------------|:----------:|:-------------------:|
+| Local Kanban board                   |     ✅     |          ✅         |
+| Run tickets through Claude Code      |     ✅     |          ✅         |
+| Codebase auto-scan / draft tickets   |     ✅     |          ✅         |
+| Per-project local storage (.adhdev/) |     ✅     |          ✅         |
+| Multi-machine sync                   |      —     |          ✅         |
+| Team boards / shared projects        |      —     |          ✅         |
+| Hosted runs (no local agent)         |      —     |          ✅         |
+
+## Links
+
+- [GitHub Issues](https://github.com/sameernoorani1/adhdev/issues)
+- [Contributing](CONTRIBUTING.md)
+- Docs site — coming soon
+
+## License
+
+[Apache 2.0](LICENSE)

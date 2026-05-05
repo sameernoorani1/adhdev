@@ -555,13 +555,19 @@ export function getDefaultAgentRules(): AgentRules {
             ],
         },
         workflows: {
-            // 'normal' (and legacy 'issue') — standard ticket, AI can implement
+            // 'normal' (and legacy 'issue') — standard ticket, AI can implement.
+            // AD-255: `done → reopen` is now allowed so triage can re-surface a
+            // closed ticket when a new chat report is clearly related to it.
+            // The reopen must carry evidence in the comment (chat msg id,
+            // screenshot, or quoted comment) — see ADHDEV.md Chat Run Protocol.
+            // `reviewed` / `observe` / `deferred` stay human-owned via
+            // forbiddenStatuses above.
             normal: {
                 allowedTransitions: {
                     backlog: ['todo'],
                     todo: ['done'],
                     reopen: ['done'],
-                    done: [],
+                    done: ['reopen'],
                     observe: [],
                     reviewed: [],
                 },
@@ -572,7 +578,7 @@ export function getDefaultAgentRules(): AgentRules {
                     backlog: ['todo'],
                     todo: ['done'],
                     reopen: ['done'],
-                    done: [],
+                    done: ['reopen'],
                     observe: [],
                     reviewed: [],
                 },

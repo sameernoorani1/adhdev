@@ -165,12 +165,13 @@ The Brain Dump (\`.adhdev/chat.json\`) is a capture queue for raw thoughts. **Ru
 
 For each chat message with \`status === 'unaddressed'\`, follow this decision order — *exhaust earlier options before reaching for "create new"*:
 
-1. **Extends an existing ticket?** → \`COMMENT\` (drop a comment on the relevant ticket) or \`EDIT\` (PATCH description / fields).
-2. **Belongs with another message already triaged this run?** → \`MERGE\`: append the bullet/context to the ticket already created for the sibling message; do not spawn a duplicate.
-3. **Direct follow-up to a specific existing ticket?** → \`SUB-TASK\`: create with \`relations: [{kind: 'subtask', ticketId: '<parent>'}]\` so the parent's Linked panel surfaces it. Inverse is auto-mirrored — never set both sides.
-4. **Sibling of new tickets being spawned in this same run?** → set \`subtask\` of the originating epic on each (so they share a parent and the Linked panel groups them) — *not* a flat list of disconnected new tickets.
-5. **None of the above?** → \`CREATE\` standalone, but only after explicitly considering 1-4.
-6. **Vague / revisit later?** → \`noted\`.
+1. **Extends an existing OPEN ticket?** → \`COMMENT\` (drop a comment on the relevant ticket) or \`EDIT\` (PATCH description / fields).
+2. **Re-surfaces a previously-shipped ticket** (\`status: done\`) — i.e. the message reports the bug recurring, the feature regressed, or the fix didn't hold? → \`REOPEN\`: PATCH the ticket from \`done\` to \`reopen\`, AND post a comment that explicitly surfaces the **evidence**: source chat msg id (e.g. \`m-abc123\`), the quoted symptom, any attached screenshot, and what changed since the prior fix. Reopening **without evidence** is a redundant respawn dressed up as a state change — don't do that. **Only \`done\` is reopenable by AI.** \`reviewed\` / \`observe\` / \`deferred\` stay human-owned: if a chat message clearly relates to a \`reviewed\` ticket, post a COMMENT on that ticket flagging the recurrence + evidence and let Sameer decide whether to re-open.
+3. **Belongs with another message already triaged this run?** → \`MERGE\`: append the bullet/context to the ticket already created for the sibling message; do not spawn a duplicate.
+4. **Direct follow-up to a specific existing ticket?** → \`SUB-TASK\`: create with \`relations: [{kind: 'subtask', ticketId: '<parent>'}]\` so the parent's Linked panel surfaces it. Inverse is auto-mirrored — never set both sides.
+5. **Sibling of new tickets being spawned in this same run?** → set \`subtask\` of the originating epic on each (so they share a parent and the Linked panel groups them) — *not* a flat list of disconnected new tickets.
+6. **None of the above?** → \`CREATE\` standalone, but only after explicitly considering 1-5.
+7. **Vague / revisit later?** → \`noted\`.
 
 **Tag taxonomy is closed.** Allowed values: \`bug\`, \`feature\`, \`polish\`, \`perf\`, \`infra\`, \`ai\`. The API rejects anything else on POST/PATCH with a 400. Tags describe *type*, not surface (use the title for surface) and not roadmap phase (that lives in \`wave\`/\`missionId\`).
 

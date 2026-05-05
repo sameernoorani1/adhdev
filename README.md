@@ -17,6 +17,7 @@ npx adhdev start   # Open the board at localhost:3111
 - **One-click Run** — trigger Claude Code on any ticket from the board
 - **Live streaming** — watch AI responses flow into ticket comments
 - **Agent rules** — enforce transition gates (AI can't skip human review)
+- **Structured receipts** — every completed run records a **verified file list** (sourced from `git diff` against the run's baseline ref; falls back to agent self-report only when the project isn't a git repo, with the source labeled honestly), alongside an agent-claimed summary and verification notes
 - **File-based storage** — everything lives in `.adhdev/` in your project
 
 ## For Claude Code users

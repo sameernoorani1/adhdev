@@ -148,6 +148,17 @@ ${buildExecutionContractText(getDefaultExecutionContract(), userName)
     .map(line => `- ${line.replace(/^- /, '')}`)
     .join('\n')}
 
+### Receipt model — what's verified vs claimed
+
+Done-time execution metadata is a **structured receipt** of the run. Not every field carries the same weight; agents and reviewers should treat them differently:
+
+- **\`filesTouched\` — verified file list.** When the project is a git repo, the API ground-truths this on the AI's PATCH-to-done by running \`git diff\` against the baseline ref captured at run-start. The agent's self-reported list is replaced. \`execution.filesTouchedSource = 'git-diff'\` labels the verified case; \`'agent'\` labels the fallback (non-git project, missing baseline, or git failure).
+- **\`summary\` — agent-claimed.** Free-form prose. Not verified; trust calibrated to the agent's track record.
+- **\`verification\` — agent-claimed.** "Ran tsc clean", "vitest passing", "tested in browser" — these are agent claims about checks they ran. Useful as breadcrumbs; not ground-truthed by ADHDev.
+- **\`result\` — agent-claimed.** \`success\` / \`blocked\` / etc. The flag the agent set on itself.
+
+Reviewers reading a Done ticket can lean on the **file list** as the structured / verified portion of the receipt and treat the rest as the agent's claimed account, to be spot-checked.
+
 ## Chat Run Protocol
 
 The Brain Dump (\`.adhdev/chat.json\`) is a capture queue for raw thoughts. **Run Chat** triggers triage — board routing only, not engineering. Engineering on any spawned ticket happens later when that ticket is run.

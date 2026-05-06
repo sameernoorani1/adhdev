@@ -27,14 +27,20 @@ export async function GET() {
 
 function probeClaudeVersion(): Promise<{ version: string | null; error: string | null }> {
     return new Promise(resolve => {
-        // AD-238: drop `shell: true` (DEP0190 + command-injection surface).
-        // On Windows the `claude` shim is `claude.cmd`; we resolve to it
-        // explicitly so spawn doesn't fail to find it without shell PATHEXT
-        // resolution.
-        const claudeCmd = process.platform === 'win32' ? 'claude.cmd' : 'claude';
+        // AD-238 (third pass): on Windows, `claude` is `claude.cmd`. The
+        // earlier "drop shell: true" fix made this throw EINVAL on a fresh
+        // Windows install (`spawn` can't run `.cmd` without a shell), and
+        // adding `shell: true` brings DEP0190 back. The clean shape is to
+        // run `cmd.exe /c claude --version` — cmd.exe is an `.exe` so
+        // spawn launches it without any implicit shell, `/c` makes it
+        // execute the rest as a command, args stay in array form. No
+        // `shell` option, no DEP0190, no EINVAL.
+        const isWin = process.platform === 'win32';
+        const spawnCmd = isWin ? 'cmd.exe' : 'claude';
+        const spawnArgs = isWin ? ['/c', 'claude', '--version'] : ['--version'];
         let child;
         try {
-            child = spawn(claudeCmd, ['--version'], {
+            child = spawn(spawnCmd, spawnArgs, {
                 windowsHide: true,
             });
         } catch (err) {

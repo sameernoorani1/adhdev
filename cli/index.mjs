@@ -639,29 +639,25 @@ async function start() {
     : ['next', 'dev', '-H', '127.0.0.1', '-p', String(port)];
   console.log(`  ✓ Board starting on http://localhost:${port} (${useProd ? 'prod' : 'dev'} mode)\n`);
 
-  // AD-238 (reopened from m-motxyl00-mmyr): on Windows, `npx` is `npx.cmd`,
-  // and `child_process.spawn` cannot execute `.cmd` / `.bat` files without
-  // a shell — Node throws EINVAL. The original AD-238 fix dropped
-  // `shell: true` to silence DEP0190, but that diagnosis was wrong: DEP0190
-  // is actually about the *implicit* shell-wrapping Node falls back to for
-  // `.cmd` files when `shell: true` is missing, so setting it *explicitly*
-  // silences the warning AND avoids the EINVAL crash that was making
-  // adhdev-board unrunnable on a fresh Windows install.
-  //
-  // Command-injection surface here is zero: every element of `nextArgs` is
-  // a constant string from this file plus a numeric port. No user input is
-  // interpolated. We still use the array form so spawn quotes args
-  // correctly under the shell.
+  // AD-238 (third pass): on Windows, `npx` is `npx.cmd`. Node's
+  // `child_process.spawn` cannot execute `.cmd` / `.bat` files directly
+  // (throws EINVAL), and the prior fix that set `shell: true` re-triggered
+  // DEP0190 (Node's deprecation of "args concatenated, not escaped" under
+  // shell mode). The right shape on Windows is to invoke `cmd.exe /c npx`
+  // explicitly: cmd.exe is an `.exe` so spawn runs it without any implicit
+  // shell wrapping, `/c` makes it execute the remaining tokens as a
+  // command, and the array form keeps each arg as its own array element.
+  // No `shell` option, no DEP0190, no EINVAL.
   //
   // The other spawn site in this file (`spawn('node', [terminalScript], …)`)
-  // stays array-form / no-shell — `node` is an `.exe` and runs cleanly
-  // without a shell on every platform.
-  const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-  const nextChild = spawn(npxCmd, nextArgs, {
+  // stays array-form / no-shell — `node` is an `.exe` on every platform.
+  const isWin = process.platform === 'win32';
+  const spawnCmd = isWin ? 'cmd.exe' : 'npx';
+  const spawnArgs = isWin ? ['/c', 'npx', ...nextArgs] : nextArgs;
+  const nextChild = spawn(spawnCmd, spawnArgs, {
     cwd: pkgDir,
     env: { ...process.env, PORT: String(port) },
     stdio: 'inherit',
-    shell: process.platform === 'win32',
   });
 
   // Auto-open browser once ready — single attempt via polling

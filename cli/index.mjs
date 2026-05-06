@@ -639,15 +639,29 @@ async function start() {
     : ['next', 'dev', '-H', '127.0.0.1', '-p', String(port)];
   console.log(`  ✓ Board starting on http://localhost:${port} (${useProd ? 'prod' : 'dev'} mode)\n`);
 
-  // AD-238: drop `shell: true` to silence DEP0190 and remove the (unused
-  // here) command-injection surface. On Windows `npx` is `npx.cmd`; we
-  // resolve to the right shim explicitly so spawn doesn't fail to find it
-  // when shell resolution is off.
+  // AD-238 (reopened from m-motxyl00-mmyr): on Windows, `npx` is `npx.cmd`,
+  // and `child_process.spawn` cannot execute `.cmd` / `.bat` files without
+  // a shell — Node throws EINVAL. The original AD-238 fix dropped
+  // `shell: true` to silence DEP0190, but that diagnosis was wrong: DEP0190
+  // is actually about the *implicit* shell-wrapping Node falls back to for
+  // `.cmd` files when `shell: true` is missing, so setting it *explicitly*
+  // silences the warning AND avoids the EINVAL crash that was making
+  // adhdev-board unrunnable on a fresh Windows install.
+  //
+  // Command-injection surface here is zero: every element of `nextArgs` is
+  // a constant string from this file plus a numeric port. No user input is
+  // interpolated. We still use the array form so spawn quotes args
+  // correctly under the shell.
+  //
+  // The other spawn site in this file (`spawn('node', [terminalScript], …)`)
+  // stays array-form / no-shell — `node` is an `.exe` and runs cleanly
+  // without a shell on every platform.
   const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
   const nextChild = spawn(npxCmd, nextArgs, {
     cwd: pkgDir,
     env: { ...process.env, PORT: String(port) },
     stdio: 'inherit',
+    shell: process.platform === 'win32',
   });
 
   // Auto-open browser once ready — single attempt via polling

@@ -55,13 +55,60 @@ export function buildBatchPlanningPrompt(mode: 'full' | 'incremental', ticketIds
     ].join('\n');
 }
 
-export function buildAgentStartupGuidance(agentName?: string | null): string[] {
-    const lower = (agentName || '').toLowerCase();
-    const command = lower.includes('codex')
-        ? 'codex'
-        : lower.includes('aider')
-            ? 'aider'
-            : 'claude';
+// §5.4 follow-up: respect the user's onboarding-saved preferred agent +
+// variant when telling them how to start the agent. Falls back to the
+// detected agent name (or bare `claude`) when no preference is stored.
+export interface PreferredAgentPref {
+    id?: string;
+    variantId?: string;
+    customFlags?: string;
+}
+
+const AGENT_RUN_COMMAND_BY_ID: Record<string, string> = {
+    'Claude Code': 'claude',
+    'Codex': 'codex',
+    'Gemini CLI': 'gemini',
+    'Aider': 'aider',
+    'Cursor Agent': 'cursor-agent',
+    'Continue': 'continue',
+};
+
+const AGENT_VARIANT_FLAGS: Record<string, Record<string, string>> = {
+    'Claude Code': {
+        standard: '',
+        yolo: '--dangerously-skip-permissions',
+    },
+    'Codex': {
+        standard: '',
+        'auto-edit': '--auto-edit',
+        'full-auto': '--full-auto',
+    },
+    'Aider': {
+        standard: '',
+        'yes-always': '--yes-always',
+    },
+};
+
+export function buildAgentStartupGuidance(agentName?: string | null, preferred?: PreferredAgentPref | null): string[] {
+    let command: string;
+    if (preferred?.id && AGENT_RUN_COMMAND_BY_ID[preferred.id]) {
+        const base = AGENT_RUN_COMMAND_BY_ID[preferred.id];
+        const flags = preferred.variantId === 'custom'
+            ? (preferred.customFlags || '').trim()
+            : (AGENT_VARIANT_FLAGS[preferred.id]?.[preferred.variantId || 'standard'] || '');
+        command = flags ? `${base} ${flags}` : base;
+    } else {
+        const lower = (agentName || '').toLowerCase();
+        command = lower.includes('codex')
+            ? 'codex'
+            : lower.includes('aider')
+                ? 'aider'
+                : lower.includes('gemini')
+                    ? 'gemini'
+                    : lower.includes('cursor')
+                        ? 'cursor-agent'
+                        : 'claude';
+    }
 
     return [
         '1. Open the terminal pane.',

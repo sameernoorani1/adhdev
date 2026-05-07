@@ -639,22 +639,34 @@ async function start() {
     : ['next', 'dev', '-H', '127.0.0.1', '-p', String(port)];
   console.log(`  ✓ Board starting on http://localhost:${port} (${useProd ? 'prod' : 'dev'} mode)\n`);
 
-  // AD-238 (third pass): on Windows, `npx` is `npx.cmd`. Node's
-  // `child_process.spawn` cannot execute `.cmd` / `.bat` files directly
-  // (throws EINVAL), and the prior fix that set `shell: true` re-triggered
-  // DEP0190 (Node's deprecation of "args concatenated, not escaped" under
-  // shell mode). The right shape on Windows is to invoke `cmd.exe /c npx`
-  // explicitly: cmd.exe is an `.exe` so spawn runs it without any implicit
-  // shell wrapping, `/c` makes it execute the remaining tokens as a
-  // command, and the array form keeps each arg as its own array element.
-  // No `shell` option, no DEP0190, no EINVAL.
-  //
-  // The other spawn site in this file (`spawn('node', [terminalScript], …)`)
-  // stays array-form / no-shell — `node` is an `.exe` on every platform.
-  const isWin = process.platform === 'win32';
-  const spawnCmd = isWin ? 'cmd.exe' : 'npx';
-  const spawnArgs = isWin ? ['/c', 'npx', ...nextArgs] : nextArgs;
-  const nextChild = spawn(spawnCmd, spawnArgs, {
+  // AD-238 (fourth pass): bypass `npx` entirely and resolve the Next.js
+  // binary via `require.resolve('next/dist/bin/next')`, then run it with
+  // `node`. `node` is `.exe` on Windows and a real binary elsewhere — spawn
+  // executes it directly, no shell, no `.cmd` shim, no `npx` wrapper.
+  // Earlier passes routed through `cmd.exe /c npx` to avoid EINVAL on the
+  // `.cmd` shim, but `npx` itself spawns internally with `shell: true`
+  // (re-introducing DEP0190 in the user's startup output, which is what we
+  // were trying to silence). Going straight to `node <next-bin>` collapses
+  // the chain to a single Node process, no shell anywhere, no DEP0190.
+  // `nextArgs[0]` was the literal string `next` (for npx) — drop it; we
+  // pass the rest as Next's own argv.
+  const { createRequire } = await import('module');
+  const localRequire = createRequire(import.meta.url);
+  let nextBinPath;
+  try {
+    nextBinPath = localRequire.resolve('next/dist/bin/next', { paths: [pkgDir] });
+  } catch {
+    // Fallback: relative to the bundled package's node_modules. Should never
+    // hit on a sane install — every npm install of adhdev-board pulls Next
+    // as a runtime dep — but if it does we surface a clear error rather
+    // than a cryptic spawn EINVAL.
+    console.error('  ✗ Next.js not found inside the package. Re-install adhdev-board?');
+    process.exit(1);
+  }
+  // nextArgs was ['next', 'start'|'dev', ...] for npx. Drop the leading
+  // `next` token — we're invoking the bin directly now.
+  const nextOwnArgs = nextArgs.slice(1);
+  const nextChild = spawn(process.execPath, [nextBinPath, ...nextOwnArgs], {
     cwd: pkgDir,
     env: { ...process.env, PORT: String(port) },
     stdio: 'inherit',

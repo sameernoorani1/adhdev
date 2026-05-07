@@ -1,9 +1,27 @@
 import { readFeedback, resolveTicketById, writeFeedback, withFeedbackLock, type FeedbackTicket } from './core';
-import { buildAgentStartupGuidance, buildRunPrompt } from './runPrompt';
+import { buildAgentStartupGuidance, buildRunPrompt, type PreferredAgentPref } from './runPrompt';
 import { boardSizeWarning } from './boardSizeWarning';
 import { terminalAuthHeaders } from './sessionToken';
 import { getCurrentGitSha } from './gitDiff';
 import { getActiveProject, getProjectById } from './registry';
+import fs from 'fs';
+import path from 'path';
+
+// §5.4 follow-up: read the project's saved preferredAgent (id + variant +
+// custom flags) so the startup-guidance text addresses the user with the
+// agent + flags they actually picked, not the bare `claude` default.
+function readPreferredAgent(projectId?: string | null): PreferredAgentPref | null {
+    try {
+        const project = getProjectById(projectId) || getActiveProject();
+        if (!project) return null;
+        const cfgPath = path.join(project.path, '.adhdev', 'config.json');
+        if (!fs.existsSync(cfgPath)) return null;
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+        const pref = cfg?.onboardingState?.preferredAgent;
+        if (pref && typeof pref.id === 'string' && typeof pref.variantId === 'string') return pref;
+        return null;
+    } catch { return null; }
+}
 
 const TERMINAL_URL = 'http://localhost:3112';
 
@@ -60,7 +78,8 @@ export async function executeAgentPrompt(
 ): Promise<RunExecutionResult> {
     const trimmedPrompt = prompt.trim();
     const terminalStatus = await getTerminalAgentStatus(projectId);
-    const guidance = buildAgentStartupGuidance(terminalStatus.agentName);
+    const preferred = readPreferredAgent(projectId);
+    const guidance = buildAgentStartupGuidance(terminalStatus.agentName, preferred);
 
     if (!trimmedPrompt) {
         return {

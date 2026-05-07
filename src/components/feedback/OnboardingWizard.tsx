@@ -30,6 +30,11 @@ export interface WizardOnboardingState {
     populated?: boolean;
     gitPosture?: 'experiment' | 'github' | 'remote' | null;
     remoteUrl?: string | null;
+    // §5.4 follow-up: persist the user's preferred agent + variant so the
+    // Run flow / startup-guidance text can address them by their chosen
+    // shape (e.g. "claude --dangerously-skip-permissions" instead of
+    // bare "claude") on subsequent sessions.
+    preferredAgent?: { id: string; variantId: string; customFlags?: string } | null;
 }
 
 interface OnboardingWizardProps {
@@ -54,13 +59,90 @@ function tagForCandidate(kind: ScanKind | undefined): string[] {
     return [];
 }
 
-const RECOGNISED_CLIS: Array<{ id: string; label: string; installHint: string; runCommand: string }> = [
-    { id: 'Claude Code', label: 'Claude Code', installHint: 'npm i -g @anthropic-ai/claude-code', runCommand: 'claude' },
-    { id: 'Codex',       label: 'Codex',       installHint: 'npm i -g @openai/codex',          runCommand: 'codex' },
-    { id: 'Gemini CLI',  label: 'Gemini CLI',  installHint: 'npm i -g @google/gemini-cli',     runCommand: 'gemini' },
-    { id: 'Aider',       label: 'Aider',       installHint: 'pip install aider-chat',          runCommand: 'aider' },
-    { id: 'Cursor Agent', label: 'Cursor Agent', installHint: 'Install Cursor (cursor.sh) — ships with cursor-agent', runCommand: 'cursor-agent' },
-    { id: 'Continue',    label: 'Continue',    installHint: 'See continue.dev/install',        runCommand: 'continue' },
+// §5.4 follow-up: per-agent variant catalogue. Each agent has at least a
+// "Standard" mode (the bare runCommand) and a "Skip permissions" / yolo mode
+// where the agent skips per-action confirmations (faster, riskier). A
+// "Custom flags" mode lets the user paste any flags they prefer — saved in
+// onboarding state so they don't retype every session.
+//
+// `installSupported` distinguishes one-click installable agents (npm-/pip-
+// shippable) from editor-bundled ones (Cursor Agent, Continue) where we
+// can only show guidance text — those agents' /api/install-agent calls
+// return a `guidanceOnly: true` response instead of running anything.
+interface AgentVariant {
+    id: string;
+    label: string;
+    flags: string;
+    help: string;
+}
+interface AgentDef {
+    id: string;
+    label: string;
+    runCommand: string;
+    installSupported: boolean;
+    installHint: string;
+    variants: AgentVariant[];
+    defaultVariantId: string;
+}
+const RECOGNISED_CLIS: AgentDef[] = [
+    {
+        id: 'Claude Code', label: 'Claude Code', runCommand: 'claude',
+        installSupported: true, installHint: 'npm i -g @anthropic-ai/claude-code',
+        variants: [
+            { id: 'standard', label: 'Standard',          flags: '',                                   help: 'Asks for permission before each edit / shell run.' },
+            { id: 'yolo',     label: 'Skip permissions',  flags: '--dangerously-skip-permissions',     help: 'No permission prompts. Faster, riskier — fine in a sandbox / disposable repo.' },
+            { id: 'custom',   label: 'Custom flags',      flags: '',                                   help: 'Paste your own flags below — e.g. `--model opus-4` or `--continue`.' },
+        ],
+        defaultVariantId: 'yolo',
+    },
+    {
+        id: 'Codex', label: 'Codex', runCommand: 'codex',
+        installSupported: true, installHint: 'npm i -g @openai/codex',
+        variants: [
+            { id: 'standard',  label: 'Suggest mode',  flags: '',             help: 'Suggests changes — you accept/reject each one.' },
+            { id: 'auto-edit', label: 'Auto-edit',     flags: '--auto-edit',  help: 'Auto-applies edits without confirmation, but still asks before shell commands.' },
+            { id: 'full-auto', label: 'Full auto',     flags: '--full-auto',  help: 'No confirmations at all — applies edits AND runs commands. Sandbox-only.' },
+            { id: 'custom',    label: 'Custom flags',  flags: '',             help: 'Paste your own flags below.' },
+        ],
+        defaultVariantId: 'auto-edit',
+    },
+    {
+        id: 'Gemini CLI', label: 'Gemini CLI', runCommand: 'gemini',
+        installSupported: true, installHint: 'npm i -g @google/gemini-cli',
+        variants: [
+            { id: 'standard', label: 'Standard',     flags: '',  help: 'Default Gemini CLI behaviour.' },
+            { id: 'custom',   label: 'Custom flags', flags: '',  help: 'Paste your own flags below — e.g. `--model gemini-1.5-pro`.' },
+        ],
+        defaultVariantId: 'standard',
+    },
+    {
+        id: 'Aider', label: 'Aider', runCommand: 'aider',
+        installSupported: true, installHint: 'pip install aider-chat',
+        variants: [
+            { id: 'standard',   label: 'Standard',      flags: '',                help: 'Confirms each commit / shell run.' },
+            { id: 'yes-always', label: 'Auto-confirm',  flags: '--yes-always',    help: 'Yes to all confirmations. Faster, riskier.' },
+            { id: 'custom',     label: 'Custom flags',  flags: '',                help: 'Paste your own flags below.' },
+        ],
+        defaultVariantId: 'yes-always',
+    },
+    {
+        id: 'Cursor Agent', label: 'Cursor Agent', runCommand: 'cursor-agent',
+        installSupported: false, installHint: 'Install Cursor (cursor.sh) — ships with cursor-agent.',
+        variants: [
+            { id: 'standard', label: 'Standard',     flags: '',  help: 'Default cursor-agent behaviour.' },
+            { id: 'custom',   label: 'Custom flags', flags: '',  help: 'Paste your own flags below.' },
+        ],
+        defaultVariantId: 'standard',
+    },
+    {
+        id: 'Continue', label: 'Continue', runCommand: 'continue',
+        installSupported: false, installHint: 'Install via continue.dev/install — editor extension, not a global CLI.',
+        variants: [
+            { id: 'standard', label: 'Standard',     flags: '',  help: 'Default Continue behaviour.' },
+            { id: 'custom',   label: 'Custom flags', flags: '',  help: 'Paste your own flags below.' },
+        ],
+        defaultVariantId: 'standard',
+    },
 ];
 
 export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: OnboardingWizardProps) {
@@ -87,6 +169,39 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
     } | null>(null);
     const [validating, setValidating] = useState(false);
     const [agentDetected, setAgentDetected] = useState<string | null>(initialState.agentDetected || null);
+    // §5.4 follow-up: full per-agent panel state.
+    //   - `agentInstalls` is the result of /api/onboarding/detect-agents:
+    //     `{ [agentId]: { installed, version } }`. Refreshes when Step 2
+    //     mounts or the user clicks Re-detect.
+    //   - `installingAgentId` tracks the in-flight install (one at a time).
+    //   - `installResults` shows per-agent install start / error / guidance.
+    //   - `expandedAgentId` is which row is open for variant configuration.
+    //   - `agentVariantSel` / `agentCustomFlags` are the user's per-agent
+    //     selections (shown in the expanded card).
+    //   - `preferredAgent` is the user-confirmed pick that gets persisted.
+    type InstallStatus = { installed: boolean; version: string | null };
+    type InstallResult = { kind: 'started' | 'guidance' | 'error'; message: string };
+    const [agentInstalls, setAgentInstalls] = useState<Record<string, InstallStatus>>({});
+    const [agentInstallsLoading, setAgentInstallsLoading] = useState(false);
+    const [installingAgentId, setInstallingAgentId] = useState<string | null>(null);
+    const [installResults, setInstallResults] = useState<Record<string, InstallResult>>({});
+    const [expandedAgentId, setExpandedAgentId] = useState<string | null>(null);
+    const [agentVariantSel, setAgentVariantSel] = useState<Record<string, string>>(() => {
+        const out: Record<string, string> = {};
+        RECOGNISED_CLIS.forEach(a => { out[a.id] = a.defaultVariantId; });
+        if (initialState.preferredAgent?.id && initialState.preferredAgent?.variantId) {
+            out[initialState.preferredAgent.id] = initialState.preferredAgent.variantId;
+        }
+        return out;
+    });
+    const [agentCustomFlags, setAgentCustomFlags] = useState<Record<string, string>>(() => {
+        const out: Record<string, string> = {};
+        if (initialState.preferredAgent?.id && initialState.preferredAgent?.customFlags) {
+            out[initialState.preferredAgent.id] = initialState.preferredAgent.customFlags;
+        }
+        return out;
+    });
+    const [preferredAgent, setPreferredAgent] = useState<{ id: string; variantId: string; customFlags?: string } | null>(initialState.preferredAgent || null);
     const [scanResult, setScanResult] = useState<ScanResult | null>(null);
     const [scanning, setScanning] = useState(false);
     const [scanError, setScanError] = useState<string | null>(null);
@@ -161,6 +276,74 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
         } catch { /* ignore */ }
         finally { setPicking(false); }
     }, [picking]);
+
+    // §5.4 follow-up: detect which agents are installed by hitting
+    // /api/onboarding/detect-agents. Runs once on Step 2 mount + on demand
+    // via the Re-detect button.
+    const detectAgents = useCallback(async () => {
+        setAgentInstallsLoading(true);
+        try {
+            const r = await fetch('/api/onboarding/detect-agents');
+            const d = await r.json();
+            if (d?.agents) setAgentInstalls(d.agents);
+        } catch { /* leave previous result; user can retry */ }
+        finally { setAgentInstallsLoading(false); }
+    }, []);
+
+    // §5.4 follow-up: per-agent install. Calls the generic /api/install-agent
+    // endpoint, which ships the agent's install command into the embedded
+    // terminal session (same shape as the AD-228 Claude installer). Editor-
+    // bundled agents (Cursor / Continue) come back as `guidanceOnly` — we
+    // surface the message inline rather than blasting the terminal.
+    const handleInstallAgent = useCallback(async (agentId: string) => {
+        if (installingAgentId) return;
+        setInstallResults(prev => ({ ...prev, [agentId]: { kind: 'started', message: 'Starting install in the terminal…' } }));
+        setInstallingAgentId(agentId);
+        try {
+            const r = await fetch('/api/install-agent', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ agentId }),
+            });
+            const d = await r.json();
+            if (!r.ok) {
+                setInstallResults(prev => ({ ...prev, [agentId]: { kind: 'error', message: d?.error || 'Install failed.' } }));
+            } else if (d.guidanceOnly) {
+                setInstallResults(prev => ({ ...prev, [agentId]: { kind: 'guidance', message: d.message || 'See the agent docs to install.' } }));
+            } else {
+                setInstallResults(prev => ({ ...prev, [agentId]: { kind: 'started', message: `Running: ${d.command || 'install'} (watch the terminal)` } }));
+                // Poll detect-agents a couple of times so the row flips to
+                // "Detected vN.N.N" after the install finishes.
+                setTimeout(() => detectAgents(), 8000);
+                setTimeout(() => detectAgents(), 20000);
+                setTimeout(() => detectAgents(), 45000);
+            }
+        } catch {
+            setInstallResults(prev => ({ ...prev, [agentId]: { kind: 'error', message: 'Terminal server unreachable.' } }));
+        } finally {
+            setInstallingAgentId(null);
+        }
+    }, [installingAgentId, detectAgents]);
+
+    // §5.4 follow-up: confirm the user's pick + variant + custom flags as
+    // the preferredAgent for this project. Persisted via the wizard's
+    // existing onboarding-state PATCH — the Run flow can read it later.
+    const handleConfirmAgent = useCallback((agentId: string) => {
+        const variantId = agentVariantSel[agentId] || RECOGNISED_CLIS.find(a => a.id === agentId)?.defaultVariantId || 'standard';
+        const customFlags = variantId === 'custom' ? (agentCustomFlags[agentId] || '').trim() : undefined;
+        const next = { id: agentId, variantId, ...(customFlags ? { customFlags } : {}) };
+        setPreferredAgent(next);
+        // Use onPatchOnboarding directly rather than the `persist` wrapper —
+        // `persist` is declared later in this component and using it here
+        // would create an unnecessary forward reference.
+        void onPatchOnboarding({ preferredAgent: next } as Record<string, unknown>);
+    }, [agentVariantSel, agentCustomFlags, onPatchOnboarding]);
+
+    // Fire detect on Step 2 mount.
+    useEffect(() => {
+        if (step !== 2) return;
+        void detectAgents();
+    }, [step, detectAgents]);
 
     // Step 2 — poll /api/terminal-status until we see an agentName. Lightweight
     // (every 2s) and only while the wizard is actually on Step 2.
@@ -340,7 +523,11 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
                 populated: !!importResult && importResult.imported > 0,
                 gitPosture,
                 remoteUrl: remoteUrl || null,
-                welcomeSeen: true,  // satisfies the existing AD-073 dismissal pattern
+                // §5.1 / first-time-intro fix: do NOT flip welcomeSeen here.
+                // Setting it pre-emptively at wizard finish suppresses the
+                // WelcomeModal (the actual product intro), leaving fresh
+                // users with no first-time guidance after the wizard. The
+                // WelcomeModal flips it itself when the user dismisses it.
             } as Record<string, unknown>);
             onClose();
         } catch (err) {
@@ -351,7 +538,10 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
     };
 
     const handleSkipAll = async () => {
-        await persist({ wizardCompleted: true, welcomeSeen: true } as Record<string, unknown>);
+        // §5.1 fix: do NOT pre-flip welcomeSeen here. A user who skips the
+        // wizard still benefits from the WelcomeModal's product intro on
+        // the next paint. Welcome dismissal flips its own flag.
+        await persist({ wizardCompleted: true } as Record<string, unknown>);
         onClose();
     };
 
@@ -563,26 +753,153 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
 
                     {step === 2 && (
                         <div className="space-y-3">
-                            <div>
-                                <h3 className="text-sm font-semibold text-vd-text-primary mb-1">Connect a coding agent</h3>
-                                <p className="text-[11px] text-vd-text-tertiary">Open the in-app terminal (the button up top) and run one of these. We'll glow the row when we see it.</p>
+                            <div className="flex items-start justify-between gap-3">
+                                <div>
+                                    <h3 className="text-sm font-semibold text-vd-text-primary mb-1">Connect a coding agent</h3>
+                                    <p className="text-[11px] text-vd-text-tertiary">Pick the agent ADHDev should drive on your tickets. We&apos;ll detect what&apos;s already on your machine and one-click install the rest.</p>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={detectAgents}
+                                    disabled={agentInstallsLoading}
+                                    className="flex-shrink-0 text-[10px] px-2 py-1 rounded border border-vd-border text-vd-text-tertiary hover:text-vd-text-secondary hover:bg-vd-bg-tertiary disabled:opacity-50"
+                                    title="Re-probe each agent CLI for installed status"
+                                >
+                                    {agentInstallsLoading ? 'Detecting…' : 'Re-detect'}
+                                </button>
                             </div>
-                            <div className="space-y-1.5">
-                                {RECOGNISED_CLIS.map(cli => {
-                                    const detected = agentDetected === cli.id;
+
+                            <div className="space-y-2">
+                                {RECOGNISED_CLIS.map((agent, idx) => {
+                                    const status = agentInstalls[agent.id];
+                                    const isInstalled = !!status?.installed;
+                                    const isLiveDetected = agentDetected === agent.id; // running NOW (terminal-status poll)
+                                    const isRecommended = idx === 0; // Claude Code is index 0
+                                    const isExpanded = expandedAgentId === agent.id;
+                                    const isPreferred = preferredAgent?.id === agent.id;
+                                    const variantId = agentVariantSel[agent.id] || agent.defaultVariantId;
+                                    const variant = agent.variants.find(v => v.id === variantId) || agent.variants[0];
+                                    const customFlags = agentCustomFlags[agent.id] || '';
+                                    const installRes = installResults[agent.id];
+                                    const isInstalling = installingAgentId === agent.id;
+                                    const previewCmd = `${agent.runCommand}${variantId === 'custom' ? (customFlags ? ' ' + customFlags : '') : (variant.flags ? ' ' + variant.flags : '')}`.trim();
+
+                                    const borderClass = isPreferred
+                                        ? 'border-emerald-400/50 bg-emerald-500/10'
+                                        : isLiveDetected
+                                            ? 'border-emerald-400/40 bg-emerald-500/5'
+                                            : isRecommended
+                                                ? 'border-vd-accent-gold/40 bg-vd-accent-gold/5'
+                                                : 'border-vd-border';
+
                                     return (
-                                        <div key={cli.id} className={`flex items-center gap-3 px-3 py-2 rounded-md border ${detected ? 'border-emerald-400/40 bg-emerald-500/10' : 'border-vd-border'}`}>
-                                            <div className={`w-2 h-2 rounded-full ${detected ? 'bg-emerald-400' : 'bg-vd-text-tertiary/40'}`} />
-                                            <div className="flex-1 min-w-0">
-                                                <div className="text-xs font-semibold text-vd-text-primary">{cli.label}</div>
-                                                <div className="text-[10px] text-vd-text-tertiary">Run <code className="text-vd-text-secondary">{cli.runCommand}</code> in the terminal — install via <code className="text-vd-text-secondary">{cli.installHint}</code></div>
+                                        <div key={agent.id} className={`px-3 py-2.5 rounded-md border ${borderClass}`}>
+                                            {/* Header row */}
+                                            <div className="flex items-center gap-3">
+                                                <div className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${isLiveDetected ? 'bg-emerald-400' : isInstalled ? 'bg-emerald-400/60' : 'bg-vd-text-tertiary/40'}`} />
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="text-xs font-semibold text-vd-text-primary flex items-center gap-2 flex-wrap">
+                                                        {agent.label}
+                                                        {isRecommended && <span className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-vd-accent-gold/20 text-vd-accent-gold font-semibold">Recommended</span>}
+                                                        {isPreferred && <span className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-semibold">Selected</span>}
+                                                    </div>
+                                                    <div className="text-[10px] text-vd-text-tertiary mt-0.5">
+                                                        {agentInstallsLoading && !status ? (
+                                                            <span>Probing…</span>
+                                                        ) : isInstalled ? (
+                                                            <span className="text-emerald-400">✓ Installed{status.version ? ` (${status.version})` : ''}{isLiveDetected ? ' · running now' : ''}</span>
+                                                        ) : (
+                                                            <span>Not installed — {agent.installSupported ? 'we can install it for you.' : agent.installHint}</span>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                {/* Action button */}
+                                                {isInstalled ? (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setExpandedAgentId(isExpanded ? null : agent.id)}
+                                                        className="flex-shrink-0 px-2.5 py-1 text-[10px] font-medium border border-vd-border rounded hover:bg-vd-bg-tertiary"
+                                                    >
+                                                        {isExpanded ? 'Close' : isPreferred ? 'Configure' : 'Use this'}
+                                                    </button>
+                                                ) : agent.installSupported ? (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => handleInstallAgent(agent.id)}
+                                                        disabled={!!installingAgentId}
+                                                        className={`flex-shrink-0 px-3 py-1 text-[11px] font-semibold rounded ${isRecommended ? 'bg-vd-accent-gold text-vd-text-inverse' : 'border border-vd-accent-gold/40 text-vd-accent-gold hover:bg-vd-accent-gold/10'} disabled:opacity-50`}
+                                                    >
+                                                        {isInstalling ? 'Starting…' : `Install ${agent.label}`}
+                                                    </button>
+                                                ) : (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => handleInstallAgent(agent.id)}
+                                                        className="flex-shrink-0 px-2.5 py-1 text-[10px] font-medium border border-vd-border rounded hover:bg-vd-bg-tertiary text-vd-text-tertiary"
+                                                    >
+                                                        How to install
+                                                    </button>
+                                                )}
                                             </div>
-                                            {detected && <span className="text-[10px] font-semibold text-emerald-400">Detected</span>}
+
+                                            {/* Install result (started / error / guidance) */}
+                                            {installRes && (
+                                                <p className={`mt-2 text-[10px] ${installRes.kind === 'error' ? 'text-red-400' : installRes.kind === 'guidance' ? 'text-vd-text-secondary' : 'text-vd-text-tertiary'}`}>
+                                                    {installRes.kind === 'error' && '✗ '}
+                                                    {installRes.kind === 'started' && '→ '}
+                                                    {installRes.kind === 'guidance' && 'ⓘ '}
+                                                    {installRes.message}
+                                                </p>
+                                            )}
+
+                                            {/* Expanded variant picker */}
+                                            {isExpanded && isInstalled && (
+                                                <div className="mt-3 pt-3 border-t border-vd-border space-y-2">
+                                                    <div className="text-[10px] text-vd-text-secondary font-medium">Run mode</div>
+                                                    <div className="space-y-1">
+                                                        {agent.variants.map(v => (
+                                                            <label key={v.id} className="flex items-start gap-2 px-2 py-1 rounded cursor-pointer hover:bg-vd-bg-tertiary/40">
+                                                                <input
+                                                                    type="radio"
+                                                                    name={`variant-${agent.id}`}
+                                                                    checked={variantId === v.id}
+                                                                    onChange={() => setAgentVariantSel(prev => ({ ...prev, [agent.id]: v.id }))}
+                                                                    className="mt-0.5 accent-vd-accent-gold flex-shrink-0"
+                                                                />
+                                                                <div className="flex-1">
+                                                                    <div className="text-[11px] text-vd-text-primary">{v.label}</div>
+                                                                    <div className="text-[9px] text-vd-text-tertiary">{v.help}</div>
+                                                                </div>
+                                                            </label>
+                                                        ))}
+                                                    </div>
+                                                    {variantId === 'custom' && (
+                                                        <input
+                                                            type="text"
+                                                            value={customFlags}
+                                                            onChange={(e) => setAgentCustomFlags(prev => ({ ...prev, [agent.id]: e.target.value }))}
+                                                            placeholder="--your-flag --another"
+                                                            className="w-full px-2 py-1.5 text-[11px] bg-vd-bg-input border border-vd-border rounded font-mono text-vd-text-primary placeholder:text-vd-text-tertiary focus:border-vd-accent-gold/60 focus:outline-none"
+                                                        />
+                                                    )}
+                                                    <div className="flex items-center justify-between gap-2 pt-1">
+                                                        <code className="text-[10px] text-vd-accent-gold bg-vd-bg-input/60 px-2 py-1 rounded font-mono truncate flex-1">{previewCmd}</code>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => { handleConfirmAgent(agent.id); setExpandedAgentId(null); }}
+                                                            className="flex-shrink-0 px-3 py-1 text-[10px] font-semibold bg-vd-accent-gold text-vd-text-inverse rounded hover:opacity-90"
+                                                        >
+                                                            {isPreferred ? 'Update' : 'Use this'}
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            )}
                                         </div>
                                     );
                                 })}
                             </div>
-                            <p className="text-[10px] text-vd-text-tertiary">You can also click <em>Next</em> now and connect later — the wizard saves your progress.</p>
+
+                            <p className="text-[10px] text-vd-text-tertiary">You can change agents and run modes any time from Settings. Click <em>Next</em> when ready.</p>
                         </div>
                     )}
 

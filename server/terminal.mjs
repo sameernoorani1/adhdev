@@ -965,6 +965,25 @@ function inspectTerminalInput(session, data) {
         return data;
     }
 
+    // AD-246 reopen #2: bracketed-paste guard. The TerminalPane Ctrl+V handler
+    // wraps clipboard content as `\x1b[200~<text>\x1b[201~` and ships it as a
+    // single WS message. Without this guard the run-detection logic below
+    // (newline-split → ticket-id scan → injection) treats the paste as a
+    // typed command and inserts the ADHDev contract block at the FIRST
+    // newline of the paste — which lands inside the user's own bracketed-
+    // paste envelope. The CLI then renders user-text + injection as one
+    // undeletable paste unit, with the activity log streaming in alongside
+    // their content (the actual symptom: paste a chat reply that mentions a
+    // ticket → contract block + activity log + UI-context line jammed into
+    // the prompt). Pasted text is never a typed run declaration; treat any
+    // bracketed-paste payload as opaque pass-through and skip the entire
+    // inspection (no buffer accumulation, no agent-command detection, no
+    // injection). Detect on a leading `\x1b[200~` — sufficient because the
+    // TerminalPane wrap is one atomic WS frame.
+    if (data.startsWith('\x1b[200~')) {
+        return data;
+    }
+
     const wasAgentActive = session.agentState.active;
     session.agentInputBuffer = (session.agentInputBuffer || '') + data;
     const buf = session.agentInputBuffer;

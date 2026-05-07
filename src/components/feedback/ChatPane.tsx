@@ -151,17 +151,30 @@ export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessage
     const handleComposerPaste = useCallback(async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
         const items = e.clipboardData?.items;
         if (!items) return;
+        // AD-246 reopen: detect image-typed items in two passes. First pass
+        // checks for *any* `image/*` item — if present, we MUST preventDefault
+        // even if file extraction later fails, otherwise the text/HTML
+        // fallback (e.g. an `<img>` tag from a Windows screenshot tool) leaks
+        // into the textarea. Original handler only preventDefault'd when
+        // `files.length > 0`, which left a hole on screenshot paths where the
+        // clipboard had an image entry but `getAsFile()` returned null.
+        let hasImageItem = false;
         const files: File[] = [];
         for (let i = 0; i < items.length; i++) {
             if (items[i].type.startsWith('image/')) {
+                hasImageItem = true;
                 const f = items[i].getAsFile();
                 if (f) files.push(f);
             }
         }
-        if (files.length === 0) return;
+        if (!hasImageItem) return; // text-only paste — let the textarea handle it natively
         e.preventDefault();
-        await ingestFiles(files);
-    }, [ingestFiles]);
+        if (files.length > 0) {
+            await ingestFiles(files);
+        } else {
+            onToast?.('Could not read the pasted image — try drag-drop or save the file first.', 3000);
+        }
+    }, [ingestFiles, onToast]);
 
     const handleDrop = async (e: React.DragEvent) => {
         e.preventDefault();

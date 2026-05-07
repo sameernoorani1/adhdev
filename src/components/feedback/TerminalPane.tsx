@@ -173,7 +173,13 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
     // outside the xterm canvas so the feedback is unambiguous. Cleared via a
     // timestamped tag check so a fresh paste during the fade doesn't get
     // wiped by an earlier timeout.
-    const [recentPaste, setRecentPaste] = useState<{ lines: number; chars: number; tag: number; kind: 'ok' | 'empty' } | null>(null);
+    // AD-246 reopen: the original toast told the user a paste landed but not
+    // *what* — so when xterm's select-to-copy grabbed stale terminal scrollback
+    // and that content paste-replays into the CLI, the mismatch was invisible
+    // until it had already been submitted. `preview` carries the first ~60
+    // chars of the pasted text so the user sees what's actually leaving the
+    // clipboard before they hit Enter.
+    const [recentPaste, setRecentPaste] = useState<{ lines: number; chars: number; tag: number; kind: 'ok' | 'empty'; preview?: string } | null>(null);
     const [size, setSize] = useState(() => {
         if (typeof window === 'undefined') return 500;
         const saved = parseInt(localStorage.getItem(SIZE_KEY) || '', 10);
@@ -308,8 +314,17 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                         // paste failed and Ctrl+V again, stacking pastes.
                         const lines = stripped.split('\n').length;
                         const tag = Date.now();
-                        setRecentPaste({ lines, chars: stripped.length, tag, kind: 'ok' });
-                        setTimeout(() => setRecentPaste(prev => (prev?.tag === tag ? null : prev)), 2500);
+                        // AD-246 reopen: build a single-line preview (collapse
+                        // newlines to ⏎, truncate at 60 chars) so a clipboard
+                        // mismatch is visible at the moment of paste.
+                        const collapsed = stripped.replace(/\s+/g, ' ').trim();
+                        const preview = collapsed.length > 60
+                            ? collapsed.slice(0, 60) + '…'
+                            : collapsed;
+                        setRecentPaste({ lines, chars: stripped.length, tag, kind: 'ok', preview });
+                        // AD-246 reopen: hold the toast longer (4 s vs 2.5 s)
+                        // so the user can actually read the preview.
+                        setTimeout(() => setRecentPaste(prev => (prev?.tag === tag ? null : prev)), 4000);
                     }).catch(() => {});
                 }
                 return false; // block both keydown and keyup
@@ -889,19 +904,30 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                         {/* AD-246: paste-confirmation toast. Lives outside the
                             xterm canvas so the user sees something happened
                             even when Claude Code condensed the paste into a
-                            tiny "[Pasted text #N]" placeholder. */}
+                            tiny "[Pasted text #N]" placeholder.
+                            AD-246 reopen: bumped from 10px top-right to 12px
+                            top-center with a content preview, so the user can
+                            actually verify the clipboard had what they thought
+                            it had — not just that *some* paste landed. */}
                         {recentPaste && (
                             <div
                                 className={
-                                    'pointer-events-none absolute top-2 right-3 px-2.5 py-1 rounded-md text-[10px] font-medium shadow-md transition-opacity ' +
+                                    'pointer-events-none absolute top-2 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-md text-[12px] font-medium shadow-lg transition-opacity max-w-[90%] ' +
                                     (recentPaste.kind === 'ok'
-                                        ? 'bg-vd-accent-gold/20 text-vd-accent-gold border border-vd-accent-gold/30'
-                                        : 'bg-red-500/15 text-red-300 border border-red-500/30')
+                                        ? 'bg-vd-accent-gold/25 text-vd-accent-gold border border-vd-accent-gold/40'
+                                        : 'bg-red-500/20 text-red-300 border border-red-500/40')
                                 }
                             >
-                                {recentPaste.kind === 'ok'
-                                    ? `Pasted ${recentPaste.lines} line${recentPaste.lines === 1 ? '' : 's'} (${recentPaste.chars} chars)`
-                                    : 'Clipboard had no text — image paste isn’t supported in the terminal'}
+                                {recentPaste.kind === 'ok' ? (
+                                    <span>
+                                        <span className="opacity-70">Pasted {recentPaste.lines} line{recentPaste.lines === 1 ? '' : 's'} ({recentPaste.chars} chars):</span>
+                                        {recentPaste.preview && (
+                                            <span className="ml-1.5 font-mono">&ldquo;{recentPaste.preview}&rdquo;</span>
+                                        )}
+                                    </span>
+                                ) : (
+                                    'Clipboard had no text — image paste isn’t supported in the terminal'
+                                )}
                             </div>
                         )}
                     </div>

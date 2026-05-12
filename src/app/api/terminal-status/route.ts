@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { readFeedback, writeFeedback, withFeedbackLock } from '@/lib/feedback/core';
 import { applyCaptureHeartbeat } from '@/lib/feedback/captureHeartbeat';
+import { heartbeatActiveRuns } from '@/lib/feedback/runs';
 
 const TERMINAL_URL = 'http://localhost:3112';
 
@@ -21,7 +22,8 @@ const TERMINAL_URL = 'http://localhost:3112';
 const lastBumpMs = new Map<string, number>();
 const HEARTBEAT_DEBOUNCE_MS = 5_000;
 
-async function bumpCaptureTickets(projectId: string | null, ticketIds: string[]): Promise<void> {
+async function bumpCaptureTickets(projectId: string | null, ticketIds: string[], agentActive: boolean): Promise<void> {
+    if (!agentActive) return;
     if (!Array.isArray(ticketIds) || ticketIds.length === 0) return;
     const now = Date.now();
     const toBump = ticketIds.filter(id => {
@@ -37,7 +39,9 @@ async function bumpCaptureTickets(projectId: string | null, ticketIds: string[])
         await withFeedbackLock(projectId, () => {
             const data = readFeedback(projectId);
             const nowIso = new Date(now).toISOString();
-            const changed = applyCaptureHeartbeat(data, toBump, nowIso);
+            const ticketHeartbeatChanged = applyCaptureHeartbeat(data, toBump, nowIso);
+            const runHeartbeatChanged = heartbeatActiveRuns(data, toBump, nowIso);
+            const changed = ticketHeartbeatChanged || runHeartbeatChanged;
             if (changed) writeFeedback(data, projectId);
         });
     } catch {
@@ -70,7 +74,7 @@ export async function GET(request: NextRequest) {
             // ticket the terminal server reports as capturing, so the client's
             // freshness backstop keeps showing the indicator even when the
             // old terminal-server code (pre-heartbeat) is still running.
-            await bumpCaptureTickets(projectId, Array.isArray(data.captureTicketIds) ? data.captureTicketIds : []);
+            await bumpCaptureTickets(projectId, Array.isArray(data.captureTicketIds) ? data.captureTicketIds : [], Boolean(data.agentActive));
             return NextResponse.json({
                 connected: true,
                 capturing: data.capturing || false,

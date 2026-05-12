@@ -30,6 +30,8 @@ export const AUTO_COMPLETE_ON_CLEAR_REASONS = new Set([
     'max_runtime_exceeded',
 ]);
 
+const ACTIVE_RUN_STATUSES = new Set(['dispatching', 'running', 'finishing']);
+
 /**
  * Decides whether `clearActiveRunTickets(session, reason)` should
  * auto-complete the still-active executions for the given reason.
@@ -39,4 +41,37 @@ export const AUTO_COMPLETE_ON_CLEAR_REASONS = new Set([
 export function shouldAutoCompleteOnClear(reason) {
     if (reason === 'interrupted') return false;
     return AUTO_COMPLETE_ON_CLEAR_REASONS.has(reason);
+}
+
+/**
+ * AD-270: the max-runtime watchdog must read the live run lease, not the
+ * ticket's durable execution receipt. Reopened tickets commonly carry an old
+ * execution.startedAt from a completed run; using that old timestamp makes a
+ * fresh active run look older than the max runtime and clears the animation
+ * even while the terminal agent is still running.
+ *
+ * @param {unknown} boardData
+ * @param {unknown[]} ticketIds
+ * @param {number} cutoffMs
+ * @param {string | null} [runId]
+ */
+export function hasActiveRunExceededMaxDuration(boardData, ticketIds, cutoffMs, runId = null) {
+    if (!boardData || !Array.isArray(boardData.activeRuns)) return false;
+    if (!Array.isArray(ticketIds) || ticketIds.length === 0) return false;
+    if (!Number.isFinite(cutoffMs)) return false;
+
+    const ids = new Set(ticketIds.map(id => String(id || '').toUpperCase()).filter(Boolean));
+    if (ids.size === 0) return false;
+
+    for (const run of boardData.activeRuns) {
+        if (!run || !ACTIVE_RUN_STATUSES.has(run.status)) continue;
+        if (runId && run.runId !== runId) continue;
+        const runTicketIds = Array.isArray(run.ticketIds) ? run.ticketIds : [];
+        if (!runTicketIds.some(id => ids.has(String(id || '').toUpperCase()))) continue;
+
+        const startedMs = new Date(run.startedAt || run.updatedAt || '').getTime();
+        if (Number.isFinite(startedMs) && startedMs < cutoffMs) return true;
+    }
+
+    return false;
 }

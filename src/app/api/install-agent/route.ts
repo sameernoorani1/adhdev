@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { terminalAuthHeaders } from '@/lib/feedback/sessionToken';
+import { existsSync } from 'node:fs';
 
 // §5.4 follow-up: generic agent-install endpoint. Same shape as AD-228's
 // /api/install-claude but takes an agentId and ships the matching install
@@ -11,10 +12,21 @@ import { terminalAuthHeaders } from '@/lib/feedback/sessionToken';
 // arbitrary commands through the endpoint — only the six known CLIs are
 // installable via this route. Anything else returns 400.
 
+function npmGlobalInstallCommand(packageName: string): string {
+    if (process.platform !== 'win32') return `npm i -g ${packageName}`;
+
+    // AD-268: terminal sessions can be cmd.exe or PowerShell, and PowerShell
+    // may reject npm.ps1. Run npm through cmd.exe; prefer Node's default short
+    // path so the command also survives shells that mishandle quoted paths.
+    const nodeNpm = 'C:\\Progra~1\\nodejs\\npm.cmd';
+    const npm = existsSync(nodeNpm) ? nodeNpm : 'npm';
+    return `cmd.exe /d /c ${npm} i -g ${packageName}`;
+}
+
 const INSTALL_COMMANDS: Record<string, string> = {
-    'Claude Code':  'npm i -g @anthropic-ai/claude-code@latest',
-    'Codex':        'npm i -g @openai/codex',
-    'Gemini CLI':   'npm i -g @google/gemini-cli',
+    'Claude Code':  npmGlobalInstallCommand('@anthropic-ai/claude-code@latest'),
+    'Codex':        npmGlobalInstallCommand('@openai/codex'),
+    'Gemini CLI':   npmGlobalInstallCommand('@google/gemini-cli'),
     'Aider':        'pip install -U aider-chat',
     // Cursor Agent ships with the Cursor IDE — there's no CLI install command.
     // Surface a guidance message instead of a no-op shell command.

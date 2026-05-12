@@ -1,9 +1,10 @@
-import { readFeedback, resolveTicketById, writeFeedback, withFeedbackLock, type FeedbackTicket } from './core';
+import { readFeedback, resolveTicketById, writeFeedback, withFeedbackLock, type FeedbackRun, type FeedbackTicket } from './core';
 import { buildAgentStartupGuidance, buildRunPrompt, type PreferredAgentPref } from './runPrompt';
 import { boardSizeWarning } from './boardSizeWarning';
 import { terminalAuthHeaders } from './sessionToken';
 import { getCurrentGitSha } from './gitDiff';
 import { getActiveProject, getProjectById } from './registry';
+import { createRunRecord, markRunFailed, markRunSubmitted, upsertRun } from './runs';
 import fs from 'fs';
 import path from 'path';
 
@@ -36,6 +37,7 @@ export interface RunExecutionResult {
     autoOpenTerminal?: boolean;
     guidance?: string[];
     updatedTickets?: FeedbackTicket[];
+    activeRun?: FeedbackRun;
 }
 
 interface TerminalAgentStatus {
@@ -75,6 +77,7 @@ export async function executeAgentPrompt(
     prompt: string,
     projectId?: string | null,
     ticketIds?: string[],
+    runId?: string | null,
 ): Promise<RunExecutionResult> {
     const trimmedPrompt = prompt.trim();
     const terminalStatus = await getTerminalAgentStatus(projectId);
@@ -132,6 +135,7 @@ export async function executeAgentPrompt(
                 // lights up every affected card — not just whichever still sits
                 // inside the client-side fallback freshness window.
                 ticketIds: ticketIds && ticketIds.length > 0 ? ticketIds : undefined,
+                runId: runId || undefined,
             }),
         });
 
@@ -154,7 +158,7 @@ export async function executeAgentPrompt(
     // AD-142/AD-149 reopen: when detection is uncertain, still return success
     // so the Run isn't blocked, but tailor the toast so the user knows to start
     // claude if it isn't already running.
-    const actor = terminalStatus.agentName || 'Coding Agent';
+    const actor = terminalStatus.agentName || preferred?.id || 'Coding Agent';
     const message = terminalStatus.agentActive
         ? `Sent prompt to ${actor}.`
         : 'Sent prompt to the terminal. If your coding agent isn\'t running, start it and press Enter to submit.';
@@ -184,7 +188,29 @@ export async function executeRunPrompt(ticketIds: string[], projectId?: string |
         };
     }
 
-    return withFeedbackLock(projectId, async () => {
+    const terminalStatus = await getTerminalAgentStatus(projectId);
+    const preferred = readPreferredAgent(projectId);
+    const guidance = buildAgentStartupGuidance(terminalStatus.agentName, preferred);
+    if (!terminalStatus.connected) {
+        return {
+            success: false,
+            terminal: false,
+            agentReady: false,
+            agentName: terminalStatus.agentName,
+            ticketIds: [],
+            prompt,
+            autoOpenTerminal: true,
+            message: 'Terminal is not connected. Open the terminal pane and start your coding agent.',
+            guidance,
+        };
+    }
+
+    const runId = `run-${Date.now().toString(36)}-${ids.join('-').toLowerCase()}`;
+    const actor = terminalStatus.agentName || preferred?.id || 'Coding Agent';
+    const project = getProjectById(projectId) || getActiveProject();
+    const startedRef = project ? (getCurrentGitSha(project.path) ?? undefined) : undefined;
+
+    const prepared = await withFeedbackLock(projectId, async () => {
         const data = readFeedback(projectId);
         const resolvedTickets: Array<{ index: number; ticket: FeedbackTicket }> = [];
 
@@ -207,13 +233,8 @@ export async function executeRunPrompt(ticketIds: string[], projectId?: string |
         // AD-149: pass the resolved ids through so the terminal server can
         // populate activeRunTicketIds — the live /api/terminal-status poll becomes
         // authoritative and every affected card lights up, regardless of status.
-        const executionResult = await executeAgentPrompt(prompt, projectId, ids);
-        if (!executionResult.success) {
-            return {
-                ...executionResult,
-                ticketIds: ids,
-            };
-        }
+        const activeRun = createRunRecord({ runId, projectId, ticketIds: ids, agent: actor, nowIso: new Date().toISOString(), startedRef });
+        upsertRun(data, activeRun);
 
         // AD-184: reports of "coding agent isn't working" toasts firing
         // even when the prompt visibly executed. Root cause: the AD-156 gate
@@ -229,11 +250,10 @@ export async function executeRunPrompt(ticketIds: string[], projectId?: string |
         // not as a failure. Worst case the prompt sits in a bare shell — same
         // outcome as before, but no false-failure toast.
         const now = new Date().toISOString();
-        const actor = executionResult.agentName || 'Coding Agent';
+        // AD-269: live running state now lives in activeRuns. Ticket execution
+        // remains the durable completion receipt.
         // AD-240: capture HEAD SHA so the done-time diff has a baseline.
         // Silent null when the project isn't a git repo.
-        const project = getProjectById(projectId) || getActiveProject();
-        const startedRef = project ? (getCurrentGitSha(project.path) ?? undefined) : undefined;
         const updatedTickets: FeedbackTicket[] = [];
 
         for (const { index, ticket } of resolvedTickets) {
@@ -241,32 +261,17 @@ export async function executeRunPrompt(ticketIds: string[], projectId?: string |
                 id: `c-${Date.now().toString(36)}-${index}`,
                 author: actor,
                 authorType: 'ai' as const,
-                content: `**Claiming ticket.** Run triggered from ADHDev for ${ticket.id}. Will inspect the ticket, implement the requested change, and report back here.`,
+                content: `**Claiming ticket.** Run ${runId} triggered from ADHDev for ${ticket.id}. Will inspect the ticket, implement the requested change, and report back here.`,
                 images: [],
                 createdAt: now,
             };
             const updatedTicket: FeedbackTicket = {
                 ...ticket,
                 comments: [...(ticket.comments || []), planComment],
-                execution: {
-                    runId: `run-${Date.now().toString(36)}-${index}`,
-                    actor,
-                    actorType: 'ai',
-                    status: 'in_progress',
-                    startedAt: now,
-                    updatedAt: now,
-                    completedAt: null,
-                    plan: '',
-                    summary: '',
-                    filesTouched: [],
-                    verification: [],
-                    blocker: null,
-                    startedRef,
-                },
                 activity: [
                     ...(ticket.activity || []),
                     { action: 'run_triggered', by: actor, byType: 'ai', at: now },
-                    { action: 'execution_started', by: actor, byType: 'ai', at: now },
+                    { action: 'run_dispatching', by: actor, byType: 'ai', at: now },
                 ],
                 updatedAt: now,
             };
@@ -277,14 +282,53 @@ export async function executeRunPrompt(ticketIds: string[], projectId?: string |
 
         writeFeedback(data, projectId);
 
-        return {
-            success: true,
-            terminal: true,
-            agentReady: true,
-            ticketIds: ids,
-            prompt,
-            message: ids.length === 1 ? `Sent ${ids[0]} to ${actor}.` : `Sent ${ids.length} tickets to ${actor}.`,
-            updatedTickets,
-        };
+        return { updatedTickets, activeRun };
     });
+
+    if ('success' in prepared && prepared.success === false) return prepared;
+
+    const executionResult = await executeAgentPrompt(prompt, projectId, ids, runId);
+    const completedAt = new Date().toISOString();
+    let activeRun = prepared.activeRun;
+
+    await withFeedbackLock(projectId, () => {
+        const data = readFeedback(projectId);
+        if (executionResult.success) {
+            markRunSubmitted(data, runId, completedAt);
+        } else {
+            markRunFailed(data, runId, completedAt, executionResult.message || 'Failed to dispatch run to terminal.');
+            const idSet = new Set(ids.map(id => id.toUpperCase()));
+            for (const ticket of data.tickets) {
+                if (!idSet.has(String(ticket.id || '').toUpperCase())) continue;
+                ticket.activity = [
+                    ...(ticket.activity || []),
+                    { action: 'run_dispatch_failed', by: actor, byType: 'ai', at: completedAt },
+                ];
+                ticket.updatedAt = completedAt;
+            }
+        }
+        activeRun = data.activeRuns?.find(run => run.runId === runId) || activeRun;
+        writeFeedback(data, projectId);
+    });
+
+    if (!executionResult.success) {
+        return {
+            ...executionResult,
+            ticketIds: ids,
+            updatedTickets: prepared.updatedTickets,
+            activeRun,
+        };
+    }
+
+    return {
+        success: true,
+        terminal: true,
+        agentReady: executionResult.agentReady,
+        agentName: actor,
+        ticketIds: ids,
+        prompt,
+        message: ids.length === 1 ? `Sent ${ids[0]} to ${actor}.` : `Sent ${ids.length} tickets to ${actor}.`,
+        updatedTickets: prepared.updatedTickets,
+        activeRun,
+    };
 }

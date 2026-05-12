@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { isTicketExecutionActive, isTicketExecutionInProgress } from '@/lib/feedback/executionState';
+import { isTicketExecutionActive } from '@/lib/feedback/executionState';
 import { AgentMascot, type MascotAgent } from './AgentMascot';
 
 function inferMascotAgent(actor?: string | null): MascotAgent {
@@ -50,6 +50,7 @@ export interface Ticket {
     session?: string;
     aiAddressable: boolean;
     reporter: string;
+    createdByType?: 'human' | 'ai' | 'system';
     images: TicketImage[];
     comments: TicketComment[];
     activity?: ActivityEntry[];
@@ -64,6 +65,7 @@ export interface Ticket {
     reopenCount?: number;
     tags?: string[];
     ticketType?: 'issue' | 'idea' | 'normal' | 'discussion' | 'onboarding';
+    sourceMessageId?: string;
     // AD-180: first-class ticket-to-ticket relations.
     relations?: { kind: 'parent' | 'subtask' | 'relates' | 'duplicate-of' | 'blocks' | 'blocked-by'; ticketId: string }[];
     createdAt: string;
@@ -80,6 +82,7 @@ interface TicketCardProps {
     isDragDisabled?: boolean;
     readTickets?: Set<string>;
     activeExecutionIds?: Set<string>;
+    activeRunStatus?: 'dispatching' | 'running' | 'finishing';
     hiddenFields?: Array<'status' | 'priority' | 'wave' | 'session' | 'mission'>;
 }
 
@@ -136,6 +139,7 @@ export function TicketCard({
     isDragDisabled,
     readTickets,
     activeExecutionIds,
+    activeRunStatus,
     hiddenFields = [],
 }: TicketCardProps) {
     const _tick = useTimeTick(); // re-render every 30s for timestamp aging
@@ -151,6 +155,7 @@ export function TicketCard({
     const style = {
         transform: CSS.Transform.toString(transform),
         transition,
+        touchAction: 'manipulation',
     };
 
     const priority = PRIORITY_CONFIG[ticket.priority] || PRIORITY_CONFIG.medium;
@@ -158,14 +163,26 @@ export function TicketCard({
     // 3-state dot: gold pulsing = unread AI response, purple = AI was last (read), grey = recently updated
     const lastComment = ticket.comments.length > 0 ? ticket.comments[ticket.comments.length - 1] as { authorType?: string } : null;
     const lastIsAi = lastComment?.authorType === 'ai';
-    const isExecuting = isTicketExecutionActive(ticket, activeExecutionIds);
+    const isDispatching = activeRunStatus === 'dispatching';
+    const isExecuting = activeRunStatus === 'running'
+        || activeRunStatus === 'finishing'
+        || (!activeRunStatus && isTicketExecutionActive(ticket, activeExecutionIds));
     // VD-109: detect AI-created tickets
-    const isAiCreated = ticket.tags?.includes('ai') ||
+    const createdActivity = ticket.activity?.find(entry => entry.action === 'created');
+    const createdByType = ticket.createdByType || createdActivity?.byType;
+    const isAiCreated = ticket.sourceMessageId ||
+        createdByType === 'ai' ||
+        createdByType === 'system' ||
+        ticket.tags?.includes('ai') ||
         ticket.reporter?.toLowerCase() === 'system' ||
         ticket.reporter?.toLowerCase().includes('claude') ||
         ticket.reporter?.toLowerCase().includes('codex') ||
-        ticket.reporter?.toLowerCase() === 'ai' ||
-        (ticket.activity && (ticket.activity[0]?.byType === 'ai' || ticket.activity[0]?.byType === 'system'));
+        ticket.reporter?.toLowerCase() === 'ai';
+    const creatorLabel = ticket.sourceMessageId
+        ? `AI for ${ticket.reporter || 'Sameer'}`
+        : isAiCreated
+            ? 'AI'
+            : 'Human';
     // "Unread" = AI commented AND user hasn't opened this ticket since (tracked via readTickets set)
     const isRead = readTickets?.has(ticket.id) ?? false;
     const isUnreadAi = lastIsAi && !isRead;
@@ -182,18 +199,21 @@ export function TicketCard({
             className={`
                 relative bg-vd-bg-secondary rounded-lg p-3 cursor-pointer
                 border border-vd-border hover:border-vd-text-tertiary
-                transition-all duration-150
+                transition-[border-color,box-shadow,background-color,opacity] duration-100
                 overflow-hidden
                 ${isDragging ? 'opacity-50 shadow-gold-md' : 'hover:shadow-card-hover'}
                 ${recent ? 'ring-1 ring-vd-accent-gold/30' : ''}
                 ${isExecuting ? 'ring-1 ring-blue-400/40 bg-blue-500/[0.06] adhdev-card-shimmer' : ''}
-                ${isUnreadAi && !isExecuting ? 'adhdev-card-unread' : ''}
+                ${isDispatching ? 'ring-1 ring-amber-400/35 bg-amber-500/[0.04]' : ''}
+                ${isUnreadAi && !isExecuting && !isDispatching ? 'adhdev-card-unread' : ''}
             `}
         >
             {/* Status dot + selection checkbox stacked in top-right corner */}
             <div className="absolute top-2 right-2 flex flex-col items-center gap-1">
                 {isExecuting ? (
                     <span className="w-2.5 h-2.5 bg-blue-400 rounded-full animate-pulse shadow-[0_0_10px_rgba(96,165,250,0.7)]" title={`In progress${ticket.execution?.actor ? ` • ${ticket.execution.actor}` : ''}`} />
+                ) : isDispatching ? (
+                    <span className="w-2.5 h-2.5 bg-amber-300 rounded-full animate-pulse shadow-[0_0_10px_rgba(251,191,36,0.55)]" title="Prompt sent; waiting for agent activity" />
                 ) : isUnreadAi ? (
                     <span className="w-2.5 h-2.5 bg-vd-accent-gold rounded-full animate-pulse" title="New AI response — click to read" />
                 ) : lastIsAi ? (
@@ -237,12 +257,16 @@ export function TicketCard({
 
             {/* Meta row */}
             <div className="flex items-center gap-2 mt-2 flex-wrap">
-                {/* AI-created badge (VD-109) */}
-                {isAiCreated && (
-                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-400" title={`Created by ${ticket.reporter}`}>
-                        AI
-                    </span>
-                )}
+                <span
+                    className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${
+                        isAiCreated || ticket.sourceMessageId
+                            ? 'bg-violet-500/15 text-violet-400'
+                            : 'bg-vd-bg-tertiary text-vd-text-tertiary'
+                    }`}
+                    title={ticket.sourceMessageId ? `Created by AI from Brain Dump ${ticket.sourceMessageId}` : `Created by ${isAiCreated ? 'AI' : ticket.reporter}`}
+                >
+                    {creatorLabel}
+                </span>
 
                 {/* Ticket type badge */}
                 {(ticket.ticketType === 'idea' || ticket.ticketType === 'discussion') && (
@@ -259,12 +283,12 @@ export function TicketCard({
                     </span>
                 )}
 
-                {isExecuting && (
-                    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 inline-flex items-center gap-1" title={ticket.execution?.actor || 'Coding agent'}>
+                {(isExecuting || isDispatching) && (
+                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded inline-flex items-center gap-1 ${isDispatching ? 'bg-amber-500/15 text-amber-300' : 'bg-blue-500/15 text-blue-400'}`} title={isDispatching ? 'Waiting for agent activity' : (ticket.execution?.actor || 'Coding agent')}>
                         <svg className="w-2.5 h-2.5 animate-spin" fill="none" viewBox="0 0 24 24">
                             <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeDasharray="14 42" />
                         </svg>
-                        Running
+                        {isDispatching ? 'Sending' : 'Running'}
                     </span>
                 )}
 
@@ -329,13 +353,10 @@ export function TicketCard({
                 AD-147: bumped size to 48px + top-right placement so it doesn't
                 overlap the meta row, and the mascot owns a dark backdrop (via
                 globals.css) so it reads against any card tint/shimmer.
-                AD-196: gate on isTicketExecutionInProgress (freshness-free)
-                instead of isTicketExecutionActive — the heartbeat-stale
-                window in the latter pauses the mascot during agent_idle
-                gaps even when the agent is genuinely still working.
-                Animation now runs as long as execution.status is
-                in_progress, ending only when status flips terminal. */}
-            {isTicketExecutionInProgress(ticket) && (
+                AD-269: gate on the same active Run signal as the pill/shimmer.
+                The persisted run lease is now the live source of truth; legacy
+                execution freshness remains only as a compatibility fallback. */}
+            {isExecuting && (
                 <div
                     className="pointer-events-none absolute bottom-1 right-1"
                     title={ticket.execution?.actor ? `${ticket.execution.actor} is working…` : 'Agent is working…'}

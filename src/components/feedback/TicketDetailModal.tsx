@@ -22,6 +22,14 @@ function buildPrompt(tickets: Ticket[]): string {
     return buildRunPrompt(tickets.map(t => t.id));
 }
 
+function getCreatorLabel(ticket: Ticket & { sourceMessageId?: string; createdByType?: 'human' | 'ai' | 'system' }): string {
+    if (ticket.sourceMessageId) return `AI for ${ticket.reporter || 'Sameer'}`;
+    const createdActivity = ticket.activity?.find(entry => entry.action === 'created');
+    const createdByType = ticket.createdByType || createdActivity?.byType;
+    if (createdByType === 'ai' || createdByType === 'system' || ticket.tags?.includes('ai')) return 'AI';
+    return ticket.reporter;
+}
+
 // Run | Copy split button
 function RunButton({
     ticket,
@@ -36,7 +44,7 @@ function RunButton({
     const [terminalStatus, setTerminalStatus] = useState<{
         connected: boolean;
         agentActive: boolean;
-        requestStatus: 'idle' | 'running' | 'interrupted';
+        requestStatus: 'idle' | 'dispatching' | 'running' | 'interrupted';
     } | null>(null);
     const [feedback, setFeedback] = useState<{ type: 'success' | 'warning' | 'error'; message: string } | null>(null);
     const [copyFeedback, setCopyFeedback] = useState(false);
@@ -52,7 +60,7 @@ function RunButton({
                 .then(d => setTerminalStatus({
                     connected: !!d.connected,
                     agentActive: !!d.agentActive,
-                    requestStatus: d.requestStatus === 'running' || d.requestStatus === 'interrupted' ? d.requestStatus : 'idle',
+                    requestStatus: d.requestStatus === 'running' || d.requestStatus === 'dispatching' || d.requestStatus === 'interrupted' ? d.requestStatus : 'idle',
                 }))
                 .catch(() => setTerminalStatus({ connected: false, agentActive: false, requestStatus: 'idle' }));
         };
@@ -175,8 +183,8 @@ const STATUS_LABELS: Record<string, string> = {
     backlog: 'Backlog',
     todo: 'To Do',
     reopen: 'Reopen',
-    done: 'Done',
-    reviewed: 'Reviewed',
+    done: 'For Review',
+    reviewed: 'Closed',
     observe: 'Observe',
     deferred: 'Deferred',
 };
@@ -194,10 +202,10 @@ const STATUS_BADGE_COLORS: Record<string, string> = {
 // Next-state transitions: primary = forward (→), non-primary = backward (←)
 const NEXT_STATES: Record<string, { label: string; target: string; primary?: boolean; direction: 'forward' | 'back' }[]> = {
     backlog: [{ label: 'Todo', target: 'todo', primary: true, direction: 'forward' }],
-    todo: [{ label: 'Done', target: 'done', primary: true, direction: 'forward' }],
-    reopen: [{ label: 'Done', target: 'done', primary: true, direction: 'forward' }],
+    todo: [{ label: 'For Review', target: 'done', primary: true, direction: 'forward' }],
+    reopen: [{ label: 'For Review', target: 'done', primary: true, direction: 'forward' }],
     done: [
-        { label: 'Reviewed', target: 'reviewed', primary: true, direction: 'forward' },
+        { label: 'Closed', target: 'reviewed', primary: true, direction: 'forward' },
         { label: 'Reopen', target: 'reopen', direction: 'back' },
     ],
     reviewed: [
@@ -1319,7 +1327,7 @@ export function TicketDetailModal({
                                 <span>Session: <span className="text-vd-text-secondary">{ticket.session}</span></span>
                             )}
                             <span>
-                                Reporter: <span className="text-vd-text-secondary">{ticket.reporter}</span>
+                                Creator: <span className="text-vd-text-secondary">{getCreatorLabel(ticket as Ticket & { sourceMessageId?: string; createdByType?: 'human' | 'ai' | 'system' })}</span>
                                 {/* AD-186: chat-spawned tickets show "via chat" as a hyperlink that opens Brain Dump at the source message. */}
                                 {(ticket as Ticket & { sourceMessageId?: string }).sourceMessageId && onOpenChatMessage && (
                                     <>
@@ -1329,7 +1337,7 @@ export function TicketDetailModal({
                                             onClick={() => onOpenChatMessage((ticket as Ticket & { sourceMessageId?: string }).sourceMessageId!)}
                                             className="text-vd-accent-gold hover:underline"
                                             title="Open in Brain Dump"
-                                        >via chat</button>
+                                        >via Brain Dump {(ticket as Ticket & { sourceMessageId?: string }).sourceMessageId}</button>
                                     </>
                                 )}
                             </span>

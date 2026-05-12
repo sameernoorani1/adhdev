@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { getActiveProject, getProjectBoardPath, initProjectDir, getProjectById } from './registry';
 import { ensureAdhdevProtocol, getDefaultExecutionContract, buildInlineContractNotice, type AdhdevExecutionContract } from './protocol';
+import { normalizeRuns, sweepStaleRuns } from './runs';
 
 function getFeedbackPath(projectId?: string | null): string {
     const project = getProjectById(projectId) || getActiveProject();
@@ -48,6 +49,7 @@ export interface FeedbackTicket {
     ticketType: string;
     aiAddressable: boolean;
     reporter: string;
+    createdByType?: 'human' | 'ai' | 'system';
     // AD-186: when a ticket is spawned from a Brain Dump message, this
     // points back to the source `m-xxx` chat-message id. Drives the
     // "Sameer via chat" reporter attribution + the click-to-open behavior.
@@ -125,6 +127,23 @@ export interface FeedbackBatch {
     updatedAt?: string;
 }
 
+export interface FeedbackRun {
+    runId: string;
+    projectId?: string | null;
+    ticketIds: string[];
+    status: 'dispatching' | 'running' | 'finishing' | 'done' | 'blocked' | 'failed' | 'interrupted' | 'stale';
+    terminalSessionId?: string | null;
+    agent: string;
+    startedAt: string;
+    updatedAt: string;
+    lastHeartbeatAt?: string | null;
+    dispatchResult?: string | null;
+    completedAt?: string | null;
+    failure?: string | null;
+    blocker?: string | null;
+    startedRef?: string;
+}
+
 export interface SessionActivityEntry {
     type: string;
     sessionId: string;
@@ -170,6 +189,7 @@ export interface FeedbackData {
     executionContract?: AdhdevExecutionContract;
     batches?: FeedbackBatch[];
     sessionActivity?: SessionActivityEntry[];
+    activeRuns?: FeedbackRun[];
 }
 
 export interface TicketLookupResult {
@@ -391,7 +411,7 @@ export function sweepStaleExecutions(data: FeedbackData): boolean {
             }
         }
     }
-    return changed;
+    return sweepStaleRuns(data, now) || changed;
 }
 
 // AD-232: per-project sweep rate-limit. The /api/feedback GET hits often
@@ -490,6 +510,7 @@ export function normalizeFeedbackData(data: FeedbackData): FeedbackData {
     if (!Array.isArray(data.missions)) data.missions = [];
     if (!Array.isArray(data.batches)) data.batches = [];
     if (!Array.isArray(data.sessionActivity)) data.sessionActivity = [];
+    data.activeRuns = normalizeRuns(data.activeRuns);
     data.executionContract = data.executionContract || getDefaultExecutionContract();
     if (Array.isArray(data.tickets)) {
         data.tickets = data.tickets.map(normalizeTicket);

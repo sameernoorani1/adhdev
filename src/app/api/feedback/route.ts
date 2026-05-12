@@ -6,6 +6,7 @@ import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
 import { validateAgentTransition } from '@/lib/feedback/transitions';
 import { recordOnboardingEvent } from '@/lib/feedback/onboardingEvents';
 import { getDiffFiles } from '@/lib/feedback/gitDiff';
+import { markRunTerminal } from '@/lib/feedback/runs';
 
 const ALLOWED_PRIORITIES = new Set(['low', 'medium', 'high', 'critical']);
 const ALLOWED_TICKET_TYPES = new Set(['normal', 'discussion', 'issue', 'idea', 'onboarding']);
@@ -233,7 +234,13 @@ export async function POST(request: NextRequest) {
         const title = body.title || 'Untitled';
         const description = body.description || '';
         const reporter = body.reporter || resolveDisplayName(projectId).toLowerCase();
-        const createdByType = body.reporterType || body.createdByType || body.authorType || (reporter === 'system' ? 'system' : 'human');
+        const sourceMessageId = typeof body.sourceMessageId === 'string' && body.sourceMessageId.trim()
+            ? body.sourceMessageId.trim()
+            : undefined;
+        const createdByType = body.reporterType
+            || body.createdByType
+            || body.authorType
+            || (sourceMessageId ? 'ai' : reporter === 'system' ? 'system' : 'human');
         const tags = normalizeTags(body.tags);
         if ((createdByType === 'ai' || createdByType === 'system' || reporter === 'system') && !tags.includes('ai')) {
             tags.unshift('ai');
@@ -256,10 +263,9 @@ export async function POST(request: NextRequest) {
             ticketType: body.ticketType || 'normal',
             aiAddressable: body.aiAddressable !== false,
             reporter,
+            createdByType,
             // AD-186: chat-spawned tickets carry the source message id back.
-            sourceMessageId: typeof body.sourceMessageId === 'string' && body.sourceMessageId.trim()
-                ? body.sourceMessageId.trim()
-                : undefined,
+            sourceMessageId,
             images: body.images || [],
             tags,
             reopenCount: 0,
@@ -420,6 +426,13 @@ export async function PATCH(request: NextRequest) {
                 updatedAt: now,
             }
             : ticket.execution;
+        const runIdForExecution = updates.execution?.runId || ticket.execution?.runId;
+        const matchingRun = runIdForExecution
+            ? data.activeRuns?.find(run => run.runId === runIdForExecution)
+            : null;
+        if (mergedExecution && matchingRun?.startedRef && !(mergedExecution as { startedRef?: string }).startedRef) {
+            (mergedExecution as { startedRef?: string }).startedRef = matchingRun.startedRef;
+        }
 
         // AD-240: ground-truth filesTouched via `git diff` when an AI flips
         // the ticket to done. If the project is in a git repo and we
@@ -565,6 +578,14 @@ export async function PATCH(request: NextRequest) {
             };
             for (const r of added) touchInverse(r, 'add');
             for (const r of removed) touchInverse(r, 'remove');
+        }
+
+        if (runIdForExecution && updates.execution) {
+            if (updates.status === 'done' || updates.execution.status === 'done') {
+                markRunTerminal(data, runIdForExecution, 'done', now);
+            } else if (updates.execution.status === 'blocked') {
+                markRunTerminal(data, runIdForExecution, 'blocked', now, updates.execution.blocker || 'Run blocked by agent.');
+            }
         }
 
         writeFeedback(data, projectId);

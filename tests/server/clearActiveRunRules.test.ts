@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { AUTO_COMPLETE_ON_CLEAR_REASONS, shouldAutoCompleteOnClear } from '../../server/clearActiveRunRules.mjs';
+import {
+    AUTO_COMPLETE_ON_CLEAR_REASONS,
+    hasActiveRunExceededMaxDuration,
+    shouldAutoCompleteOnClear,
+} from '../../server/clearActiveRunRules.mjs';
 
 // AD-216: covers the auto-complete decision in clearActiveRunTickets.
 // terminal.mjs delegates to shouldAutoCompleteOnClear for the reason gate;
@@ -61,5 +65,84 @@ describe('shouldAutoCompleteOnClear', () => {
         it('empty string → false', () => {
             expect(shouldAutoCompleteOnClear('')).toBe(false);
         });
+    });
+});
+
+describe('hasActiveRunExceededMaxDuration', () => {
+    it('uses the matching active run startedAt instead of an old ticket execution receipt', () => {
+        const boardData = {
+            tickets: [
+                {
+                    id: 'AD-270',
+                    execution: {
+                        status: 'done',
+                        startedAt: '2026-05-07T22:25:47.141Z',
+                    },
+                },
+            ],
+            activeRuns: [
+                {
+                    runId: 'run-fresh',
+                    ticketIds: ['AD-270'],
+                    status: 'running',
+                    startedAt: '2026-05-08T09:35:38.251Z',
+                    updatedAt: '2026-05-08T09:36:00.000Z',
+                },
+            ],
+        };
+
+        expect(hasActiveRunExceededMaxDuration(
+            boardData,
+            ['AD-270'],
+            new Date('2026-05-08T08:40:00.000Z').getTime(),
+            'run-fresh',
+        )).toBe(false);
+    });
+
+    it('expires the matching active run when its own lease exceeds the cutoff', () => {
+        const boardData = {
+            activeRuns: [
+                {
+                    runId: 'run-old',
+                    ticketIds: ['AD-270'],
+                    status: 'running',
+                    startedAt: '2026-05-08T07:35:38.251Z',
+                    updatedAt: '2026-05-08T09:36:00.000Z',
+                },
+            ],
+        };
+
+        expect(hasActiveRunExceededMaxDuration(
+            boardData,
+            ['ad-270'],
+            new Date('2026-05-08T08:40:00.000Z').getTime(),
+            'run-old',
+        )).toBe(true);
+    });
+
+    it('ignores stale/completed runs and non-matching run ids', () => {
+        const boardData = {
+            activeRuns: [
+                {
+                    runId: 'run-stale',
+                    ticketIds: ['AD-270'],
+                    status: 'stale',
+                    startedAt: '2026-05-08T07:35:38.251Z',
+                },
+                {
+                    runId: 'run-other',
+                    ticketIds: ['AD-270'],
+                    status: 'running',
+                    startedAt: '2026-05-08T07:35:38.251Z',
+                },
+            ],
+        };
+
+        expect(hasActiveRunExceededMaxDuration(
+            boardData,
+            ['AD-270'],
+            new Date('2026-05-08T08:40:00.000Z').getTime(),
+            'run-current',
+        )).toBe(false);
     });
 });

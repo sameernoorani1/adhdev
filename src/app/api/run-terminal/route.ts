@@ -3,6 +3,7 @@ import { readFeedback, writeFeedback, withFeedbackLock, resolveTicketById } from
 import { terminalAuthHeaders } from '@/lib/feedback/sessionToken';
 import { getCurrentGitSha } from '@/lib/feedback/gitDiff';
 import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
+import { createRunRecord, markRunFailed, markRunSubmitted, upsertRun } from '@/lib/feedback/runs';
 
 /**
  * POST /api/run-terminal
@@ -21,6 +22,7 @@ export async function POST(request: NextRequest) {
         // AD-141: scope reads and the downstream /execute call to the caller's
         // project so tabs on different boards don't cross-wire.
         const projectId = request.headers.get('x-adhdev-project');
+        const runId = `run-${Date.now().toString(36)}-${String(ticketId).toLowerCase()}`;
         const lockResult = await withFeedbackLock(projectId, () => {
             const data = readFeedback(projectId);
             const resolved = resolveTicketById(data, ticketId);
@@ -37,7 +39,7 @@ export async function POST(request: NextRequest) {
                     id: `c-${Date.now().toString(36)}`,
                     author: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
                     authorType: 'ai',
-                    content: `**Claiming ticket.** Terminal run declared for ${ticket.id}. Will inspect the ticket, work the request, and post a completion update here.`,
+                    content: `**Claiming ticket.** Terminal run ${runId} declared for ${ticket.id}. Will inspect the ticket, work the request, and post a completion update here.`,
                     images: [],
                     createdAt: now,
                 },
@@ -45,27 +47,25 @@ export async function POST(request: NextRequest) {
             // AD-240: capture git HEAD as the diff baseline.
             const project = getProjectById(projectId) || getActiveProject();
             const startedRef = project ? (getCurrentGitSha(project.path) ?? undefined) : undefined;
-            data.tickets[idx].execution = {
-                runId: `run-${Date.now().toString(36)}`,
-                actor: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
-                actorType: 'ai',
-                status: 'in_progress',
-                startedAt: now,
-                updatedAt: now,
-                filesTouched: [],
-                verification: [],
+            const actor = mode === 'claude-code' ? 'Claude Code' : 'Terminal';
+            upsertRun(data, createRunRecord({
+                runId,
+                projectId,
+                ticketIds: [ticket.id],
+                agent: actor,
+                nowIso: now,
                 startedRef,
-            };
+            }));
             if (!data.tickets[idx].activity) data.tickets[idx].activity = [];
             data.tickets[idx].activity.push({
                 action: 'claimed',
-                by: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
+                by: actor,
                 byType: 'ai',
                 at: now
             });
             data.tickets[idx].activity.push({
-                action: 'execution_started',
-                by: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
+                action: 'run_dispatching',
+                by: actor,
                 byType: 'ai',
                 at: now
             });
@@ -117,14 +117,24 @@ export async function POST(request: NextRequest) {
                 method: 'POST',
                 // AD-204: forward the session token to the terminal server.
                 headers: { 'Content-Type': 'application/json', ...terminalAuthHeaders() },
-                body: JSON.stringify({ command, ticketId, projectId: projectId ?? undefined }),
+                body: JSON.stringify({ command, ticketId, projectId: projectId ?? undefined, runId }),
             });
 
             if (!response.ok) {
                 throw new Error(`Terminal server responded with ${response.status}`);
             }
+            await withFeedbackLock(projectId, () => {
+                const data = readFeedback(projectId);
+                markRunSubmitted(data, runId, new Date().toISOString());
+                writeFeedback(data, projectId);
+            });
         } catch (err) {
             console.error('[ADHDev] POST /api/run-terminal terminal-server fallback:', err);
+            await withFeedbackLock(projectId, () => {
+                const data = readFeedback(projectId);
+                markRunFailed(data, runId, new Date().toISOString(), 'Terminal server not available. Run the command manually in your terminal.');
+                writeFeedback(data, projectId);
+            });
             // Fallback: return the command for manual execution
             return Response.json({
                 success: false,

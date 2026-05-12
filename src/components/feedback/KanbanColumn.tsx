@@ -25,6 +25,7 @@ interface KanbanColumnProps {
     onToggleSelect?: (id: string) => void;
     onSelectColumn?: (status: string) => void;
     activeExecutionIds?: Set<string>;
+    activeRunStatusByTicket?: Map<string, 'dispatching' | 'running' | 'finishing'>;
     stackBy?: 'status' | 'priority' | 'wave' | 'session';
     groupedBy?: 'none' | 'status' | 'priority' | 'wave' | 'session';
 }
@@ -44,6 +45,7 @@ export function KanbanColumn({
     onToggleSelect,
     onSelectColumn,
     activeExecutionIds,
+    activeRunStatusByTicket,
     stackBy = 'status',
     groupedBy = 'none',
 }: KanbanColumnProps) {
@@ -183,6 +185,7 @@ export function KanbanColumn({
                                     isDragDisabled={isDragDisabled}
                                     readTickets={readTickets}
                                     activeExecutionIds={activeExecutionIds}
+                                    activeRunStatus={activeRunStatusByTicket?.get(String(ticket.id).toUpperCase())}
                                     hiddenFields={hiddenFields}
                                 />
                             ))}

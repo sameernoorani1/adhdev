@@ -660,7 +660,21 @@ function SkinCard({ skin, mode, isActive, onClick }: { skin: SkinDef; mode: Mode
 }
 
 // ─── Settings Modal ─────────────────────────────────────────────────
-export function SettingsModal({ onClose, projectId, projectName }: { onClose: () => void; projectId?: string | null; projectName?: string | null }) {
+export function SettingsModal({
+    onClose,
+    projectId,
+    projectName,
+    laneOptions = [],
+    hiddenLaneIds = new Set<string>(),
+    onLaneVisibilityChange,
+}: {
+    onClose: () => void;
+    projectId?: string | null;
+    projectName?: string | null;
+    laneOptions?: Array<{ id: string; label: string }>;
+    hiddenLaneIds?: Set<string>;
+    onLaneVisibilityChange?: (id: string, hidden: boolean) => void;
+}) {
     const [currentSkin, setCurrentSkin] = useState('default');
     const [currentMode, setCurrentMode] = useState<Mode>('dark');
     const [currentPalette, setCurrentPalette] = useState<PaletteId>('default');
@@ -744,6 +758,57 @@ export function SettingsModal({ onClose, projectId, projectName }: { onClose: ()
                 body: JSON.stringify({ onboardingState: { hideTips: next } }),
             });
         } catch { /* optimistic update already applied */ }
+    };
+
+    // AD-266: replay the first-run experience as a fresh user would see it.
+    // Clears the flags that gate intro / coach marks / tooltips on both server
+    // (config.json onboardingState) and client (localStorage per-project keys +
+    // session-only tips dismissal). Leaves workspace setup and prefs alone.
+    //
+    // AD-266 reopen: explicitly pin `wizardCompleted: true` in the PATCH. The
+    // OnboardingWizard fires when `!wizardCompleted && !welcomeSeen`
+    // (FeedbackBoard.tsx:989) — clearing `welcomeSeen` flips that gate if the
+    // existing project ever drifted into a state where `wizardCompleted` wasn't
+    // set true. Sameer's explicit ask: this reset must NOT take an existing
+    // project through the 4-step Pick-a-folder / Agent / Scan / Git-posture
+    // wizard. That wizard is for new projects only, and runs on first paint of
+    // a fresh project on its own.
+    const [resetting, setResetting] = useState(false);
+    const resetOnboarding = async () => {
+        if (!window.confirm(
+            'Reset onboarding?\n\n' +
+            'The introductory explainer, coach marks and one-shot tooltips will all show again on next load. ' +
+            'Your project list, theme, and other settings are untouched.'
+        )) return;
+        setResetting(true);
+        try {
+            await fetch('/api/onboarding', {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    onboardingState: {
+                        welcomeSeen: false,
+                        checklistDismissed: false,
+                        hideTips: false,
+                        coachMarks: null,
+                        wizardCompleted: true,
+                    },
+                }),
+            });
+            if (typeof window !== 'undefined') {
+                const pid = window.sessionStorage.getItem('adhdev-active-project-id') || 'default';
+                const k = (f: string) => `adhdev-onboard:${pid}:${f}`;
+                window.localStorage.removeItem(k('welcomeSeen'));
+                window.localStorage.removeItem(k('checklistDismissed'));
+                window.localStorage.removeItem(k('hideTips'));
+                window.localStorage.removeItem(k('coachMarks'));
+                window.sessionStorage.removeItem('adhdev-tips-hidden-session');
+            }
+            window.location.reload();
+        } catch {
+            setResetting(false);
+            window.alert('Reset failed. Check the dev server log and try again.');
+        }
     };
 
     // AD-162: load completion-notification prefs on mount.
@@ -989,7 +1054,7 @@ export function SettingsModal({ onClose, projectId, projectName }: { onClose: ()
                                 </div>
 
                                 {/* AD-137: global Hide tips toggle */}
-                                <label className="flex items-center justify-between gap-3 cursor-pointer mb-6">
+                                <label className="flex items-center justify-between gap-3 cursor-pointer mb-3">
                                     <div>
                                         <h3 className="text-xs font-semibold text-vd-text-primary">Onboarding tips</h3>
                                         <p className="text-[10px] text-vd-text-tertiary mt-0.5">
@@ -1003,6 +1068,49 @@ export function SettingsModal({ onClose, projectId, projectName }: { onClose: ()
                                         className="w-4 h-4 accent-vd-accent-gold"
                                     />
                                 </label>
+
+                                {/* AD-266: replay the first-run experience. Clears the flags that
+                                    gate the intro modal, coach marks and one-shot tooltips on both
+                                    server config and client storage, then reloads so they re-mount
+                                    fresh. Workspace / project list / theme / prefs are untouched. */}
+                                <div className="flex items-center justify-between gap-3 mb-6">
+                                    <div>
+                                        <h3 className="text-xs font-semibold text-vd-text-primary">Reset onboarding</h3>
+                                        <p className="text-[10px] text-vd-text-tertiary mt-0.5">
+                                            Replay the intro, coach marks and one-shot tips as a fresh user would see them. Doesn&apos;t touch projects, theme, or other prefs.
+                                        </p>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={resetOnboarding}
+                                        disabled={resetting}
+                                        className="shrink-0 px-2.5 py-1 text-[11px] border border-vd-accent-gold/40 text-vd-accent-gold rounded hover:bg-vd-accent-gold/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                    >
+                                        {resetting ? 'Resetting…' : 'Reset'}
+                                    </button>
+                                </div>
+
+                                {laneOptions.length > 0 && (
+                                    <div className="mb-6">
+                                        <h3 className="text-xs font-semibold text-vd-text-primary">Kanban lanes</h3>
+                                        <p className="text-[10px] text-vd-text-tertiary mt-0.5 mb-2">
+                                            Choose which workflow columns are visible on the board.
+                                        </p>
+                                        <div className="grid grid-cols-2 gap-2">
+                                            {laneOptions.map((lane) => (
+                                                <label key={lane.id} className="flex items-center justify-between gap-2 rounded-md border border-vd-border bg-vd-bg-primary/40 px-2.5 py-1.5 cursor-pointer">
+                                                    <span className="text-[11px] text-vd-text-secondary">{lane.label}</span>
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={!hiddenLaneIds.has(lane.id)}
+                                                        onChange={(e) => onLaneVisibilityChange?.(lane.id, !e.target.checked)}
+                                                        className="w-3.5 h-3.5 accent-vd-accent-gold"
+                                                    />
+                                                </label>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
 
                                 {/* AD-162: completion notifications + sound */}
                                 <div>

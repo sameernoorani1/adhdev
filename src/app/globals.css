@@ -134,6 +134,28 @@
   animation-iteration-count: infinite;
   will-change: transform;
 }
+
+/* AD-155: keep xterm constrained to the measured pane after orientation,
+   fullscreen, or splitter changes. Stale TUI scrollback can still contain hard
+   line breaks, but it should not force horizontal overflow or a phantom gutter. */
+.adhdev-terminal-host .xterm,
+.adhdev-terminal-host .xterm-viewport,
+.adhdev-terminal-host .xterm-screen {
+  max-width: 100%;
+}
+.adhdev-terminal-host .xterm {
+  box-sizing: border-box;
+  padding-left: 2px;
+  padding-right: 14px;
+  scrollbar-gutter: stable;
+}
+.adhdev-terminal-host .xterm-viewport {
+  overflow-x: hidden !important;
+  scrollbar-gutter: stable;
+}
+.adhdev-terminal-host .xterm-screen {
+  box-sizing: border-box;
+}
 @keyframes adhdev-mascot-step {
   from { transform: translateX(0); }
   to   { transform: translateX(-100%); }

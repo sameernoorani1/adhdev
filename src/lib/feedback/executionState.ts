@@ -29,8 +29,14 @@ export function isTicketExecutionActive(
     // Kept in the signature so existing callers compile without changes. The
     // value is ignored — the live poll is no longer part of the authoritative
     // signal.
-    _activeExecutionIds?: Iterable<string> | null,
+    activeExecutionIds?: Iterable<string> | null,
 ): boolean {
+    if (activeExecutionIds) {
+        const id = String(ticket.id || '').toUpperCase();
+        for (const activeId of activeExecutionIds) {
+            if (String(activeId || '').toUpperCase() === id) return true;
+        }
+    }
     if (ticket.execution?.status !== 'in_progress') return false;
     const updatedAtRaw = ticket.execution?.updatedAt;
     if (!updatedAtRaw) return false;

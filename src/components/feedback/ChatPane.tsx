@@ -703,6 +703,14 @@ function ChatMessageBubble({
                     {isAi ? 'AI' : message.author}
                 </span>
                 <span className="text-[10px] text-vd-text-tertiary">{tsLabel}</span>
+                <button
+                    type="button"
+                    onClick={() => navigator.clipboard?.writeText(message.id).catch(() => {})}
+                    className="text-[9px] font-mono text-vd-text-tertiary hover:text-vd-accent-gold"
+                    title="Copy Brain Dump reference id"
+                >
+                    {message.id}
+                </button>
                 {statusBadge}
             </div>
             {/* AD-187: replies (isAi mid-thread) get more prominent text +

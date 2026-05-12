@@ -15,7 +15,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { shouldAutoCompleteOnClear } from './clearActiveRunRules.mjs';
+import { hasActiveRunExceededMaxDuration, shouldAutoCompleteOnClear } from './clearActiveRunRules.mjs';
 
 const PORT = parseInt(process.env.TERMINAL_PORT || '3112', 10);
 
@@ -154,7 +154,6 @@ let uiContext = {
 const clients = new Set();
 const REGISTRY_PATH = path.join(os.homedir(), '.adhdev', 'registry.json');
 const BOARD_RELATIVE_PATH = path.join('.adhdev', 'board.json');
-const PROTOCOL_FILENAME = 'ADHDEV.md';
 
 function normalizeProjectId(id) {
     return id && typeof id === 'string' ? id : DEFAULT_PROJECT_ID;
@@ -179,20 +178,6 @@ function getProjectRoot(projectId) {
 
 function getBoardPath(projectId) {
     return path.join(getProjectRoot(projectId), BOARD_RELATIVE_PATH);
-}
-
-// AD-146: read the user's preferred display name from the project config.
-// AD-200: fallback is now the neutral 'You' (was 'Sameer' historically).
-function getUserDisplayName(projectId) {
-    try {
-        const configPath = path.join(getProjectRoot(projectId), '.adhdev', 'config.json');
-        if (!fs.existsSync(configPath)) return 'You';
-        const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-        const name = typeof parsed?.userDisplayName === 'string' ? parsed.userDisplayName.trim() : '';
-        return name || 'You';
-    } catch {
-        return 'You';
-    }
 }
 
 // AD-144: per-project terminal history persistence.
@@ -264,89 +249,54 @@ function writeBoard(data, projectId) {
     }
 }
 
-function extractReferencedTicketIds(command, boardData) {
-    const matches = command.match(/\b[A-Z]{2,6}-\d+\b/gi) || [];
-    const ids = Array.from(new Set(matches.map(match => match.toUpperCase())));
-    if (!boardData?.tickets?.length) return ids;
-    const validIds = new Set(boardData.tickets.map(ticket => String(ticket.id || '').toUpperCase()));
-    return ids.filter(id => validIds.has(id));
+const ACTIVE_RUN_STATUSES = new Set(['dispatching', 'running', 'finishing']);
+
+function heartbeatActiveRuns(projectId, ticketIds, runId) {
+    if (!ticketIds?.length) return;
+    const boardData = readBoard(projectId);
+    if (!boardData) return;
+    if (!Array.isArray(boardData.activeRuns)) boardData.activeRuns = [];
+    const ids = new Set(ticketIds.map(id => String(id).toUpperCase()));
+    const now = new Date().toISOString();
+    let changed = false;
+
+    for (const run of boardData.activeRuns) {
+        if (!ACTIVE_RUN_STATUSES.has(run.status)) continue;
+        if (runId && run.runId !== runId) continue;
+        const runTicketIds = Array.isArray(run.ticketIds) ? run.ticketIds : [];
+        if (!runTicketIds.some(id => ids.has(String(id).toUpperCase()))) continue;
+        run.status = 'running';
+        run.updatedAt = now;
+        run.lastHeartbeatAt = now;
+        changed = true;
+    }
+
+    if (changed) writeBoard(boardData, projectId);
 }
 
-function resolveTicketIdsFromUiContext(command, boardData) {
-    const lower = command.toLowerCase();
-    const selectedIds = Array.isArray(uiContext.selectedTicketIds) ? uiContext.selectedTicketIds : [];
+function markActiveRunsTerminal(projectId, ticketIds, reason) {
+    if (!ticketIds?.length) return;
+    const boardData = readBoard(projectId);
+    if (!boardData || !Array.isArray(boardData.activeRuns)) return;
+    const ids = new Set(ticketIds.map(id => String(id).toUpperCase()));
+    const now = new Date().toISOString();
+    const status = reason === 'interrupted' ? 'interrupted' : 'stale';
+    let changed = false;
 
-    if ((/\b(these|selected)\b/.test(lower) || lower.includes('current selection')) && selectedIds.length > 0) {
-        return selectedIds.map(id => String(id).toUpperCase());
+    for (const run of boardData.activeRuns) {
+        if (!ACTIVE_RUN_STATUSES.has(run.status)) continue;
+        const runTicketIds = Array.isArray(run.ticketIds) ? run.ticketIds : [];
+        if (!runTicketIds.some(id => ids.has(String(id).toUpperCase()))) continue;
+        run.status = status;
+        run.updatedAt = now;
+        run.completedAt = now;
+        run.blocker = run.blocker || (reason === 'interrupted'
+            ? 'Interrupted by user (Esc / Ctrl+C).'
+            : `Recovered: terminal run cleared (${reason}).`);
+        changed = true;
     }
 
-    if ((/\bthis ticket\b/.test(lower) || /\bcurrent ticket\b/.test(lower)) && uiContext.selectedTicketId) {
-        return [String(uiContext.selectedTicketId).toUpperCase()];
-    }
-
-    if ((/\bthis mission\b/.test(lower) || /\bcurrent mission\b/.test(lower)) && uiContext.missionFilter && boardData?.tickets?.length) {
-        return boardData.tickets
-            .filter(ticket => String(ticket.missionId || '') === String(uiContext.missionFilter))
-            .map(ticket => String(ticket.id).toUpperCase());
-    }
-
-    return [];
-}
-
-function alreadyIncludesAdhdevContract(command) {
-    const lower = command.toLowerCase();
-    return (
-        lower.includes('adhdev.md') ||
-        lower.includes('.adhdev/board.json') ||
-        lower.includes('execution contract') ||
-        lower.includes('workflow rules')
-    );
-}
-
-function buildInjectedExecutionContract(ticketIds, boardData, projectId) {
-    const tickets = (boardData?.tickets || []).filter(ticket => ticketIds.includes(String(ticket.id || '').toUpperCase()));
-    const userName = getUserDisplayName(projectId);
-    const lines = [
-        '[ADHDEV AUTO-CONTEXT]',
-        // AD-146: tell the agent the user's name up front so every comment
-        // addresses them by name instead of as "human" / "user".
-        `User: ${userName}. Address them as "${userName}" in comments, terminal output, and summaries — never as "human", "user", or "reporter".`,
-        `Treat this as declared ADHDev work for ticket${ticketIds.length === 1 ? '' : 's'} ${ticketIds.join(', ')}.`,
-        `Read ${PROTOCOL_FILENAME} and the full referenced ticket entries in ${BOARD_RELATIVE_PATH} before acting.`,
-        'Execution contract:',
-        '- Read the hidden ticket execution contract first.',
-        '- Read the full ticket entry before acting.',
-        '- Read all comments and activity on the ticket before acting.',
-        '- Add or update an AI plan comment before implementation.',
-        '- Keep ticket status and execution state accurately updated while working.',
-        `- Reply in comments to any @mentions from ${userName} on these tickets.`,
-        '- After work, add an AI completion comment with summary, files touched, and verification.',
-        '- If blocked or interrupted, add/update comments and leave the ticket in an accurate non-done state.',
-        '- Add this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Embedded Contract Read.',
-    ];
-
-    // AD-254: trim per-ticket scope to id/title/status/priority/description
-    // only. The full comments dump and activity log were the bulk of the
-    // injected fluff Sameer reported — and they're redundant: the contract
-    // above already tells the agent to read the full ticket entry from
-    // board.json before acting, which carries those fields authoritatively.
-    // Dropping the UI-context bits (view/mission/stackBy/groupedBy) for the
-    // same reason — the agent doesn't condition on board layout.
-    if (tickets.length > 0) {
-        lines.push('Ticket scope:');
-        for (const ticket of tickets) {
-            const metadata = [
-                ticket.status ? `status: ${ticket.status}` : null,
-                ticket.priority ? `priority: ${ticket.priority}` : null,
-            ].filter(Boolean).join(', ');
-            lines.push(`- ${ticket.id}: ${ticket.title}${metadata ? ` (${metadata})` : ''}`);
-            if (ticket.description) {
-                lines.push(`  Description: ${String(ticket.description).trim()}`);
-            }
-        }
-    }
-
-    return `\n\n${lines.join('\n')}`;
+    if (changed) writeBoard(boardData, projectId);
 }
 
 // AD-149 follow-up: when the user presses Esc or Ctrl+C in the terminal the
@@ -526,35 +476,37 @@ function startHeartbeat(session) {
         // signals never fired. Clear with `max_runtime_exceeded` so the
         // mascot drops instead of haunting the board indefinitely.
         try {
-            if (anyActiveRunExceededMaxDuration(session.projectId, ids)) {
+            if (anyActiveRunExceededMaxDuration(session.projectId, ids, session.activeRunId)) {
                 clearActiveRunTickets(session, 'max_runtime_exceeded');
                 return;
             }
         } catch {}
-        try { bumpExecutionForActiveTickets(session.projectId, ids); } catch {}
+        if (session.agentState?.active) {
+            confirmActiveRunTickets(session);
+        }
     }, HEARTBEAT_INTERVAL_MS);
 }
 
-function anyActiveRunExceededMaxDuration(projectId, ticketIds) {
+function anyActiveRunExceededMaxDuration(projectId, ticketIds, runId = null) {
     if (!ticketIds?.length) return false;
     const boardData = readBoard(projectId);
-    if (!boardData?.tickets?.length) return false;
-    const ids = new Set(ticketIds.map(id => String(id).toUpperCase()));
     const cutoff = Date.now() - MAX_RUN_DURATION_MS;
-    for (const ticket of boardData.tickets) {
-        if (!ids.has(String(ticket.id || '').toUpperCase())) continue;
-        const startedAt = ticket.execution?.startedAt;
-        if (!startedAt) continue;
-        const startedMs = new Date(startedAt).getTime();
-        if (Number.isFinite(startedMs) && startedMs < cutoff) return true;
-    }
-    return false;
+    return hasActiveRunExceededMaxDuration(boardData, ticketIds, cutoff, runId);
 }
 
 function stopHeartbeat(session) {
     if (!session?.heartbeatInterval) return;
     clearInterval(session.heartbeatInterval);
     session.heartbeatInterval = null;
+}
+
+function confirmActiveRunTickets(session) {
+    if (!session?.activeRunTicketIds?.length) return;
+    session.requestState.status = 'running';
+    session.requestState.updatedAt = new Date().toISOString();
+    session.requestState.lastEvent = 'agent_confirmed';
+    try { bumpExecutionForActiveTickets(session.projectId, session.activeRunTicketIds); } catch {}
+    try { heartbeatActiveRuns(session.projectId, session.activeRunTicketIds, session.activeRunId); } catch {}
 }
 
 // Server-startup recovery: any ticket left with execution.status='in_progress'
@@ -573,6 +525,16 @@ function recoverStaleInProgressTickets() {
                 if (!boardData?.tickets?.length) continue;
                 const now = new Date().toISOString();
                 let changed = false;
+                if (Array.isArray(boardData.activeRuns)) {
+                    for (const run of boardData.activeRuns) {
+                        if (!ACTIVE_RUN_STATUSES.has(run.status)) continue;
+                        run.status = 'stale';
+                        run.updatedAt = now;
+                        run.completedAt = now;
+                        run.blocker = run.blocker || 'Terminal server restarted while run was in progress.';
+                        changed = true;
+                    }
+                }
                 for (const ticket of boardData.tickets) {
                     if (ticket.execution?.status === 'in_progress') {
                         ticket.execution = {
@@ -592,72 +554,6 @@ function recoverStaleInProgressTickets() {
             } catch {}
         }
     } catch {}
-}
-
-function markDeclaredRun(projectId, ticketIds, actorName) {
-    const boardData = readBoard(projectId);
-    if (!boardData?.tickets?.length) return;
-
-    const now = new Date().toISOString();
-    const nowMs = Date.now();
-    // AD-159: window for de-duping declarations. A user pressing Enter twice
-    // (often a "did that work?" retry) used to land two Claiming-ticket
-    // comments + two pairs of activity entries on the same ticket within
-    // seconds. 30s is long enough to absorb retries without suppressing a
-    // legitimate re-declaration after a real conversation.
-    const DECLARATION_DEDUP_MS = 30 * 1000;
-    const actor = actorName || 'Coding Agent';
-    let changed = false;
-
-    for (const ticket of boardData.tickets) {
-        if (!ticketIds.includes(String(ticket.id || '').toUpperCase())) continue;
-
-        // AD-159: skip if this actor already declared a terminal run on this
-        // ticket within the dedup window. Keeps the comment trail clean and
-        // avoids the misleading "started working ... started working ..."
-        // double-entry seen on AD-158.
-        const recentDeclaration = (ticket.activity || []).some(entry => {
-            if (entry.action !== 'terminal_run_declared') return false;
-            if (entry.by !== actor) return false;
-            const ts = new Date(entry.at || 0).getTime();
-            return Number.isFinite(ts) && (nowMs - ts) < DECLARATION_DEDUP_MS;
-        });
-        if (recentDeclaration) continue;
-
-        if (!Array.isArray(ticket.comments)) ticket.comments = [];
-        ticket.comments.push({
-            id: `c-${Date.now().toString(36)}-${ticket.id}`,
-            author: actorName || 'Coding Agent',
-            authorType: 'ai',
-            content: `**Claiming ticket.** Terminal-referenced ADHDev work was declared for ${ticket.id}. I will inspect the ticket, follow the ADHDev contract, and post a completion update here.`,
-            images: [],
-            createdAt: now,
-        });
-
-        // AD-247: heartbeat-ONLY. The declaration comment + activity trail
-        // record that the agent referenced this ticket in the terminal, but
-        // it does NOT promote the ticket to running. Sameer's spec on AD-232
-        // is that Running = UI Run button only. If the ticket already has an
-        // in_progress execution (someone clicked Run), refresh the heartbeat
-        // so the indicator stays alive while the agent posts. Otherwise leave
-        // execution untouched.
-        const priorExec = ticket.execution;
-        if (priorExec?.status === 'in_progress') {
-            ticket.execution = { ...priorExec, updatedAt: now };
-        }
-
-        if (!Array.isArray(ticket.activity)) ticket.activity = [];
-        ticket.activity.push({
-            action: 'terminal_run_declared',
-            by: actorName || 'Coding Agent',
-            byType: 'ai',
-            at: now,
-        });
-        ticket.updatedAt = now;
-        changed = true;
-    }
-
-    if (changed) writeBoard(boardData, projectId);
 }
 
 function scheduleActiveRunClear(session) {
@@ -684,7 +580,10 @@ function scheduleActiveRunClear(session) {
             if (isAgentDetectionStale(session)) {
                 clearActiveRunTickets(session, 'detection_stale');
             } else if (agentEverDetected && session.agentState?.active) {
-                clearActiveRunTickets(session, 'agent_idle');
+                // AD-269: quiet agent work is still a live run. Keep the run
+                // lease heartbeat alive instead of clearing UI state after a
+                // shell-output gap.
+                scheduleActiveRunClear(session);
             } else {
                 clearActiveRunTickets(session, 'timed_out');
             }
@@ -692,18 +591,19 @@ function scheduleActiveRunClear(session) {
     }
 }
 
-function setActiveRunTickets(session, ticketIds = []) {
+function setActiveRunTickets(session, ticketIds = [], runId = null) {
     if (!session) return;
     session.activeRunTicketIds = Array.from(new Set(ticketIds.filter(Boolean)));
-    session.requestState.status = session.activeRunTicketIds.length > 0 ? 'running' : 'idle';
+    session.activeRunId = runId || null;
+    session.requestState.status = session.activeRunTicketIds.length > 0 ? 'dispatching' : 'idle';
     session.requestState.startedAt = session.activeRunTicketIds.length > 0 ? new Date().toISOString() : null;
     session.requestState.updatedAt = new Date().toISOString();
     session.requestState.lastEvent = session.activeRunTicketIds.length > 0 ? 'request_started' : 'request_cleared';
     scheduleActiveRunClear(session);
-    // AD-149 permanent fix: heartbeat kicks in the moment a run starts and
-    // keeps execution.updatedAt fresh every 10 s until the set clears.
+    // Dispatching is only "prompt sent". Promote to confirmed running once
+    // an agent is detected on this terminal session.
     if (session.activeRunTicketIds.length > 0) {
-        bumpExecutionForActiveTickets(session.projectId, session.activeRunTicketIds);
+        if (session.agentState?.active) confirmActiveRunTickets(session);
         startHeartbeat(session);
     } else {
         stopHeartbeat(session);
@@ -743,6 +643,10 @@ function clearActiveRunTickets(session, reason = 'cleared') {
     // AD-178 — they fire mid-run). 'cleared' (the default) is also skipped
     // because callers that pass no reason haven't asserted the agent is gone.
     stopHeartbeat(session);
+    if (priorIds.length > 0 && (reason === 'interrupted' || shouldAutoCompleteOnClear(reason))) {
+        try { markActiveRunsTerminal(session.projectId, priorIds, reason); } catch {}
+    }
+    session.activeRunId = null;
     if (priorIds.length > 0 && shouldAutoCompleteOnClear(reason)) {
         try { autoCompleteTickets(session.projectId, priorIds, reason); } catch {}
     }
@@ -751,6 +655,9 @@ function clearActiveRunTickets(session, reason = 'cleared') {
 function setAgentActive(session, name) {
     if (!session || !name) return;
     const prior = session.agentState.name;
+    if (prior && prior !== name) {
+        session.outputTail = '';
+    }
     session.agentState.active = true;
     session.agentState.name = name;
     session.agentState.lastDetectedAt = Date.now();
@@ -760,10 +667,12 @@ function setAgentActive(session, name) {
         session.requestState.status = 'idle';
         session.requestState.lastEvent = 'agent_ready';
     }
+    confirmActiveRunTickets(session);
 }
 
 function clearAgentActive(session) {
     if (!session) return;
+    session.outputTail = '';
     session.agentState.active = false;
     session.agentState.name = null;
     session.requestState.status = 'idle';
@@ -829,6 +738,33 @@ function detectAgentOutput(session, data) {
     const normalized = session.outputTail.toLowerCase();
     if (!chunk.trim() && !normalized.trim()) return;
 
+    const activeAgentName = session.agentState.active ? session.agentState.name : null;
+    const seenForAgent = (agentName, matcher) => matcher(chunk) || (activeAgentName === agentName && matcher(normalized));
+    const seenWhenIdle = matcher => matcher(chunk) || (!activeAgentName && matcher(normalized));
+    const seenCodex = text => (
+        text.includes('openai codex') ||
+        text.includes('codex (v') ||
+        text.includes('permissions: yolo mode') ||
+        text.includes('approving:') ||
+        text.includes('codex cli') ||
+        text.includes('codex v') ||
+        text.includes('full auto mode') ||
+        text.includes('ctrl+e to explain')
+    );
+    const seenClaude = text => (
+        text.includes('esc to interrupt') ||
+        text.includes('summarize code changes after completion') ||
+        text.includes('press ctrl-c again to quit') ||
+        text.includes('claude code v') ||
+        text.includes('bypass permissions on') ||
+        text.includes('shift+tab to cycle')
+    );
+
+    if (seenForAgent('Codex', seenCodex) || seenWhenIdle(seenCodex)) {
+        setAgentActive(session, 'Codex');
+        return;
+    }
+
     // AD-144 reopen #2: detection markers must be *distinctive* — bare words
     // like "codex" or "aider" triggered false agent switches whenever Claude's
     // output mentioned them (e.g. a conversation about agent mascots
@@ -854,8 +790,10 @@ function detectAgentOutput(session, data) {
         normalized.includes('bypass permissions on') ||
         normalized.includes('shift+tab to cycle')
     ) {
-        setAgentActive(session, 'Claude Code');
-        return;
+        if (seenForAgent('Claude Code', seenClaude) || seenWhenIdle(seenClaude)) {
+            setAgentActive(session, 'Claude Code');
+            return;
+        }
     }
 
     if (
@@ -865,14 +803,17 @@ function detectAgentOutput(session, data) {
         normalized.includes('full auto mode') ||
         normalized.includes('ctrl+e to explain')
     ) {
-        setAgentActive(session, 'Codex');
-        return;
+        if (seenForAgent('Codex', seenCodex) || seenWhenIdle(seenCodex)) {
+            setAgentActive(session, 'Codex');
+            return;
+        }
     }
 
-    if (
-        normalized.includes('aider v') ||
-        (normalized.includes('model:') && normalized.includes('aider'))
-    ) {
+    const seenAider = text => (
+        text.includes('aider v') ||
+        (text.includes('model:') && text.includes('aider'))
+    );
+    if (seenForAgent('Aider', seenAider) || seenWhenIdle(seenAider)) {
         setAgentActive(session, 'Aider');
         return;
     }
@@ -881,20 +822,22 @@ function detectAgentOutput(session, data) {
     // "GEMINI.md" hint on launch and a "/directory" workspace footer; the
     // privacy/auth screens print "google ai" lines. Keep markers narrow so
     // foreign agents don't false-trigger (see AD-144 reopen #2).
-    if (
-        normalized.includes('gemini cli') ||
-        normalized.includes('gemini.md file') ||
-        normalized.includes('workspace (/directory)') ||
-        (normalized.includes('google ai') && normalized.includes('gemini'))
-    ) {
+    const seenGemini = text => (
+        text.includes('gemini cli') ||
+        text.includes('gemini.md file') ||
+        text.includes('workspace (/directory)') ||
+        (text.includes('google ai') && text.includes('gemini'))
+    );
+    if (seenForAgent('Gemini CLI', seenGemini) || seenWhenIdle(seenGemini)) {
         setAgentActive(session, 'Gemini CLI');
         return;
     }
 
-    if (
-        normalized.includes('cursor agent') ||
-        normalized.includes('cursor-agent v')
-    ) {
+    const seenCursor = text => (
+        text.includes('cursor agent') ||
+        text.includes('cursor-agent v')
+    );
+    if (seenForAgent('Cursor Agent', seenCursor) || seenWhenIdle(seenCursor)) {
         setAgentActive(session, 'Cursor Agent');
         return;
     }
@@ -922,7 +865,10 @@ function detectAgentOutput(session, data) {
         const isUnixPrompt = /(?:^|\n)\s*(?:\w+@[\w.-]+[:#~][^\r\n]*|)\$\s*$/m.test(recentOutput);
         if (isWindowsPrompt || isPSPrompt || isUnixPrompt) {
             clearAgentActive(session);
-            clearActiveRunTickets(session, 'shell_prompt');
+            // AD-269: shell-prompt detection is heuristic and has repeatedly
+            // fired mid-run. Do not clear the persisted active Run; completion
+            // PATCH, explicit interrupt, reliable stale recovery, or the max
+            // runtime watchdog owns that transition.
         }
     }
 
@@ -939,7 +885,9 @@ function detectAgentOutput(session, data) {
             chunk.includes('awaiting your input')
         )
     ) {
-        clearActiveRunTickets(session, 'agent_idle');
+        // Keep the active Run visible while the agent is awaiting input.
+        // This is still live work from the board's perspective.
+        scheduleActiveRunClear(session);
     }
 }
 
@@ -965,26 +913,13 @@ function inspectTerminalInput(session, data) {
         return data;
     }
 
-    // AD-246 reopen #2: bracketed-paste guard. The TerminalPane Ctrl+V handler
-    // wraps clipboard content as `\x1b[200~<text>\x1b[201~` and ships it as a
-    // single WS message. Without this guard the run-detection logic below
-    // (newline-split → ticket-id scan → injection) treats the paste as a
-    // typed command and inserts the ADHDev contract block at the FIRST
-    // newline of the paste — which lands inside the user's own bracketed-
-    // paste envelope. The CLI then renders user-text + injection as one
-    // undeletable paste unit, with the activity log streaming in alongside
-    // their content (the actual symptom: paste a chat reply that mentions a
-    // ticket → contract block + activity log + UI-context line jammed into
-    // the prompt). Pasted text is never a typed run declaration; treat any
-    // bracketed-paste payload as opaque pass-through and skip the entire
-    // inspection (no buffer accumulation, no agent-command detection, no
-    // injection). Detect on a leading `\x1b[200~` — sufficient because the
-    // TerminalPane wrap is one atomic WS frame.
+    // Bracketed-paste payloads are opaque terminal data. Do not accumulate
+    // them into the agent-command detector; pasted text can contain arbitrary
+    // ticket IDs and newlines, but it is still just user input.
     if (data.startsWith('\x1b[200~')) {
         return data;
     }
 
-    const wasAgentActive = session.agentState.active;
     session.agentInputBuffer = (session.agentInputBuffer || '') + data;
     const buf = session.agentInputBuffer;
     const newlineIndex = buf.search(/[\r\n]/);
@@ -993,50 +928,10 @@ function inspectTerminalInput(session, data) {
     const command = buf.slice(0, newlineIndex);
     session.agentInputBuffer = buf.slice(newlineIndex + 1);
     detectAgentCommand(session, command);
-
-    if (!wasAgentActive || !command.trim()) {
-        return data;
-    }
-
-    const boardData = readBoard(session.projectId);
-    const explicitTicketIds = extractReferencedTicketIds(command, boardData);
-    const contextualTicketIds = explicitTicketIds.length === 0 ? resolveTicketIdsFromUiContext(command, boardData) : [];
-    const ticketIds = explicitTicketIds.length > 0 ? explicitTicketIds : contextualTicketIds;
-    if (ticketIds.length === 0) {
-        return data;
-    }
-
-    // AD-159: bare-reference guard. If the user typed nothing but ticket IDs
-    // (and trivial punctuation), they're almost certainly looking it up,
-    // referencing it, or testing — not declaring a run. Without this guard
-    // typing `AD-158` + Enter into the agent prompt dumps the full ADHDev
-    // contract block into Claude's input AND lights up the Running indicator
-    // on a card nobody is actually working. Imperative phrasing like
-    // `Fix AD-158` still trips the trigger because residualSignal is
-    // non-empty after stripping IDs and punctuation.
-    if (explicitTicketIds.length > 0) {
-        const residualSignal = command
-            .replace(/\b[A-Z]{2,6}-\d+\b/gi, '')
-            .replace(/[^a-zA-Z0-9]/g, '');
-        if (residualSignal.length === 0) {
-            return data;
-        }
-    }
-
-    setActiveRunTickets(session, ticketIds);
-    markDeclaredRun(session.projectId, ticketIds, session.agentState.name || 'Coding Agent');
-
-    if (alreadyIncludesAdhdevContract(command)) {
-        return data;
-    }
-
-    const injection = buildInjectedExecutionContract(ticketIds, boardData, session.projectId);
-    const chunkNewlineIndex = data.search(/[\r\n]/);
-    if (chunkNewlineIndex === -1) {
-        return `${data}${injection}`;
-    }
-
-    return `${data.slice(0, chunkNewlineIndex)}${injection}${data.slice(chunkNewlineIndex)}`;
+    // Raw terminal input is opaque user data. Ticket context is injected only
+    // via the explicit run paths, never by heuristically rewriting typed or
+    // pasted terminal content.
+    return data;
 }
 
 function getSession(projectId) {
@@ -1059,6 +954,7 @@ function createSessionState(projectId) {
         agentInputBuffer: '',
         outputTail: '',
         activeRunTicketIds: [],
+        activeRunId: null,
         clearActiveRunTimeout: null,
         historyWriteTimeout: null,
         agentState: { active: false, name: null, lastDetectedAt: 0 },
@@ -1293,7 +1189,7 @@ const httpServer = createServer((req, res) => {
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
             try {
-                const { command, ticketId, ticketIds, batchId, projectId: rawProjectId } = JSON.parse(body);
+                const { command, ticketId, ticketIds, batchId, projectId: rawProjectId, runId } = JSON.parse(body);
                 if (!command) {
                     res.writeHead(400);
                     res.end(JSON.stringify({ error: 'Command required' }));
@@ -1313,7 +1209,7 @@ const httpServer = createServer((req, res) => {
                         : batchId
                             ? [batchId]
                             : [];
-                setActiveRunTickets(session, normalizedTicketIds);
+                setActiveRunTickets(session, normalizedTicketIds, typeof runId === 'string' ? runId : null);
 
                 // AD-184 → AD-140 (round 2): the 80ms-gap fix from round 1
                 // was insufficient — reports kept coming in of the failure
@@ -1339,11 +1235,14 @@ const httpServer = createServer((req, res) => {
                 //       everything between those markers as a single paste,
                 //       NOT as multi-line edit, so the in-buffer \n's are no
                 //       longer ambiguous. Closes #2.
-                //   (b) Bump the delay between paste and Enter to 250ms.
-                //       Closes #3 and most of #4.
-                //   (c) Send Enter twice with a 150ms gap. If Enter #1 lands
-                //       while Claude's startup dialog is still up, it
-                //       dismisses the dialog; Enter #2 submits the prompt.
+                //   (b) Delay Enter until the receiving REPL has had time to
+                //       drain the bracketed-paste payload. Short fixed delays
+                //       race on Windows/Codex/Claude when the prompt is large:
+                //       the text visibly lands, but the submit keystroke is
+                //       swallowed before the TUI exits paste handling.
+                //   (c) Send Enter more than once. If Enter #1 lands while
+                //       Claude's startup dialog is still up, it dismisses the
+                //       dialog; the delayed follow-ups submit the prompt.
                 //       Closes #1. Stray-second-Enter at a bash/cmd prompt
                 //       just produces one blank line — cheap.
                 //
@@ -1363,16 +1262,27 @@ const httpServer = createServer((req, res) => {
                 const BPM_OPEN = '\x1b[200~';
                 const BPM_CLOSE = '\x1b[201~';
                 const CTRL_U = '\x15';
+                // AD-140 reopen: the double-Enter path still left rare runs
+                // sitting in the agent prompt after a long paste. Scale the
+                // initial submit window up for large prompts and keep two
+                // delayed follow-up submits so a startup dialog, paste drain,
+                // or ConPTY split cannot consume the only Enter.
+                const firstSubmitDelay = Math.max(900, Math.min(3000, 650 + Math.ceil(stripped.length / 6)));
+                const secondSubmitDelay = firstSubmitDelay + 600;
+                const thirdSubmitDelay = firstSubmitDelay + 1800;
                 session.shell.write(CTRL_U);
                 setTimeout(() => {
                     try { session.shell.write(BPM_OPEN + stripped + BPM_CLOSE); } catch {}
                 }, 50);
                 setTimeout(() => {
                     try { session.shell.write('\r'); } catch { /* shell torn down between writes */ }
-                }, 300);
+                }, firstSubmitDelay);
                 setTimeout(() => {
                     try { session.shell.write('\r'); } catch { /* same */ }
-                }, 450);
+                }, secondSubmitDelay);
+                setTimeout(() => {
+                    try { session.shell.write('\r'); } catch { /* same */ }
+                }, thirdSubmitDelay);
 
                 const identifier = batchId || ticketId || normalizedTicketIds.join(', ') || 'unknown';
                 console.log(`Terminal execution started for project ${projectId}, ${batchId ? 'batch' : 'ticket'} ${identifier}`);
@@ -1405,6 +1315,43 @@ const httpServer = createServer((req, res) => {
                     }
                     session.shellBuffer = [];
                     session.shellBufferLength = 0;
+                }
+                clearHistoryBuffer(projectId);
+                res.writeHead(200);
+                res.end(JSON.stringify({ success: true, projectId }));
+            } catch {
+                res.writeHead(400);
+                res.end(JSON.stringify({ error: 'Invalid JSON' }));
+            }
+        });
+        return;
+    }
+
+    // Explicit UI reset: kill the project's current shell and wipe its
+    // persisted scrollback. Typing `exit` into the PTY is not reliable when a
+    // TUI owns the prompt, so expose a gated server-side reset path.
+    if (req.method === 'POST' && req.url && req.url.startsWith('/reset-session')) {
+        if (!requireGate(req, res, new URL(req.url, `http://localhost:${PORT}`))) return;
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const { projectId: rawProjectId } = body ? JSON.parse(body) : {};
+                const projectId = normalizeProjectId(rawProjectId || currentProjectId);
+                const session = getSession(projectId);
+                if (session) {
+                    if (session.activeRunTicketIds.length > 0) {
+                        markTicketsInterrupted(projectId, session.activeRunTicketIds);
+                        clearActiveRunTickets(session, 'interrupted');
+                    }
+                    clearAgentActive(session);
+                    if (session.historyWriteTimeout) {
+                        clearTimeout(session.historyWriteTimeout);
+                        session.historyWriteTimeout = null;
+                    }
+                    session.shellBuffer = [];
+                    session.shellBufferLength = 0;
+                    try { session.shell?.kill(); } catch {}
                 }
                 clearHistoryBuffer(projectId);
                 res.writeHead(200);
@@ -1477,6 +1424,10 @@ wss.on('connection', (ws, req) => {
             if (parsed.type === 'input') {
                 const transformedInput = inspectTerminalInput(activeSession, parsed.data || '');
                 activeSession.shell.write(transformedInput);
+            } else if (parsed.type === 'agent-hint') {
+                if (typeof parsed.agentId === 'string' && parsed.agentId.trim()) {
+                    setAgentActive(activeSession, parsed.agentId.trim());
+                }
             } else if (parsed.type === 'resize') {
                 activeSession.shell.resize(parsed.cols || 120, parsed.rows || 30);
             } else if (parsed.type === 'switch-project') {

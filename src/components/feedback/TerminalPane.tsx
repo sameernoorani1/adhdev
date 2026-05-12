@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { getSessionToken, fetchWithAdhdevToken, invalidateSessionToken } from '@/lib/api/sessionToken';
+import { AgentLauncherMenu } from './AgentLauncherMenu';
 
 const WS_URL = 'ws://localhost:3112';
 const SIZE_KEY = 'adhdev-terminal-size';
@@ -188,7 +189,6 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
     const sizeRef = useRef(size);
     const cleanupRef = useRef<(() => void) | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
-    const initCountRef = useRef(0); // Track reinit for reset
     const [startTime, setStartTime] = useState<Date | null>(null);
     const [sessionTime, setSessionTime] = useState('00:00');
 
@@ -267,6 +267,7 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
 
         const term = new Terminal({
             cursorBlink: true, fontSize: 13, scrollback: 10000,
+            cursorStyle: 'bar',
             fontFamily: '"Cascadia Code", "Fira Code", "Consolas", monospace',
             theme: computeXtermTheme(),
             allowProposedApi: true,
@@ -276,58 +277,30 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         term.loadAddon(fitAddon);
         fitAddonRef.current = fitAddon;
 
+        const sendBracketedPaste = (text: string) => {
+            const stripped = text.replace(/\x1b\[200~|\x1b\[201~/g, '');
+            if (!stripped) {
+                const tag = Date.now();
+                setRecentPaste({ lines: 0, chars: 0, tag, kind: 'empty' });
+                setTimeout(() => setRecentPaste(prev => (prev?.tag === tag ? null : prev)), 2500);
+                return;
+            }
+            if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+            wsRef.current.send(JSON.stringify({ type: 'input', data: '\x1b[200~' + stripped + '\x1b[201~' }));
+
+            const lines = stripped.split('\n').length;
+            const tag = Date.now();
+            const collapsed = stripped.replace(/\s+/g, ' ').trim();
+            const preview = collapsed.length > 60 ? collapsed.slice(0, 60) + '...' : collapsed;
+            setRecentPaste({ lines, chars: stripped.length, tag, kind: 'ok', preview });
+            setTimeout(() => setRecentPaste(prev => (prev?.tag === tag ? null : prev)), 4000);
+        };
+
         term.attachCustomKeyEventHandler((e) => {
-            // Block all Ctrl+V events (keydown AND keyup) to prevent double paste
-            if (e.ctrlKey && e.key === 'v') {
-                if (e.type === 'keydown') {
-                    e.preventDefault(); // Prevent browser paste event
-                    navigator.clipboard.readText().then(text => {
-                        // AD-233: wrap the paste in bracketed-paste-mode markers
-                        // so Claude Code's REPL (and modern shells) treat the
-                        // whole text as a single paste, not as character-by-
-                        // character input. Without this, every \n inside a
-                        // multi-line paste fires the agent's submit handler,
-                        // producing the "adding a ton of things" symptom
-                        // (incremental responses to each line). Defensively
-                        // strip any pre-existing markers from the clipboard
-                        // content so we never double-wrap.
-                        const stripped = text.replace(/\x1b\[200~|\x1b\[201~/g, '');
-                        // AD-246: empty clipboard (or image-only clipboard,
-                        // since readText() returns "" for images) — surface
-                        // that explicitly. Avoids the "I pasted four times
-                        // because nothing happened" trap; nothing happened
-                        // because there was no text to paste.
-                        if (!stripped) {
-                            const tag = Date.now();
-                            setRecentPaste({ lines: 0, chars: 0, tag, kind: 'empty' });
-                            setTimeout(() => setRecentPaste(prev => (prev?.tag === tag ? null : prev)), 2500);
-                            return;
-                        }
-                        if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-                        const wrapped = '\x1b[200~' + stripped + '\x1b[201~';
-                        wsRef.current.send(JSON.stringify({ type: 'input', data: wrapped }));
-                        // AD-246: visible paste-success toast outside the
-                        // xterm canvas. Claude Code's REPL collapses the
-                        // pasted text into a tiny "[Pasted text #N]"
-                        // placeholder which is easy to miss — without an
-                        // outside-the-canvas confirmation users assume the
-                        // paste failed and Ctrl+V again, stacking pastes.
-                        const lines = stripped.split('\n').length;
-                        const tag = Date.now();
-                        // AD-246 reopen: build a single-line preview (collapse
-                        // newlines to ⏎, truncate at 60 chars) so a clipboard
-                        // mismatch is visible at the moment of paste.
-                        const collapsed = stripped.replace(/\s+/g, ' ').trim();
-                        const preview = collapsed.length > 60
-                            ? collapsed.slice(0, 60) + '…'
-                            : collapsed;
-                        setRecentPaste({ lines, chars: stripped.length, tag, kind: 'ok', preview });
-                        // AD-246 reopen: hold the toast longer (4 s vs 2.5 s)
-                        // so the user can actually read the preview.
-                        setTimeout(() => setRecentPaste(prev => (prev?.tag === tag ? null : prev)), 4000);
-                    }).catch(() => {});
-                }
-                return false; // block both keydown and keyup
+            // Let the browser emit ClipboardEvent; the capture paste handler
+            // below sends one bracketed payload and prevents xterm's raw paste.
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+                return false;
             }
             // Ctrl+C: copy selected text, or pass through to terminal (SIGINT)
             if (e.ctrlKey && e.key === 'c') {
@@ -365,10 +338,18 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         term.open(el);
         await new Promise(r => setTimeout(r, 50));
 
-        // Block browser paste events on the terminal container to prevent double paste.
-        // Our Ctrl+V handler already sends clipboard content via WS manually.
-        const pasteBlocker = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
-        el.addEventListener('paste', pasteBlocker, true);
+        // Own every browser paste path (Ctrl+V, Cmd+V, context menu, and
+        // textarea paste). xterm also listens for paste, so capture first,
+        // prevent its raw multiline send, and ship one bracketed WS payload.
+        const pasteHandler = (e: ClipboardEvent) => {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            sendBracketedPaste(e.clipboardData?.getData('text/plain') || '');
+            term.focus();
+        };
+        const pasteTargets = [el, term.element, term.textarea].filter(Boolean) as HTMLElement[];
+        pasteTargets.forEach(target => target.addEventListener('paste', pasteHandler, true));
 
         // Initial fit with stabilization
         fitAddon.fit();
@@ -481,13 +462,9 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
             lastCols = term.cols;
             lastRows = term.rows;
             ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-            // SIGWINCH alone is unreliable on Windows ConPTY — explicit Ctrl+L
-            // tells any TUI (Claude Code) to repaint at current cols. Skip the
-            // very first observation (initial fit) and skip rows-only changes
-            // (wrapping is column-driven).
-            if (initialResizeDone && colsChanged) {
-                ws.send(JSON.stringify({ type: 'input', data: '\x0c' }));
-            }
+            // Preserve the transcript during automatic layout changes. A PTY
+            // resize is enough here; Ctrl+L is reserved for the explicit Force
+            // redraw button because agent TUIs often treat it as a screen clear.
             initialResizeDone = true;
         };
 
@@ -530,7 +507,7 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         cleanupRef.current = () => {
             if (fitTimer) clearTimeout(fitTimer);
             if (pushTimer) clearTimeout(pushTimer);
-            el.removeEventListener('paste', pasteBlocker, true);
+            pasteTargets.forEach(target => target.removeEventListener('paste', pasteHandler, true));
             obs.disconnect();
             ws.close();
             term.dispose();
@@ -545,7 +522,7 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         if (!activeProjectId) return;
         const timer = setTimeout(initTerminal, 100);
         return () => { clearTimeout(timer); cleanupRef.current?.(); cleanupRef.current = null; };
-    }, [initTerminal, initCountRef.current, activeProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [initTerminal, activeProjectId]);
 
     // AD-144 reopen: when the pane transitions from hidden → visible, xterm
     // needs to refit because its cols/rows measured zero while display:none.
@@ -559,12 +536,10 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         return () => cancelAnimationFrame(raf);
     }, [hidden]);
 
-    // AD-155: orientation changes (placement flip, fullscreen toggle) cause
-    // xterm's existing scrollback to display at stale column positions —
-    // Claude Code's TUI uses absolute cursor positioning, so content rendered
-    // at the old width sits at wrong columns after a dramatic resize. Refit
-    // immediately, force xterm's own redraw, and send Ctrl+L to the running
-    // agent so it repaints its UI at the new dimensions.
+    // AD-155 / AD-270: orientation changes (placement flip, fullscreen toggle)
+    // can leave xterm painted at stale dimensions. Refit and refresh xterm's
+    // own viewport, but do not send Ctrl+L automatically; that clears many
+    // agent TUIs and made maximize/minimize look like the chat was wiped.
     const prevLayoutRef = useRef<string>('');
     useEffect(() => {
         const layout = `${placement}|${isFullscreen ? 'fs' : 'n'}`;
@@ -582,16 +557,11 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
             try {
                 const term = termInstanceRef.current;
                 if (term) {
+                    if (wsRef.current?.readyState === WebSocket.OPEN) {
+                        wsRef.current.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+                    }
                     term.refresh?.(0, (term.rows ?? 1) - 1);
                     term.scrollToBottom?.();
-                }
-            } catch {}
-            // Ctrl+L tells any TUI (Claude Code, bash, PowerShell) to redraw
-            // with the current dimensions. Only send if a run is likely in
-            // progress — avoids clearing the user's prompt line unnecessarily.
-            try {
-                if (wsRef.current?.readyState === WebSocket.OPEN) {
-                    wsRef.current.send(JSON.stringify({ type: 'input', data: '\x0c' }));
                 }
             } catch {}
         }, 220);
@@ -631,25 +601,21 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         setError(null);
         cleanupRef.current?.();
         cleanupRef.current = null;
-        initCountRef.current += 1;
-        // Force re-init by changing a dep... simplest: just call init directly
         setTimeout(initTerminal, 100);
     }, [initTerminal]);
 
     // ─── Reset session ───────────────────────────────────────────
     const handleResetSession = useCallback(() => {
         setShowResetModal(false);
-        // Kill current shell
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({ type: 'input', data: 'exit\r' }));
-        }
+        // Kill current shell and wipe persisted history server-side. Typing
+        // `exit` is not reliable when a TUI owns the prompt.
         // AD-144: explicit reset wipes the persisted history file too, so the
         // new shell truly starts blank — otherwise the on-disk scrollback from
         // the just-exited shell would replay into the fresh session.
         // AD-204: forward the session token to the terminal server.
         // fetchWithAdhdevToken transparently recovers from a rotated token
         // (terminal-server restart) by retrying once with a fresh value.
-        fetchWithAdhdevToken('http://localhost:3112/reset-history', {
+        fetchWithAdhdevToken('http://localhost:3112/reset-session', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ projectId: activeProjectId || undefined }),
@@ -758,7 +724,7 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                     // left. Drop it in fullscreen so the terminal claims the
                     // full viewport width.
                     (isFullscreen
-                        ? `fixed inset-0 z-50 flex flex-col bg-vd-bg-primary`
+                        ? `fixed inset-0 z-[200] flex flex-col bg-vd-bg-primary`
                         : `flex flex-col bg-vd-bg-primary ${borderClass} border-vd-border relative flex-shrink-0`)
                     // AD-125: unambiguous focus indicator. Ring pulses in when keystrokes are live.
                     + (isFocused
@@ -818,6 +784,8 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                                 <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.582m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                             </svg>
                         </button>
+                        {/* Agent launcher — click to start an installed agent or install a missing one */}
+                        <AgentLauncherMenu wsRef={wsRef} connected={connected} projectId={activeProjectId} />
                         {/* Reset session */}
                         <button
                             onClick={() => setShowResetModal(true)}
@@ -894,8 +862,8 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                     <div className="relative flex-1 flex flex-col min-h-0">
                         <div
                             ref={containerRef}
-                            className="flex-1"
-                            style={{ minHeight: 0, padding: '8px 8px 8px 12px' }}
+                            className="adhdev-terminal-host flex-1 overflow-hidden"
+                            style={{ minHeight: 0, padding: '8px 18px 8px 12px' }}
                             onClick={() => {
                                 // Focus the terminal when clicking anywhere in the pane
                                 termInstanceRef.current?.focus();
@@ -936,7 +904,7 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
 
             {/* Reset confirmation modal */}
             {showResetModal && (
-                <div className="fixed inset-0 z-[60] flex items-center justify-center" onClick={() => setShowResetModal(false)}>
+                <div className="fixed inset-0 z-[220] flex items-center justify-center" onClick={() => setShowResetModal(false)}>
                     <div className="absolute inset-0 bg-black/50" />
                     <div className="relative bg-vd-bg-secondary border border-vd-border rounded-xl px-6 py-5 max-w-xs mx-4" onClick={e => e.stopPropagation()}>
                         <h3 className="text-sm font-semibold text-vd-text-primary mb-2">Reset Terminal Session?</h3>

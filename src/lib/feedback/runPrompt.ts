@@ -80,8 +80,8 @@ const AGENT_VARIANT_FLAGS: Record<string, Record<string, string>> = {
     },
     'Codex': {
         standard: '',
-        'auto-edit': '--auto-edit',
-        'full-auto': '--full-auto',
+        'auto-edit': '--sandbox workspace-write --ask-for-approval on-request',
+        'full-auto': '--dangerously-bypass-approvals-and-sandbox',
     },
     'Aider': {
         standard: '',

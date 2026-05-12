@@ -133,6 +133,12 @@ interface FeedbackData {
     columns: Record<string, ColumnConfig>;
     tickets: Ticket[];
     missions?: Mission[];
+    activeRuns?: Array<{
+        runId: string;
+        ticketIds: string[];
+        status: 'dispatching' | 'running' | 'finishing' | 'done' | 'blocked' | 'failed' | 'interrupted' | 'stale';
+        agent?: string;
+    }>;
 }
 
 const COLUMN_ORDER = ['backlog', 'todo', 'reopen', 'done', 'reviewed', 'observe', 'deferred'];
@@ -150,8 +156,8 @@ const STATUS_LABELS: Record<string, string> = {
     backlog: 'Backlog',
     todo: 'Todo',
     reopen: 'Reopen',
-    done: 'Done',
-    reviewed: 'Reviewed',
+    done: 'For Review',
+    reviewed: 'Closed',
     observe: 'Observe',
     deferred: 'Deferred',
 };
@@ -177,9 +183,11 @@ const FEEDBACK_BROADCAST_CHANNEL = 'adhdev-feedback-board';
 
 type PriorityFilter = Ticket['priority'];
 type SortBy = 'default' | 'priority' | 'newest' | 'updated';
+type TimeFilter = 'all' | 'today' | '7d' | '30d';
 type TypeFilter = 'all' | 'normal' | 'discussion';
 type StackField = 'status' | 'wave' | 'session' | 'priority';
 type GroupField = 'none' | StackField;
+const HIDDEN_LANES_KEY = 'adhdev-hidden-status-lanes';
 
 interface StackGroup {
     id: string;
@@ -206,6 +214,20 @@ const PRIORITY_GROUP_META: Record<Ticket['priority'], { label: string; colorBar:
 };
 const PLANNING_COLOR_BARS = ['bg-cyan-500', 'bg-sky-500', 'bg-teal-500', 'bg-fuchsia-500', 'bg-violet-500', 'bg-emerald-500'];
 
+function matchesTimeFilter(value: string | undefined | null, filter: TimeFilter): boolean {
+    if (filter === 'all') return true;
+    if (!value) return false;
+    const ts = new Date(value).getTime();
+    if (!Number.isFinite(ts)) return false;
+    if (filter === 'today') {
+        const start = new Date();
+        start.setHours(0, 0, 0, 0);
+        return ts >= start.getTime();
+    }
+    const days = filter === '7d' ? 7 : 30;
+    return ts >= Date.now() - days * 24 * 60 * 60 * 1000;
+}
+
 function parseSequenceLabel(value: string): number | null {
     const match = value.match(/(\d+)/);
     return match ? Number.parseInt(match[1], 10) : null;
@@ -228,6 +250,8 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     const [search, setSearch] = useState('');
     const [priorityFilter, setPriorityFilter] = useState<PriorityFilter[]>([]);
     const [statusFilter, setStatusFilter] = useState<string[]>([]);
+    const [createdTimeFilter, setCreatedTimeFilter] = useState<TimeFilter>('all');
+    const [updatedTimeFilter, setUpdatedTimeFilter] = useState<TimeFilter>('all');
     const [aiFilter, setAiFilter] = useState<'all' | 'yes' | 'no'>('all');
     const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
     const [missionFilter, setMissionFilter] = useState('all');
@@ -237,6 +261,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // whose `relations` includes a `parent` edge) from the kanban. Default
     // off so today's behaviour is preserved.
     const [hideSubtasks, setHideSubtasks] = useState(false);
+    const [hiddenStatusIds, setHiddenStatusIds] = useState<Set<string>>(() => {
+        if (typeof window === 'undefined') return new Set();
+        try {
+            const parsed = JSON.parse(localStorage.getItem(HIDDEN_LANES_KEY) || '[]');
+            return new Set(Array.isArray(parsed) ? parsed.filter((id) => COLUMN_ORDER.includes(id)) : []);
+        } catch { return new Set(); }
+    });
     const searchRef = useRef<HTMLInputElement>(null);
     const [sortBy, setSortBy] = useState<SortBy>('updated');
     const [stackBy, setStackBy] = useState<StackField>('status');
@@ -328,14 +359,14 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         connected: boolean;
         agentStatus: 'inactive' | 'running';
         agentName: string | null;
-        requestStatus: 'idle' | 'running' | 'interrupted';
+        requestStatus: 'idle' | 'dispatching' | 'running' | 'interrupted';
     }>({
         connected: false,
         agentStatus: 'inactive',
         agentName: null,
         requestStatus: 'idle',
     });
-    const [activeExecutionIds, setActiveExecutionIds] = useState<Set<string>>(new Set());
+    const [terminalExecutionIds, setTerminalExecutionIds] = useState<Set<string>>(new Set());
     const [termPlacement, setTermPlacement] = useState<TerminalPlacement>('right');
     // AD-136: onboarding state + events, fetched from /api/onboarding.
     // AD-166: extended with wizard fields (wizardCompleted, wizardStep, etc.).
@@ -833,6 +864,17 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         });
     }, []);
 
+    const setLaneHidden = useCallback((status: string, hidden: boolean) => {
+        setHiddenStatusIds(prev => {
+            const next = new Set(prev);
+            if (hidden) next.add(status);
+            else next.delete(status);
+            if (next.size >= COLUMN_ORDER.length) next.delete(status);
+            try { localStorage.setItem(HIDDEN_LANES_KEY, JSON.stringify(Array.from(next))); } catch {}
+            return next;
+        });
+    }, []);
+
     // Load saved skin on mount
     // Init skin + fetch projects on mount
     useEffect(() => {
@@ -1049,9 +1091,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     connected: !!d.connected,
                     agentStatus: d.agentStatus === 'running' ? 'running' : 'inactive',
                     agentName: d.agentName || null,
-                    requestStatus: d.requestStatus === 'running' || d.requestStatus === 'interrupted' ? d.requestStatus : 'idle',
+                    requestStatus: d.requestStatus === 'running' || d.requestStatus === 'dispatching' || d.requestStatus === 'interrupted' ? d.requestStatus : 'idle',
                 });
-                setActiveExecutionIds(new Set(Array.isArray(d.captureTicketIds) ? d.captureTicketIds : []));
+                const nextExecutionIds = new Set<string>(d.requestStatus === 'running' && Array.isArray(d.captureTicketIds) ? d.captureTicketIds : []);
+                setTerminalExecutionIds(prev => {
+                    if (prev.size === nextExecutionIds.size && Array.from(prev).every(id => nextExecutionIds.has(id))) return prev;
+                    return nextExecutionIds;
+                });
             }).catch(() => {
                 setTerminalRuntime({
                     connected: false,
@@ -1059,7 +1105,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     agentName: null,
                     requestStatus: 'idle',
                 });
-                setActiveExecutionIds(new Set());
+                setTerminalExecutionIds(prev => prev.size === 0 ? prev : new Set());
             });
         };
         poll();
@@ -1071,6 +1117,24 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             document.removeEventListener('visibilitychange', onVisible);
         };
     }, [activeProjectId]);
+
+    const activeExecutionIds = useMemo(() => {
+        const ids = new Set<string>(terminalExecutionIds);
+        for (const run of data?.activeRuns || []) {
+            if (run.status !== 'running' && run.status !== 'finishing') continue;
+            for (const id of run.ticketIds || []) ids.add(String(id).toUpperCase());
+        }
+        return ids;
+    }, [data?.activeRuns, terminalExecutionIds]);
+
+    const activeRunStatusByTicket = useMemo(() => {
+        const statuses = new Map<string, 'dispatching' | 'running' | 'finishing'>();
+        for (const run of data?.activeRuns || []) {
+            if (run.status !== 'dispatching' && run.status !== 'running' && run.status !== 'finishing') continue;
+            for (const id of run.ticketIds || []) statuses.set(String(id).toUpperCase(), run.status);
+        }
+        return statuses;
+    }, [data?.activeRuns]);
 
     // AD-011: pull the configured display name on mount + project switch.
     // The fetch interceptor at the top of this component scopes the request
@@ -1129,21 +1193,35 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // AD-189: showPlanChoice removed — Plan Batches button moved into BatchPane.
     const [showFilters, setShowFilters] = useState(false);
     const filterRef = useRef<HTMLDivElement>(null);
+    const liveActiveRun = useMemo(() => {
+        const runs = data?.activeRuns || [];
+        return runs.find(run => run.status === 'running' || run.status === 'finishing')
+            || runs.find(run => run.status === 'dispatching')
+            || null;
+    }, [data?.activeRuns]);
+    const terminalRequestDispatching = terminalRuntime.requestStatus === 'dispatching';
+    const terminalRunDispatching = terminalRequestDispatching || liveActiveRun?.status === 'dispatching';
     const terminalRequestRunning = terminalRuntime.requestStatus === 'running';
+    const terminalRunRunning = terminalRequestRunning || liveActiveRun?.status === 'running' || liveActiveRun?.status === 'finishing';
     const terminalAgentRunning = terminalRuntime.agentStatus === 'running';
+    const terminalAgentName = terminalRuntime.agentName || liveActiveRun?.agent || 'Agent';
     const terminalLabel = !terminalRuntime.connected
         ? 'Terminal'
-        : terminalRequestRunning
-            ? `⚡ ${terminalRuntime.agentName || 'Agent'}`
+        : terminalRunDispatching
+            ? 'Sending...'
+            : terminalRunRunning
+            ? `${terminalAgentName} Running`
             : terminalAgentRunning
-                ? `${terminalRuntime.agentName || 'Agent'} Ready`
+                ? `${terminalAgentName} Ready`
                 : 'Shell Ready';
     const terminalTitle = !terminalRuntime.connected
         ? 'Open terminal'
-        : terminalRequestRunning
-            ? `${terminalRuntime.agentName || 'Coding agent'} is working`
+        : terminalRunDispatching
+            ? 'Prompt sent; waiting for agent activity'
+            : terminalRunRunning
+            ? `${terminalAgentName} is working`
             : terminalAgentRunning
-                ? `${terminalRuntime.agentName || 'Coding agent'} is running and idle`
+                ? `${terminalAgentName} is running and idle`
                 : 'Shell is connected';
     const [sidebarExpanded, setSidebarExpanded] = useState(() => {
         if (typeof window === 'undefined') return false;
@@ -1208,14 +1286,17 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         const dy = e.changedTouches[0].clientY - touchStartY.current;
         // Only trigger if horizontal swipe > 60px and more horizontal than vertical
         if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
-            const idx = COLUMN_ORDER.indexOf(mobileTab);
-            if (dx < 0 && idx < COLUMN_ORDER.length - 1) {
-                switchTab(COLUMN_ORDER[idx + 1], 'left'); // swipe left → next
+            const visibleIds = stackBy === 'status'
+                ? COLUMN_ORDER.filter(status => !hiddenStatusIds.has(status))
+                : COLUMN_ORDER;
+            const idx = visibleIds.indexOf(mobileTab);
+            if (dx < 0 && idx < visibleIds.length - 1) {
+                switchTab(visibleIds[idx + 1], 'left'); // swipe left → next
             } else if (dx > 0 && idx > 0) {
-                switchTab(COLUMN_ORDER[idx - 1], 'right'); // swipe right → prev
+                switchTab(visibleIds[idx - 1], 'right'); // swipe right → prev
             }
         }
-    }, [mobileTab, switchTab]);
+    }, [hiddenStatusIds, mobileTab, stackBy, switchTab]);
 
     // Keyboard shortcuts: Escape to close modals/pane, N to new ticket, B to toggle batch pane, Ctrl+F to search
     useEffect(() => {
@@ -1359,7 +1440,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // notifier owns document.title — splitting these would race (two effects
     // both writing document.title would fight on every poll tick).
     const projectNameForTitle = projects.find(p => p.id === activeProjectId)?.name ?? null;
-    const prevRequestStatusRef = useRef<'idle' | 'running' | 'interrupted'>('idle');
+    const prevRequestStatusRef = useRef<'idle' | 'dispatching' | 'running' | 'interrupted'>('idle');
     const lastActiveTicketsRef = useRef<string[]>([]);
     useEffect(() => {
         if (typeof document === 'undefined') return;
@@ -1513,8 +1594,8 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     }, [fetchData]);
 
     // DnD sensors
-    const pointerSensor = useSensor(PointerSensor, { activationConstraint: { distance: 5 } });
-    const touchSensor = useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } });
+    const pointerSensor = useSensor(PointerSensor, { activationConstraint: { distance: 3 } });
+    const touchSensor = useSensor(TouchSensor, { activationConstraint: { delay: 90, tolerance: 8 } });
     const keyboardSensor = useSensor(KeyboardSensor);
     const sensors = useSensors(pointerSensor, touchSensor, keyboardSensor);
 
@@ -1543,6 +1624,8 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             }
             if (priorityFilter.length > 0 && !priorityFilter.includes(t.priority)) return false;
             if (statusFilter.length > 0 && !statusFilter.includes(t.status)) return false;
+            if (!matchesTimeFilter(t.createdAt, createdTimeFilter)) return false;
+            if (!matchesTimeFilter(t.updatedAt, updatedTimeFilter)) return false;
             // aiFilter removed (VD-155) — batch selection replaced AI addressable
             // Type filter: normalize old values (issue→normal, idea→discussion)
             const tType = t.ticketType === 'idea' ? 'discussion' : t.ticketType === 'discussion' ? 'discussion' : 'normal';
@@ -1570,7 +1653,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             if (hideSubtasks && (t.relations || []).some(r => r.kind === 'parent')) return false;
             return true;
         });
-    }, [data, search, priorityFilter, statusFilter, aiFilter, typeFilter, missionFilter, batchFilter, batchedTicketIds, creatorFilter, hideSubtasks]);
+    }, [data, search, priorityFilter, statusFilter, createdTimeFilter, updatedTimeFilter, aiFilter, typeFilter, missionFilter, batchFilter, batchedTicketIds, creatorFilter, hideSubtasks]);
 
     // Sort function
     const sortTickets = useCallback((tickets: Ticket[]): Ticket[] => {
@@ -1609,7 +1692,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             return COLUMN_ORDER.map((status) => ({
                 id: status,
                 value: status,
-                label: data.columns[status]?.label || status,
+                label: STATUS_LABELS[status] || data.columns[status]?.label || status,
                 colorBar: COLUMN_COLORS[status] || 'bg-gray-500',
                 instruction: data.columns[status]?.aiInstruction || '',
             }));
@@ -1644,6 +1727,12 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         return groups;
     }, [data, stackBy, waveOptions, sessionOptions]);
 
+    const visibleStackGroups = useMemo(() => (
+        stackBy === 'status'
+            ? stackGroups.filter(group => !hiddenStatusIds.has(group.id))
+            : stackGroups
+    ), [hiddenStatusIds, stackBy, stackGroups]);
+
     const groupedTickets = useMemo(() => {
         const grouped: Record<string, Ticket[]> = {};
         for (const group of stackGroups) grouped[group.id] = [];
@@ -1668,11 +1757,11 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     }, [filteredTickets, sortTickets, stackBy, stackGroups]);
 
     useEffect(() => {
-        if (stackGroups.length === 0) return;
-        if (!stackGroups.some(group => group.id === mobileTab)) {
-            setMobileTab(stackGroups[0].id);
+        if (visibleStackGroups.length === 0) return;
+        if (!visibleStackGroups.some(group => group.id === mobileTab)) {
+            setMobileTab(visibleStackGroups[0].id);
         }
-    }, [stackGroups, mobileTab]);
+    }, [visibleStackGroups, mobileTab]);
 
     // Collect all unique tags across all tickets
     const allTags = useMemo(() => {
@@ -1708,6 +1797,8 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         if (missionFilter !== 'all') count++;
         if (priorityFilter.length > 0) count++;
         if (statusFilter.length > 0) count++;
+        if (createdTimeFilter !== 'all') count++;
+        if (updatedTimeFilter !== 'all') count++;
         if (typeFilter !== 'all') count++;
         if (aiFilter !== 'all') count++;
         if (creatorFilter !== 'all') count++;
@@ -1717,11 +1808,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         if (groupedBy !== 'none') count++;
         if (hideSubtasks) count++;
         return count;
-    }, [missionFilter, priorityFilter, statusFilter, typeFilter, aiFilter, creatorFilter, batchFilter, sortBy, stackBy, groupedBy, hideSubtasks]);
+    }, [missionFilter, priorityFilter, statusFilter, createdTimeFilter, updatedTimeFilter, typeFilter, aiFilter, creatorFilter, batchFilter, sortBy, stackBy, groupedBy, hideSubtasks]);
 
     const clearAllFilters = useCallback(() => {
         setPriorityFilter([]);
         setStatusFilter([]);
+        setCreatedTimeFilter('all');
+        setUpdatedTimeFilter('all');
         setTypeFilter('all');
         setMissionFilter('all');
         setAiFilter('all');
@@ -2623,14 +2716,28 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                             ))}
                                         </select>
                                     </label>
-                                    <label className="block">
-                                        <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Sort</span>
-                                        <select value={sortBy} onChange={(e) => setSortBy(e.target.value as SortBy)} className="mt-0.5 w-full text-xs bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-vd-text-primary focus:border-vd-accent-gold focus:outline-none">
-                                            <option value="updated">Recently Updated</option><option value="default">Default Order</option><option value="priority">By Priority</option><option value="newest">Newest First</option>
-                                        </select>
-                                    </label>
-                                    <div className="block">
-                                        <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Status</span>
+                                     <label className="block">
+                                         <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Sort</span>
+                                         <select value={sortBy} onChange={(e) => setSortBy(e.target.value as SortBy)} className="mt-0.5 w-full text-xs bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-vd-text-primary focus:border-vd-accent-gold focus:outline-none">
+                                             <option value="updated">Recently Updated</option><option value="default">Default Order</option><option value="priority">By Priority</option><option value="newest">Newest First</option>
+                                         </select>
+                                     </label>
+                                     <div className="grid grid-cols-2 gap-2">
+                                         <label className="block">
+                                             <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Created</span>
+                                             <select value={createdTimeFilter} onChange={(e) => setCreatedTimeFilter(e.target.value as TimeFilter)} className="mt-0.5 w-full text-xs bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-vd-text-primary focus:border-vd-accent-gold focus:outline-none">
+                                                 <option value="all">Any time</option><option value="today">Today</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option>
+                                             </select>
+                                         </label>
+                                         <label className="block">
+                                             <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Updated</span>
+                                             <select value={updatedTimeFilter} onChange={(e) => setUpdatedTimeFilter(e.target.value as TimeFilter)} className="mt-0.5 w-full text-xs bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-vd-text-primary focus:border-vd-accent-gold focus:outline-none">
+                                                 <option value="all">Any time</option><option value="today">Today</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option>
+                                             </select>
+                                         </label>
+                                     </div>
+                                     <div className="block">
+                                         <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Status</span>
                                         <div className="mt-1 flex flex-wrap gap-1.5">
                                             {COLUMN_ORDER.map((status) => {
                                                 const selected = statusFilter.includes(status);
@@ -2759,7 +2866,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                             <button
                                 onClick={() => setShowTerminal(!showTerminal)}
                                 className={`relative px-2.5 py-1.5 text-xs font-medium border rounded-lg transition-colors ${
-                                    terminalRequestRunning
+                                    (terminalRunRunning || terminalRunDispatching)
                                         ? 'border-vd-accent-gold text-vd-accent-gold animate-pulse'
                                         : terminalAgentRunning
                                         ? 'border-emerald-500/60 text-emerald-400'
@@ -2769,13 +2876,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                 }`}
                                 title={terminalTitle}
                             >
-                                {terminalRequestRunning && (
+                                {terminalRunRunning && (
                                     <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
                                         <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-vd-accent-gold opacity-75"></span>
                                         <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-vd-accent-gold"></span>
                                     </span>
                                 )}
-                                {terminalAgentRunning && !terminalRequestRunning && (
+                                {terminalAgentRunning && !terminalRunRunning && (
                                     <span className="absolute -top-1 -right-1 h-2.5 w-2.5 rounded-full bg-emerald-400" />
                                 )}
                                 {/* AD-141: terminal icon inline with the label, inherits the button's
@@ -2832,6 +2939,20 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                             });
                                             const result = await res.json();
                                             if (result.success && result.terminal) {
+                                                if (result.activeRun) {
+                                                    setData(prev => prev ? {
+                                                        ...prev,
+                                                        activeRuns: [
+                                                            ...(prev.activeRuns || []).filter(run => run.runId !== result.activeRun.runId),
+                                                            result.activeRun,
+                                                        ],
+                                                    } : prev);
+                                                    setTerminalExecutionIds(prev => {
+                                                        const next = new Set(prev);
+                                                        for (const id of result.activeRun.ticketIds || []) next.add(String(id).toUpperCase());
+                                                        return next;
+                                                    });
+                                                }
                                                 if (Array.isArray(result.updatedTickets)) {
                                                     for (const updatedTicket of result.updatedTickets) {
                                                         replaceTicketLocally(updatedTicket);
@@ -2893,20 +3014,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                 </button>
                             </div>
                         )}
-                        {selectedIds.size === 0 && (
-                            <button
-                                onClick={async () => {
-                                    await navigator.clipboard.writeText('Read .adhdev/board.json and work on all actionable tickets (status: todo, reopen).');
-                                    showToast('Copied! Paste into your AI agent.', 3000);
-                                }}
-                                className="px-2.5 py-1.5 text-xs font-medium border border-vd-accent-gold/40 text-vd-accent-gold rounded-lg hover:bg-vd-accent-gold/10 transition-colors"
-                                title="Copy for AI"
-                            >
-                                <span className="hidden sm:inline">Copy for AI</span>
-                                <svg className="w-4 h-4 sm:hidden" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M15.666 3.888A2.25 2.25 0 0013.5 2.25h-3c-1.03 0-1.9.693-2.166 1.638m7.332 0c.055.194.084.4.084.612v0a.75.75 0 01-.75.75H9.75a.75.75 0 01-.75-.75v0c0-.212.03-.418.084-.612m7.332 0c.646.049 1.288.11 1.927.184 1.1.128 1.907 1.077 1.907 2.185V19.5a2.25 2.25 0 01-2.25 2.25H6.75A2.25 2.25 0 014.5 19.5V6.257c0-1.108.806-2.057 1.907-2.185a48.208 48.208 0 011.927-.184" /></svg>
-                            </button>
-                        )}
-
                         {/* AD-181 / AD-188: Inbox toggle — second-from-right
                             placement, immediately left of New Ticket per
                             chat message m-moir8zwy-cxe8.
@@ -3048,7 +3155,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     <div className="flex-1 flex flex-col min-h-0">
                         {/* Tab bar — tap to switch columns */}
                         <div className="flex gap-0.5 pb-2 flex-wrap">
-                            {stackGroups.map((group) => {
+                            {visibleStackGroups.map((group) => {
                                 const count = (groupedTickets[group.id] || []).length;
                                 const shortLabel = group.label.length > 8
                                     ? group.label.split(/\s+/).map(part => part[0]).join('').slice(0, 3).toUpperCase()
@@ -3058,8 +3165,8 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                         key={group.id}
                                         onClick={() => {
                                             if (group.id === mobileTab) return;
-                                            const fromIdx = stackGroups.findIndex(entry => entry.id === mobileTab);
-                                            const toIdx = stackGroups.findIndex(entry => entry.id === group.id);
+                                            const fromIdx = visibleStackGroups.findIndex(entry => entry.id === mobileTab);
+                                            const toIdx = visibleStackGroups.findIndex(entry => entry.id === group.id);
                                             switchTab(group.id, toIdx > fromIdx ? 'left' : 'right');
                                         }}
                                         className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-colors ${
@@ -3094,7 +3201,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
 
                         {/* Active column — full width, vertically scrollable */}
                         {(() => {
-                            const activeGroup = stackGroups.find(group => group.id === mobileTab);
+                            const activeGroup = visibleStackGroups.find(group => group.id === mobileTab);
                             const colTickets = groupedTickets[mobileTab] || [];
                             const colColor = activeGroup?.colorBar || 'bg-gray-500';
                             return (
@@ -3219,7 +3326,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                 }}
                             >
                                 <div style={{ display: 'inline-flex', gap: '12px', height: '100%', padding: '0 4px 12px 4px', minWidth: '100%' }}>
-                                    {stackGroups.map((group) => (
+                                    {visibleStackGroups.map((group) => (
                                         <KanbanColumn
                                             key={group.id}
                                             status={group.id}
@@ -3235,6 +3342,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                             onToggleSelect={toggleSelect}
                                             onSelectColumn={selectColumn}
                                             activeExecutionIds={activeExecutionIds}
+                                            activeRunStatusByTicket={activeRunStatusByTicket}
                                             stackBy={stackBy}
                                             groupedBy={groupedBy}
                                         />
@@ -3374,6 +3482,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     onClose={() => setShowSettings(false)}
                     projectId={activeProjectId}
                     projectName={projects.find(p => p.id === activeProjectId)?.name ?? null}
+                    laneOptions={COLUMN_ORDER.map(status => ({ id: status, label: STATUS_LABELS[status] || status }))}
+                    hiddenLaneIds={hiddenStatusIds}
+                    onLaneVisibilityChange={setLaneHidden}
                 />
             )}
 
@@ -3401,6 +3512,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     onboardingLoaded
                     && dragAnchorReady
                     && !!onboardingState.welcomeSeen
+                    && !!onboardingEvents.firstRunAt
                     && !onboardingState.coachMarks?.drag
                     && !onboardingState.hideTips
                     && !tipsHiddenThisSession
@@ -3449,6 +3561,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     <WelcomeModal
                         demoTicketId={demo ? demo.id : null}
                         onClose={() => { void patchOnboardingState({ welcomeSeen: true }); }}
+                        onStartSetup={() => setShowOnboardingWizard(true)}
                         onRunDemo={async (id) => {
                             try {
                                 await fetch('/api/run', {

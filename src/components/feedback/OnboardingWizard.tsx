@@ -20,6 +20,7 @@
 // where they left off.
 
 import { useEffect, useState, useCallback } from 'react';
+import { RECOGNISED_CLIS } from '@/lib/feedback/agentCatalog';
 
 export interface WizardOnboardingState {
     wizardCompleted?: boolean;
@@ -59,91 +60,8 @@ function tagForCandidate(kind: ScanKind | undefined): string[] {
     return [];
 }
 
-// §5.4 follow-up: per-agent variant catalogue. Each agent has at least a
-// "Standard" mode (the bare runCommand) and a "Skip permissions" / yolo mode
-// where the agent skips per-action confirmations (faster, riskier). A
-// "Custom flags" mode lets the user paste any flags they prefer — saved in
-// onboarding state so they don't retype every session.
-//
-// `installSupported` distinguishes one-click installable agents (npm-/pip-
-// shippable) from editor-bundled ones (Cursor Agent, Continue) where we
-// can only show guidance text — those agents' /api/install-agent calls
-// return a `guidanceOnly: true` response instead of running anything.
-interface AgentVariant {
-    id: string;
-    label: string;
-    flags: string;
-    help: string;
-}
-interface AgentDef {
-    id: string;
-    label: string;
-    runCommand: string;
-    installSupported: boolean;
-    installHint: string;
-    variants: AgentVariant[];
-    defaultVariantId: string;
-}
-const RECOGNISED_CLIS: AgentDef[] = [
-    {
-        id: 'Claude Code', label: 'Claude Code', runCommand: 'claude',
-        installSupported: true, installHint: 'npm i -g @anthropic-ai/claude-code',
-        variants: [
-            { id: 'standard', label: 'Standard',          flags: '',                                   help: 'Asks for permission before each edit / shell run.' },
-            { id: 'yolo',     label: 'Skip permissions',  flags: '--dangerously-skip-permissions',     help: 'No permission prompts. Faster, riskier — fine in a sandbox / disposable repo.' },
-            { id: 'custom',   label: 'Custom flags',      flags: '',                                   help: 'Paste your own flags below — e.g. `--model opus-4` or `--continue`.' },
-        ],
-        defaultVariantId: 'yolo',
-    },
-    {
-        id: 'Codex', label: 'Codex', runCommand: 'codex',
-        installSupported: true, installHint: 'npm i -g @openai/codex',
-        variants: [
-            { id: 'standard',  label: 'Suggest mode',  flags: '',             help: 'Suggests changes — you accept/reject each one.' },
-            { id: 'auto-edit', label: 'Auto-edit',     flags: '--auto-edit',  help: 'Auto-applies edits without confirmation, but still asks before shell commands.' },
-            { id: 'full-auto', label: 'Full auto',     flags: '--full-auto',  help: 'No confirmations at all — applies edits AND runs commands. Sandbox-only.' },
-            { id: 'custom',    label: 'Custom flags',  flags: '',             help: 'Paste your own flags below.' },
-        ],
-        defaultVariantId: 'auto-edit',
-    },
-    {
-        id: 'Gemini CLI', label: 'Gemini CLI', runCommand: 'gemini',
-        installSupported: true, installHint: 'npm i -g @google/gemini-cli',
-        variants: [
-            { id: 'standard', label: 'Standard',     flags: '',  help: 'Default Gemini CLI behaviour.' },
-            { id: 'custom',   label: 'Custom flags', flags: '',  help: 'Paste your own flags below — e.g. `--model gemini-1.5-pro`.' },
-        ],
-        defaultVariantId: 'standard',
-    },
-    {
-        id: 'Aider', label: 'Aider', runCommand: 'aider',
-        installSupported: true, installHint: 'pip install aider-chat',
-        variants: [
-            { id: 'standard',   label: 'Standard',      flags: '',                help: 'Confirms each commit / shell run.' },
-            { id: 'yes-always', label: 'Auto-confirm',  flags: '--yes-always',    help: 'Yes to all confirmations. Faster, riskier.' },
-            { id: 'custom',     label: 'Custom flags',  flags: '',                help: 'Paste your own flags below.' },
-        ],
-        defaultVariantId: 'yes-always',
-    },
-    {
-        id: 'Cursor Agent', label: 'Cursor Agent', runCommand: 'cursor-agent',
-        installSupported: false, installHint: 'Install Cursor (cursor.sh) — ships with cursor-agent.',
-        variants: [
-            { id: 'standard', label: 'Standard',     flags: '',  help: 'Default cursor-agent behaviour.' },
-            { id: 'custom',   label: 'Custom flags', flags: '',  help: 'Paste your own flags below.' },
-        ],
-        defaultVariantId: 'standard',
-    },
-    {
-        id: 'Continue', label: 'Continue', runCommand: 'continue',
-        installSupported: false, installHint: 'Install via continue.dev/install — editor extension, not a global CLI.',
-        variants: [
-            { id: 'standard', label: 'Standard',     flags: '',  help: 'Default Continue behaviour.' },
-            { id: 'custom',   label: 'Custom flags', flags: '',  help: 'Paste your own flags below.' },
-        ],
-        defaultVariantId: 'standard',
-    },
-];
+// Agent catalogue moved to src/lib/feedback/agentCatalog.ts so the persistent
+// terminal-header launcher can share the same source of truth.
 
 export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: OnboardingWizardProps) {
     const [step, setStep] = useState<number>(initialState.wizardStep || 1);

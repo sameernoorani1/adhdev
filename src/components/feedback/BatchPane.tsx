@@ -501,7 +501,7 @@ export function BatchPane({
 
     return (
         <>
-            {/* Backdrop — click outside to close (VD-161) */}
+            {/* Backdrop — click outside to close */}
             <div
                 className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm"
                 onClick={onClose}

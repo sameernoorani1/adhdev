@@ -1,0 +1,41 @@
+# .npmignore — defense-in-depth against private content shipping to npm.
+#
+# Note: package.json `files` is the primary whitelist; npm publishes the
+# union of `files` minus this list. These patterns exist so that even if
+# `files` accidentally widens to include a glob like `**/*.md`, no private
+# data ships.
+#
+# Keep in sync with the leak patterns in .gitignore.
+
+# Internal project state — never ship
+.adhdev/
+ADHDEV.md
+CLAUDE.md
+
+# Private docs and reports
+docs/
+audit-report.md
+build-check.md
+
+# Dev / build artifacts
+*.bak
+*.log
+.env
+.env.local
+pending-mentions.json
+.claude-preview/
+.claude-tmp/
+.tmp-tgz-audit/
+adhdev-board-*.tgz
+next-env.d.zip
+Codebase 1.zip
+.relates.txt
+.tags.txt
+*.tsbuildinfo
+
+# Test scaffolding (the runtime doesn't need it)
+tests/
+vitest.config.*
+
+# Source files (we ship the Next build output, not raw sources)
+src/

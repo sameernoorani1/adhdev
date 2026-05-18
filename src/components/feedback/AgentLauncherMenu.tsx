@@ -67,6 +67,10 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
     const [installError, setInstallError] = useState<string | null>(null);
     const [preferredAgent, setPreferredAgent] = useState<PreferredAgent | null>(null);
     const [lastVariants, setLastVariants] = useState<Record<string, string>>({});
+    // AD-296: track whether an agent is actively running so we can boost the
+    // Launch button's prominence on idle. We poll terminal-status here rather
+    // than pull from a parent prop to keep the launcher self-contained.
+    const [agentActive, setAgentActive] = useState<boolean>(false);
     const wrapperRef = useRef<HTMLDivElement>(null);
 
     // Resolve the variant we'll launch when the user clicks the parent row:
@@ -106,6 +110,29 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
         })();
         return () => { cancelled = true; };
     }, [projectId]);
+
+    // AD-296: poll terminal-status to know whether an agent is running. We
+    // only need a coarse signal (active vs idle) for the Launch button's
+    // visual weight, so a 3 s cadence is fine — and we skip when there is no
+    // project (the launch button is already disabled in that case).
+    useEffect(() => {
+        if (!projectId || !connected) {
+            setAgentActive(false);
+            return;
+        }
+        let cancelled = false;
+        const fetchStatus = async () => {
+            try {
+                const r = await fetch(`/api/terminal-status?project=${encodeURIComponent(projectId)}`);
+                if (!r.ok) return;
+                const j = await r.json();
+                if (!cancelled) setAgentActive(Boolean(j?.agentActive));
+            } catch { /* ignore — keep last known value */ }
+        };
+        fetchStatus();
+        const interval = setInterval(fetchStatus, 3000);
+        return () => { cancelled = true; clearInterval(interval); };
+    }, [projectId, connected]);
 
     // Click-outside close.
     useEffect(() => {
@@ -173,14 +200,24 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
     }, [installing, projectId]);
 
     const buttonDisabled = !connected || !projectId;
+    // AD-296: when an agent isn't running we want the Launch button to read
+    // as the obvious next step. Bumps text size + gold accent + ring. Active
+    // sessions keep the low-key tertiary look so it doesn't compete with
+    // the live terminal output.
+    const idleProminent = !buttonDisabled && !agentActive;
+    const launchButtonClass = buttonDisabled
+        ? 'text-[9px] px-1.5 py-0.5 text-vd-text-tertiary opacity-50 cursor-not-allowed'
+        : idleProminent
+            ? 'text-[10px] px-2 py-1 text-vd-accent-gold bg-vd-accent-gold/10 ring-1 ring-vd-accent-gold/40 hover:bg-vd-accent-gold/20'
+            : 'text-[9px] px-1.5 py-0.5 text-vd-text-tertiary hover:text-vd-text-secondary hover:bg-vd-bg-tertiary';
 
     return (
         <div ref={wrapperRef} className="relative z-[120]">
             <button
                 onClick={() => setOpen(o => !o)}
                 disabled={buttonDisabled}
-                className={`text-[9px] px-1.5 py-0.5 rounded flex items-center gap-1 ${buttonDisabled ? 'text-vd-text-tertiary opacity-50 cursor-not-allowed' : 'text-vd-text-tertiary hover:text-vd-text-secondary hover:bg-vd-bg-tertiary'}`}
-                title={buttonDisabled ? 'Connect a terminal session first' : 'Launch a coding agent'}
+                className={`${launchButtonClass} rounded flex items-center gap-1`}
+                title={buttonDisabled ? 'Connect a terminal session first' : agentActive ? 'Launch a coding agent' : 'Launch a coding agent — none running'}
             >
                 <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                     <path d="M3.5 2.5 L12.5 8 L3.5 13.5 z" />
@@ -204,7 +241,28 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
                             </svg>
                         </button>
                     </div>
-                    {RECOGNISED_CLIS.map(agent => {
+                    {/* AD-296: while detection is in flight (and no cached
+                        probe yet), render each row as a 'detecting…'
+                        skeleton instead of defaulting to Install. Otherwise
+                        every agent flashes 'Install' for ~1 s before
+                        flipping to Run on cached installs, which Sameer
+                        flagged as misleading on first open. */}
+                    {(probeLoading && Object.keys(probe).length === 0) ? (
+                        RECOGNISED_CLIS.map(agent => (
+                            <div key={agent.id} className="w-full px-3 py-1.5 text-[11px] flex items-center gap-2.5 opacity-70" aria-busy="true">
+                                <span className="text-vd-text-tertiary">
+                                    {agentIcon(agent.id, 'w-4 h-4')}
+                                </span>
+                                <span className="flex-1 text-vd-text-secondary">{agent.label}</span>
+                                <span className="text-[9px] text-vd-text-tertiary flex items-center gap-1">
+                                    <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
+                                        <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.582m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                    </svg>
+                                    Detecting…
+                                </span>
+                            </div>
+                        ))
+                    ) : RECOGNISED_CLIS.map(agent => {
                         const status = probe[agent.id];
                         const isInstalled = status?.installed === true;
                         const isHovered = hoveredAgent === agent.id;

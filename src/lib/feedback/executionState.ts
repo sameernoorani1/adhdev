@@ -37,6 +37,13 @@ export function isTicketExecutionActive(
             if (String(activeId || '').toUpperCase() === id) return true;
         }
     }
+    // AD-232: a done/reviewed ticket can never be 'in progress' by definition.
+    // When the AD-284 write race leaves `execution.status` stuck as
+    // 'in_progress' after `ticket.status` has flipped to a terminal state,
+    // the running pill would stay lit until the 45 s freshness window
+    // expired. Gate on ticket.status so the visible state self-heals on the
+    // next render instead of waiting for the heartbeat-stale clock.
+    if (ticket.status === 'done' || ticket.status === 'reviewed') return false;
     if (ticket.execution?.status !== 'in_progress') return false;
     const updatedAtRaw = ticket.execution?.updatedAt;
     if (!updatedAtRaw) return false;
@@ -58,5 +65,12 @@ export function isTicketExecutionActive(
 // tickets after a hard server crash get cleaned by `recoverStaleInProgressTickets`
 // at next startup.
 export function isTicketExecutionInProgress(ticket: TicketExecutionShape): boolean {
+    // AD-232: same defensive gate as isTicketExecutionActive — a ticket whose
+    // work status is done/reviewed cannot legitimately have a still-running
+    // execution. The AD-284 cross-process write race intermittently leaves
+    // execution.status stuck as 'in_progress' after the status flip; without
+    // this guard the mascot would animate on a closed ticket until the next
+    // server-side sweep (~30 s) or page reload.
+    if (ticket.status === 'done' || ticket.status === 'reviewed') return false;
     return ticket.execution?.status === 'in_progress';
 }

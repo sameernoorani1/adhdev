@@ -82,7 +82,7 @@ export function NewTicketModal({
         }
     }, [open]);
 
-    // Auto-upload dropped files when modal opens with them (VD-024)
+    // Auto-upload dropped files when modal opens with them
     useEffect(() => {
         if (!open || !droppedFiles || droppedFiles.length === 0) return;
         const uploadDropped = async () => {
@@ -163,7 +163,7 @@ export function NewTicketModal({
         return () => window.removeEventListener('paste', handleGlobalPaste);
     }, [handleGlobalPaste]);
 
-    // VD-072: Full-screen drag-drop on new ticket modal
+    // Full-screen drag-drop on new ticket modal
     const handleDragOver = useCallback((e: React.DragEvent) => {
         e.preventDefault();
         e.stopPropagation();
@@ -221,7 +221,7 @@ export function NewTicketModal({
 
     const handleSubmit = async () => {
         if (!title.trim()) return;
-        if (submitting) return; // Prevent double-submit (VD-055)
+        if (submitting) return; // Prevent double-submit
         setSubmitting(true);
 
         try {
@@ -267,7 +267,7 @@ export function NewTicketModal({
             {/* Backdrop */}
             <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
 
-            {/* Full-screen drag overlay (VD-072) */}
+            {/* Full-screen drag overlay */}
             {isDraggingOver && (
                 <div className="absolute inset-0 z-[65] bg-vd-accent-gold/10 border-4 border-dashed border-vd-accent-gold/50 flex items-center justify-center pointer-events-none">
                     <div className="bg-vd-bg-secondary/90 rounded-xl px-8 py-6 text-center shadow-xl">
@@ -304,7 +304,7 @@ export function NewTicketModal({
 
                 {/* Body */}
                 <div className="p-5 space-y-4">
-                    {/* Ticket mode toggle (VD-170) — Normal vs Discussion (safety lock) */}
+                    {/* Ticket mode toggle — Normal vs Discussion (safety lock) */}
                     <div className="flex gap-2">
                         <button
                             onClick={() => setTicketType('normal')}
@@ -398,7 +398,7 @@ export function NewTicketModal({
                                 <option value="low">Low</option>
                             </select>
                         </div>
-                        {/* AI Addressable checkbox removed — batch selection replaced it (VD-155) */}
+                        {/* AI Addressable checkbox removed — batch selection replaced it */}
                         <div>
                             <label className="text-xs text-vd-text-tertiary uppercase tracking-wider">Mission</label>
                             <select

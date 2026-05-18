@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { getActiveProject, getProjectBoardPath, initProjectDir, getProjectById } from './registry';
 import { ensureAdhdevProtocol, getDefaultExecutionContract, buildInlineContractNotice, type AdhdevExecutionContract } from './protocol';
-import { normalizeRuns, sweepStaleRuns } from './runs';
+import { ACTIVE_RUN_STATUSES, normalizeRuns, sweepStaleRuns } from './runs';
 
 function getFeedbackPath(projectId?: string | null): string {
     const project = getProjectById(projectId) || getActiveProject();
@@ -73,6 +73,7 @@ export interface FeedbackTicket {
         from?: string;
         to?: string;
         targetAgent?: string;
+        reason?: string;
     }[];
     createdAt: string;
     updatedAt: string;
@@ -132,6 +133,7 @@ export interface FeedbackRun {
     projectId?: string | null;
     ticketIds: string[];
     status: 'dispatching' | 'running' | 'finishing' | 'done' | 'blocked' | 'failed' | 'interrupted' | 'stale';
+    source?: 'ui-run' | 'agent-claim' | 'terminal-run';
     terminalSessionId?: string | null;
     agent: string;
     startedAt: string;
@@ -347,6 +349,30 @@ export function readFeedback(projectId?: string | null): FeedbackData {
     return data;
 }
 
+// AD-307 reopen: async sibling of `readFeedback`. Same shape, but `readFile`
+// is non-blocking so a 2.6 MB board doesn't freeze the event loop during a
+// heartbeat. Bootstrap helpers (`mkdirSync`, `existsSync`, `initProjectDir`,
+// `ensureAdhdevProtocol`) stay sync because they're one-time first-run paths
+// — the hot per-beat cost is the actual `readFile`, which is now async.
+export async function readFeedbackAsync(projectId?: string | null): Promise<FeedbackData> {
+    const feedbackPath = getFeedbackPath(projectId);
+    const dir = path.dirname(feedbackPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    if (!fs.existsSync(feedbackPath)) {
+        initProjectDir(path.dirname(dir));
+    }
+    ensureAdhdevProtocol(path.dirname(dir));
+    const raw = await fs.promises.readFile(feedbackPath, 'utf-8');
+    const data = normalizeFeedbackData(JSON.parse(raw));
+    const contractNotice = buildInlineContractNotice(getDefaultExecutionContract());
+    if (Array.isArray(data.tickets)) {
+        for (const ticket of data.tickets) {
+            ticket._executionContract = contractNotice;
+        }
+    }
+    return data;
+}
+
 // AD-209: per-project async lock around read-modify-write. Two PATCHes racing
 // the same board would each `readFeedback`, mutate, then `writeFeedback` —
 // last writer wins, first writer's changes silently lost. The single-process
@@ -380,6 +406,14 @@ export function sweepStaleExecutions(data: FeedbackData): boolean {
     const now = new Date().toISOString();
     const nowMs = Date.now();
     let changed = false;
+    const runsChanged = sweepStaleRuns(data, now);
+    const liveRunTicketIds = new Set<string>();
+    if (Array.isArray(data.activeRuns)) {
+        for (const run of data.activeRuns) {
+            if (!ACTIVE_RUN_STATUSES.has(run.status)) continue;
+            for (const id of run.ticketIds || []) liveRunTicketIds.add(String(id || '').toUpperCase());
+        }
+    }
     for (const ticket of data.tickets) {
         const exec = ticket.execution;
         if (!exec || exec.status !== 'in_progress') continue;
@@ -398,6 +432,7 @@ export function sweepStaleExecutions(data: FeedbackData): boolean {
         }
 
         if (!ACTIVE_WORK_STATUSES.has(ticket.status)) {
+            if (liveRunTicketIds.has(String(ticket.id || '').toUpperCase())) continue;
             const updatedAtMs = exec.updatedAt ? new Date(exec.updatedAt).getTime() : 0;
             if (Number.isFinite(updatedAtMs) && nowMs - updatedAtMs > STALE_RUN_MS) {
                 ticket.execution = {
@@ -411,7 +446,7 @@ export function sweepStaleExecutions(data: FeedbackData): boolean {
             }
         }
     }
-    return sweepStaleRuns(data, now) || changed;
+    return runsChanged || changed;
 }
 
 // AD-232: per-project sweep rate-limit. The /api/feedback GET hits often
@@ -450,6 +485,61 @@ export async function withFeedbackLock<T>(
 // POSIX, and on Windows fs.renameSync replaces the destination atomically as
 // long as both paths are on the same filesystem (the tmp lives next to the
 // target, so they are).
+// AD-307: Windows AV / Search Indexer briefly opens board.json during writes,
+// so fs.renameSync('.tmp' -> 'board.json') intermittently throws EPERM/EBUSY.
+// The throw both fails that heartbeat AND blocks the per-project lock chain,
+// piling up queued requests until the renderer crashes. Retry on transient
+// codes with bounded sync sleeps — budget short enough not to starve the lock.
+const RETRYABLE_RENAME_CODES = new Set(['EPERM', 'EBUSY', 'EACCES', 'EEXIST']);
+const RENAME_MAX_ATTEMPTS = 6;
+const RENAME_RETRY_MS = 50;
+
+function syncSleep(ms: number) {
+    try {
+        const buf = new Int32Array(new SharedArrayBuffer(4));
+        Atomics.wait(buf, 0, 0, ms);
+    } catch {
+        const end = Date.now() + ms;
+        while (Date.now() < end) { /* fallback spin */ }
+    }
+}
+
+function renameWithRetry(src: string, dest: string) {
+    for (let attempt = 0; attempt < RENAME_MAX_ATTEMPTS; attempt++) {
+        try {
+            fs.renameSync(src, dest);
+            return;
+        } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code || '';
+            if (!RETRYABLE_RENAME_CODES.has(code) || attempt === RENAME_MAX_ATTEMPTS - 1) {
+                throw err;
+            }
+            syncSleep(RENAME_RETRY_MS);
+        }
+    }
+}
+
+// AD-307 reopen: async sibling of renameWithRetry. The heartbeat handler
+// fires every 10 s during a run, and `fs.renameSync` (plus `writeFileSync`
+// upstream) blocks the entire Node event loop — so a ~2 s write on Windows
+// during AV scan freezes *all* in-flight HTTP requests, not just same-project
+// ones. The async path yields to the event loop between attempts and during
+// the rename itself, so cross-project UI stays responsive.
+async function renameWithRetryAsync(src: string, dest: string) {
+    for (let attempt = 0; attempt < RENAME_MAX_ATTEMPTS; attempt++) {
+        try {
+            await fs.promises.rename(src, dest);
+            return;
+        } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code || '';
+            if (!RETRYABLE_RENAME_CODES.has(code) || attempt === RENAME_MAX_ATTEMPTS - 1) {
+                throw err;
+            }
+            await new Promise(resolve => setTimeout(resolve, RENAME_RETRY_MS));
+        }
+    }
+}
+
 export function writeFeedback(data: FeedbackData | Record<string, unknown>, projectId?: string | null) {
     const feedbackPath = getFeedbackPath(projectId);
     const normalized = isFeedbackData(data) ? normalizeFeedbackData(data) : data;
@@ -468,9 +558,39 @@ export function writeFeedback(data: FeedbackData | Record<string, unknown>, proj
     const tmp = `${feedbackPath}.tmp-${process.pid}-${Date.now().toString(36)}`;
     try {
         fs.writeFileSync(tmp, payload, 'utf-8');
-        fs.renameSync(tmp, feedbackPath);
+        renameWithRetry(tmp, feedbackPath);
     } catch (err) {
         try { fs.unlinkSync(tmp); } catch {}
+        throw err;
+    }
+}
+
+// AD-307 reopen: async write for the high-frequency heartbeat path. Same
+// atomic temp-then-rename contract as `writeFeedback`, but yields to the
+// event loop so other-project requests (project switch, image paste, board
+// GETs on a different project) aren't blocked behind heartbeat I/O.
+export async function writeFeedbackAsync(
+    data: FeedbackData | Record<string, unknown>,
+    projectId?: string | null,
+): Promise<void> {
+    const feedbackPath = getFeedbackPath(projectId);
+    const normalized = isFeedbackData(data) ? normalizeFeedbackData(data) : data;
+    const persistShape = isFeedbackData(normalized as FeedbackData)
+        ? {
+            ...(normalized as FeedbackData),
+            tickets: (normalized as FeedbackData).tickets.map(ticket => {
+                const { _executionContract: _omit, ...rest } = ticket;
+                return rest as FeedbackTicket;
+            }),
+        }
+        : normalized;
+    const payload = JSON.stringify(persistShape, null, 2) + '\n';
+    const tmp = `${feedbackPath}.tmp-${process.pid}-${Date.now().toString(36)}`;
+    try {
+        await fs.promises.writeFile(tmp, payload, 'utf-8');
+        await renameWithRetryAsync(tmp, feedbackPath);
+    } catch (err) {
+        try { await fs.promises.unlink(tmp); } catch {}
         throw err;
     }
 }
@@ -536,7 +656,7 @@ export function resolveTicketById(data: FeedbackData, ticketId: string): TicketL
         return {
             ok: false,
             status: 409,
-            error: `Ticket ${ticketId} is duplicated in FEEDBACK.json (${matches.length} matches). Repair the board data before updating this ticket.`,
+            error: `Ticket ${ticketId} is duplicated in .adhdev/board.json (${matches.length} matches). Repair the board data before updating this ticket.`,
         };
     }
 
@@ -560,14 +680,14 @@ export function getDefaultAgentRules(): AgentRules {
         global: {
             forbiddenStatuses: ['reviewed', 'observe', 'deferred'],
             sessionStart: [
-                'Read FEEDBACK.json fresh — never use cached data.',
+                'Read .adhdev/board.json fresh — never use cached data.',
                 'Process tickets where aiAddressable === true and status is reopen/todo.',
                 'Reopen > todo. Within status: critical > high > medium > low. Within priority: oldest first (FIFO).',
                 'reopenCount >= 2 boosts effective priority by one tier.',
                 '@MENTION CHECK: Scan ALL ticket comments for @ai, @claude, @codex, or @chatgpt mentions. Reply to each with your answer via POST /api/feedback/{id}/comments. Discussion only — do NOT change status or start implementation for @mentions.',
             ],
             commentRules: [
-                'HARD GATE: You cannot move a ticket to "done" without an AI comment. The API returns 403. Use POST /api/feedback/agent-claim to claim a ticket (auto-creates comment) OR POST /api/feedback/{id}/comments manually.',
+                'HARD GATE: Before implementation, use POST /api/feedback/agent-claim to claim the ticket. This opens the live running state and auto-creates the plan comment. Do not rely on passive comments to start running state.',
                 "Use authorType: 'ai' and your agent name in all API calls.",
                 'Add activity entries for every status change.',
                 'Never re-comment if your last comment is the most recent — POST /api/feedback/agent-claim returns 409 if stale.',

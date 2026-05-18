@@ -30,8 +30,12 @@ Bugs, feature requests, weird behaviour — all live at [GitHub Issues](https://
 
 ## Code of conduct
 
-Be kind. Argue ideas, not people.
+Be kind. Argue ideas, not people. Full text in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
-## License
+## Contributor License Agreement
 
-By contributing, you agree your work ships under [Apache 2.0](LICENSE). No CLA required.
+ADHDev is dual-licensed (AGPL-3.0-or-later open-source + commercial license for companies that need different terms — see [LICENSING.md](LICENSING.md)). For that to keep working, all external contributions need to come in under a Contributor License Agreement: you keep the copyright to what you wrote, but you grant Sameer (the project owner) a license broad enough to re-license the project under commercial terms when needed.
+
+The full text is in [CLA.md](CLA.md). The PR template has a checkbox to confirm you've read and agreed.
+
+If you're a first-time contributor and the CLA is a blocker, open an issue or email **sameernoorani@gmail.com** and we'll figure it out.

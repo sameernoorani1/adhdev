@@ -496,7 +496,7 @@ function CopyButton({ text }: { text: string }) {
     );
 }
 
-/** VD-190: How many entries to show by default before "Load earlier" */
+/** How many entries to show by default before "Load earlier" */
 const DEFAULT_VISIBLE_ENTRIES = 12;
 
 function getCommentDisplayText(comment: Comment): string {
@@ -565,7 +565,7 @@ export function CommentTimeline({ comments, activity, onDeleteComment, onImageCl
         return <p className="text-sm text-vd-text-tertiary italic">No activity yet</p>;
     }
 
-    // VD-190: Show last N entries by default, "Load earlier" for the rest
+    // Show last N entries by default, "Load earlier" for the rest
     const needsPagination = entries.length > DEFAULT_VISIBLE_ENTRIES && !showAll;
     const hiddenCount = needsPagination ? entries.length - DEFAULT_VISIBLE_ENTRIES : 0;
     const visibleEntries = needsPagination ? entries.slice(-DEFAULT_VISIBLE_ENTRIES) : entries;

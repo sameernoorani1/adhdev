@@ -23,7 +23,7 @@ function buildPrompt(tickets: Ticket[]): string {
 }
 
 function getCreatorLabel(ticket: Ticket & { sourceMessageId?: string; createdByType?: 'human' | 'ai' | 'system' }): string {
-    if (ticket.sourceMessageId) return `AI for ${ticket.reporter || 'Sameer'}`;
+    if (ticket.sourceMessageId) return `AI for ${ticket.reporter || 'you'}`;
     const createdActivity = ticket.activity?.find(entry => entry.action === 'created');
     const createdByType = ticket.createdByType || createdActivity?.byType;
     if (createdByType === 'ai' || createdByType === 'system' || ticket.tags?.includes('ai')) return 'AI';
@@ -282,7 +282,7 @@ interface TicketDetailModalProps {
     onSelectTicket?: (ticketId: string) => void;
 }
 
-/** VD-190: Description block with "See more" truncation for long descriptions */
+/** Description block with "See more" truncation for long descriptions */
 const DESC_MAX_LINES = 12;
 function DescriptionBlock({ description }: { description: string }) {
     const [expanded, setExpanded] = useState(false);
@@ -394,7 +394,7 @@ export function TicketDetailModal({
     const [editMissionId, setEditMissionId] = useState('');
     const [editWave, setEditWave] = useState('');
     const [editSession, setEditSession] = useState('');
-    // VD-191: Track images during edit mode (add/remove)
+    // Track images during edit mode (add/remove)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const [editImages, setEditImages] = useState<any[]>([]);
 
@@ -463,8 +463,8 @@ export function TicketDetailModal({
         return undefined;
     }, [desktopViewport, effectiveInset, activePlacement, terminalVisible]);
 
-    // Upload file helper for drag-drop and paste (VD-024)
-    // VD-191: Routes to editImages when in edit mode, commentImages otherwise
+    // Upload file helper for drag-drop and paste
+    // Routes to editImages when in edit mode, commentImages otherwise
     const uploadAndAdd = useCallback(async (files: File[]) => {
         if (files.length === 0) return;
         showToast(`Uploading ${files.length} file${files.length > 1 ? 's' : ''}...`);
@@ -501,7 +501,7 @@ export function TicketDetailModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isEditing]);
 
-    // Full-screen drag-drop handler (VD-024: drop anywhere adds to comment images)
+    // Full-screen drag-drop handler (drop anywhere adds to comment images)
     const handleModalDragOver = useCallback((e: React.DragEvent) => {
         e.preventDefault();
         e.stopPropagation();
@@ -511,7 +511,7 @@ export function TicketDetailModal({
 
     const handleModalDragLeave = useCallback((e: React.DragEvent) => {
         e.stopPropagation();
-        // VD-072 fix: timer-based dismiss — if no dragover fires within 150ms, the drag truly left
+        // fix: timer-based dismiss — if no dragover fires within 150ms, the drag truly left
         if (dragLeaveTimer.current) clearTimeout(dragLeaveTimer.current);
         dragLeaveTimer.current = setTimeout(() => setIsDraggingOver(false), 150);
     }, []);
@@ -526,7 +526,7 @@ export function TicketDetailModal({
         }
     }, [uploadAndAdd]);
 
-    // Global paste handler — paste images anywhere in modal adds to comment images (VD-023 + VD-024)
+    // Global paste handler — paste images anywhere in modal adds to comment images (+ )
     useEffect(() => {
         if (!open) return;
         const handlePaste = (e: ClipboardEvent) => {
@@ -665,13 +665,13 @@ export function TicketDetailModal({
         setEditMissionId(ticket.missionId || '');
         setEditWave(ticket.wave || '');
         setEditSession(ticket.session || '');
-        // VD-191: Initialize edit images from ticket
+        // Initialize edit images from ticket
         setEditImages([...ticket.images]);
         setIsEditing(true);
     };
 
     const handleSaveEdit = () => {
-        // VD-191: Save images along with title/description
+        // Save images along with title/description
         onUpdate(ticket.id, {
             title: editTitle,
             description: editDescription,
@@ -703,7 +703,7 @@ export function TicketDetailModal({
 
     const handleSubmitComment = async () => {
         if (!commentText.trim() && commentImages.length === 0) return;
-        if (submittingComment) return; // Prevent double-submit (VD-055)
+        if (submittingComment) return; // Prevent double-submit
         const pendingText = commentText;
         const pendingImages = commentImages;
         setSubmittingComment(true);
@@ -741,7 +741,7 @@ export function TicketDetailModal({
                 {/* Backdrop */}
                 <div className={`absolute inset-0 bg-black/60 ${terminalVisible && desktopViewport ? '' : 'backdrop-blur-sm'}`} onClick={onClose} />
 
-                {/* Full-screen drag overlay (VD-024) */}
+                {/* Full-screen drag overlay */}
                 {isDraggingOver && (
                     <div className="absolute inset-0 z-[65] bg-vd-accent-gold/10 border-4 border-dashed border-vd-accent-gold/50 flex items-center justify-center pointer-events-none">
                         <div className="bg-vd-bg-secondary/90 rounded-xl px-8 py-6 text-center shadow-xl">
@@ -752,7 +752,7 @@ export function TicketDetailModal({
                     </div>
                 )}
 
-                {/* Toast (VD-023: near comment area for visibility) */}
+                {/* Toast (near comment area for visibility) */}
                 {toast && (
                     <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-[70] px-4 py-2 rounded-lg bg-vd-accent-gold/90 text-vd-bg-primary text-xs font-medium shadow-lg animate-in fade-in slide-in-from-bottom-2 duration-200">
                         {toast}
@@ -784,7 +784,7 @@ export function TicketDetailModal({
                                         ↻ Reopened {ticket.reopenCount}×
                                     </span>
                                 )}
-                                {/* Discussion/Normal toggle (VD-170) */}
+                                {/* Discussion/Normal toggle */}
                                 <button
                                     onClick={() => {
                                         const isDiscussion = ticket.ticketType === 'idea' || ticket.ticketType === 'discussion';
@@ -1208,7 +1208,7 @@ export function TicketDetailModal({
 
 
                         {/* Ticket images / attachments */}
-                        {/* VD-191: In edit mode, show editImages with remove buttons + drop zone */}
+                        {/* In edit mode, show editImages with remove buttons + drop zone */}
                         {isEditing ? (
                             <div>
                                 <h4 className="text-xs text-vd-text-tertiary uppercase tracking-wider mb-2">Attachments</h4>

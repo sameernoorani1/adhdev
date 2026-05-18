@@ -25,7 +25,7 @@ function npmGlobalInstallCommand(packageName: string): string {
 
 const INSTALL_COMMANDS: Record<string, string> = {
     'Claude Code':  npmGlobalInstallCommand('@anthropic-ai/claude-code@latest'),
-    'Codex':        npmGlobalInstallCommand('@openai/codex'),
+    'Codex':        npmGlobalInstallCommand('@openai/codex@latest'),
     'Gemini CLI':   npmGlobalInstallCommand('@google/gemini-cli'),
     'Aider':        'pip install -U aider-chat',
     // Cursor Agent ships with the Cursor IDE — there's no CLI install command.

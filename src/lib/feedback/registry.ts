@@ -102,7 +102,7 @@ export function initProjectDir(projectPath: string, prefix: string = 'AD') {
         fs.writeFileSync(configPath, JSON.stringify({ prefix, agents: ['Claude Code'] }, null, 2) + '\n');
     }
 
-    ensureAdhdevProtocol(projectPath, prefix);
+    ensureAdhdevProtocol(projectPath, prefix, { writeClaudeMdRef: true });
 
     // Ensure uploads dir
     const uploadsDir = path.join(adhdevDir, 'uploads');

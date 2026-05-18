@@ -45,7 +45,7 @@ import { ChatPane } from './ChatPane';
 import { OnboardingWizard } from './OnboardingWizard';
 import { fetchWithAdhdevToken } from '@/lib/api/sessionToken';
 
-// ADHDev brand icon — detailed brain with multi-directional arrows (VD-113, v2 SVG)
+// ADHDev brand icon — detailed brain with multi-directional arrows (v2 SVG)
 function ADHDevIcon({ className = 'w-6 h-6' }: { className?: string }) {
     return (
         <svg className={className} viewBox="0 0 200 194" fill="none">
@@ -68,7 +68,7 @@ function ADHDevIcon({ className = 'w-6 h-6' }: { className?: string }) {
     );
 }
 
-// ADHDev brand text with Press Start 2P pixel font (VD-113, VD-169)
+// ADHDev brand text with Press Start 2P pixel font
 function ADHDevBrand({ size = 'sm' }: { size?: 'sm' | 'xs' | 'base' }) {
     const textClass = size === 'base' ? 'text-sm' : size === 'xs' ? 'text-[7px]' : 'text-xs';
     return (
@@ -176,9 +176,8 @@ const PRIORITY_SORT_ORDER: Record<string, number> = {
     low: 3,
 };
 const FEEDBACK_POLL_MS = 2500;
-// AD-012: renamed from the legacy 'vibedeck-feedback-board' channel. Worst
-// case during the cutover is a stale tab missing one round of cross-tab
-// updates until it refreshes.
+// AD-012: cross-tab broadcast channel. Renamed in the past; worst case during
+// a cutover is a stale tab missing one round of cross-tab updates until refresh.
 const FEEDBACK_BROADCAST_CHANNEL = 'adhdev-feedback-board';
 
 type PriorityFilter = Ticket['priority'];
@@ -291,7 +290,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // Selection state for "Copy for AI" workflow (ephemeral — resets on reload)
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
-    // Batch state — loaded from API (FEEDBACK.json), synced via fetchData polling
+    // Batch state — loaded from API (.adhdev/board.json), synced via fetchData polling
     const [batches, setBatches] = useState<Batch[]>([]);
     const [showBatchPane, setShowBatchPane] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
@@ -302,7 +301,10 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     });
     const [showProjectSwitcher, setShowProjectSwitcher] = useState(false);
     const [switchingProjectId, setSwitchingProjectId] = useState<string | null>(null);
-    const [showAddProjectForm, setShowAddProjectForm] = useState(false);
+    // AD-286: "+ Add project" now launches the full OnboardingWizard (folder
+    // pick + agent + git posture) instead of the legacy 3-field inline form,
+    // matching the first-run flow.
+    const [showAddProjectWizard, setShowAddProjectWizard] = useState(false);
     // AD-128: flag a broken or outdated system `claude` so Run / manual REPL use isn't silently stuck.
     const [claudeHealth, setClaudeHealth] = useState<{ ok: boolean; version: string | null; outdated: boolean; error: string | null } | null>(null);
     const [claudeBannerDismissed, setClaudeBannerDismissed] = useState<boolean>(() => {
@@ -322,10 +324,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         if (typeof window === 'undefined') return false;
         return sessionStorage.getItem('adhdev-tips-hidden-session') === '1';
     });
-    const [newProjectPath, setNewProjectPath] = useState('');
-    const [newProjectName, setNewProjectName] = useState('');
-    const [newProjectPrefix, setNewProjectPrefix] = useState('AD');
-    const [isAddingProject, setIsAddingProject] = useState(false);
     // AD-011: configured user display name. Replaces hardcoded 'Sameer' in
     // optimistic comments + mission decision authoring. Refetched on project
     // switch so the per-project config is honoured.
@@ -388,6 +386,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // OR a `?wizard=onboarding` query-param escape hatch so the user can replay
     // the wizard without resetting state.
     const [showOnboardingWizard, setShowOnboardingWizard] = useState(false);
+    const [onboardingWizardStartStep, setOnboardingWizardStartStep] = useState<number | null>(null);
     const [onboardingEvents, setOnboardingEvents] = useState<Record<string, string>>({});
     // AD-130 fix: gate any onboarding UI until the initial GET completes, otherwise
     // the welcome modal flashes on every page load before the fetch resolves.
@@ -472,6 +471,29 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         toastTimer.current = setTimeout(() => setToast(null), duration);
     }, []);
 
+    const openFeedbackIssue = useCallback(() => {
+        const activeProject = projects.find(project => project.id === activeProjectId);
+        const body = [
+            '## What happened?',
+            '',
+            '',
+            '## What did you expect?',
+            '',
+            '',
+            '## ADHDev diagnostics',
+            '',
+            `- Project: ${activeProject?.name || 'Unknown'}`,
+            `- Tickets: ${data?.tickets.length ?? 0}`,
+            `- Active runs: ${data?.activeRuns?.filter(run => ['dispatching', 'running', 'finishing'].includes(run.status)).length ?? 0}`,
+            `- Browser: ${typeof navigator !== 'undefined' ? navigator.userAgent : 'Unknown'}`,
+        ].join('\n');
+        const params = new URLSearchParams({
+            title: 'Feedback: ',
+            body,
+        });
+        window.open(`https://github.com/sameernoorani1/adhdev/issues/new?${params.toString()}`, '_blank', 'noopener,noreferrer');
+    }, [activeProjectId, data?.activeRuns, data?.tickets.length, projects]);
+
     const toggleSelect = useCallback((id: string) => {
         setSelectedIds(prev => {
             const next = new Set(prev);
@@ -530,7 +552,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         await syncBatches();
     }, [selectedIds, batches.length, syncBatches]);
 
-    // Plan batches from selected tickets — copies AI prompt to clipboard (VD-158)
+    // Plan batches from selected tickets — copies AI prompt to clipboard
     const handleBatchFromSelected = useCallback(async () => {
         if (selectedIds.size === 0) return;
         const ids = Array.from(selectedIds);
@@ -737,39 +759,67 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         }
     }, [showToast]);
 
-    const handleAddProject = useCallback(async () => {
-        const path = newProjectPath.trim();
-        const name = newProjectName.trim();
-        const prefix = (newProjectPrefix.trim() || 'AD').toUpperCase();
+    // AD-286: invoked when the wizard's "Add new project" Finish button fires.
+    // Creates the project, makes it active, applies the wizard's collected
+    // onboarding state to the *new* project (the wizard deferred persistence
+    // because the new project didn't exist mid-flow), and refreshes data.
+    const handleCreateProjectFromWizard = useCallback(async (state: {
+        folderSource?: 'existing' | 'new' | null;
+        folderPath?: string | null;
+        agentDetected?: string | null;
+        populated?: boolean;
+        gitPosture?: 'experiment' | 'github' | 'remote' | null;
+        remoteUrl?: string | null;
+        preferredAgent?: { id: string; variantId: string; customFlags?: string } | null;
+    }) => {
+        const path = (state.folderPath || '').trim();
         if (!path) {
             showToast('Project path is required.', 3000);
             return;
         }
-
-        setIsAddingProject(true);
         try {
             const res = await fetch('/api/projects', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path, name: name || undefined, prefix }),
+                body: JSON.stringify({ path }),
             });
             const result = await res.json();
             if (!res.ok || !result.project) {
                 showToast(result.error || 'Failed to add project.', 4000);
                 return;
             }
-
             const addedProject = result.project;
             setProjects(prev => {
                 const withoutExisting = prev.filter(project => project.id !== addedProject.id);
                 return [...withoutExisting, addedProject];
             });
             setActiveProjectId(addedProject.id);
-            setShowAddProjectForm(false);
             setShowProjectSwitcher(false);
-            setNewProjectPath('');
-            setNewProjectName('');
-            setNewProjectPrefix('AD');
+            setShowAddProjectWizard(false);
+
+            // Apply the wizard's collected state to the new (now active) project.
+            // registerProject already flips the active project in the registry,
+            // so the PATCH below lands on the new project's config.
+            try {
+                await fetch('/api/onboarding', {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        onboardingState: {
+                            wizardCompleted: true,
+                            wizardStep: 4,
+                            folderSource: state.folderSource,
+                            folderPath: state.folderPath,
+                            agentDetected: state.agentDetected,
+                            populated: state.populated,
+                            gitPosture: state.gitPosture,
+                            remoteUrl: state.remoteUrl,
+                            preferredAgent: state.preferredAgent,
+                        },
+                    }),
+                });
+            } catch { /* non-fatal — project still created */ }
+
             const feedbackRes = await fetch('/api/feedback');
             if (feedbackRes.ok) {
                 const nextData = await feedbackRes.json();
@@ -779,13 +829,11 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             showToast(`Added ${addedProject.name}.`, 3000);
         } catch {
             showToast('Failed to add project.', 4000);
-        } finally {
-            setIsAddingProject(false);
         }
-    }, [newProjectName, newProjectPath, newProjectPrefix, showToast]);
+    }, [showToast]);
 
     const formatBatchForCopy = useCallback((batch: Batch, index: number, total: number) => {
-        // Exclude done/reviewed/observe tickets from the copy (VD-065)
+        // Exclude done/reviewed/observe tickets from the copy
         const doneStatuses = new Set(['done', 'reviewed', 'observe', 'deferred']);
         const activeIds = batch.ticketIds.filter(id => {
             const t = data?.tickets.find(tk => tk.id === id);
@@ -975,6 +1023,12 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 body: JSON.stringify({ onboardingState: patch }),
             });
         } catch { /* optimistic update already applied */ }
+    }, []);
+
+    const openCodebaseScan = useCallback(() => {
+        setOnboardingWizardStartStep(3);
+        setOnboardingState(prev => ({ ...prev, wizardStep: 3, folderSource: 'existing' }));
+        setShowOnboardingWizard(true);
     }, []);
 
     // AD-127: re-apply theme whenever the active project changes so each
@@ -1193,6 +1247,8 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // AD-189: showPlanChoice removed — Plan Batches button moved into BatchPane.
     const [showFilters, setShowFilters] = useState(false);
     const filterRef = useRef<HTMLDivElement>(null);
+    const newTicketButtonRef = useRef<HTMLButtonElement | null>(null);
+    const brainDumpButtonRef = useRef<HTMLButtonElement | null>(null);
     const liveActiveRun = useMemo(() => {
         const runs = data?.activeRuns || [];
         return runs.find(run => run.status === 'running' || run.status === 'finishing')
@@ -1204,7 +1260,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     const terminalRequestRunning = terminalRuntime.requestStatus === 'running';
     const terminalRunRunning = terminalRequestRunning || liveActiveRun?.status === 'running' || liveActiveRun?.status === 'finishing';
     const terminalAgentRunning = terminalRuntime.agentStatus === 'running';
-    const terminalAgentName = terminalRuntime.agentName || liveActiveRun?.agent || 'Agent';
+    const terminalAgentName = terminalRunRunning && liveActiveRun?.agent
+        ? liveActiveRun.agent
+        : terminalRuntime.agentName || liveActiveRun?.agent || 'Agent';
     const terminalLabel = !terminalRuntime.connected
         ? 'Terminal'
         : terminalRunDispatching
@@ -1223,6 +1281,29 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             : terminalAgentRunning
                 ? `${terminalAgentName} is running and idle`
                 : 'Shell is connected';
+    const markCoachMarkSeen = useCallback((key: string) => {
+        void patchOnboardingState({ coachMarks: { ...(onboardingState.coachMarks || {}), [key]: true } });
+    }, [onboardingState.coachMarks, patchOnboardingState]);
+    const boardCoachmarkHidden = !onboardingLoaded
+        || !onboardingState.welcomeSeen
+        || !!onboardingState.hideTips
+        || tipsHiddenThisSession
+        || isMobile
+        || !!selectedTicket;
+    const activeBoardCoachmark = useMemo(() => {
+        if (boardCoachmarkHidden) return null;
+        const coachMarks = onboardingState.coachMarks || {};
+        const ticketCount = data?.tickets?.length ?? 0;
+        if (!coachMarks['new-ticket']) return 'new-ticket';
+        if (!coachMarks['brain-dump-main']) return 'brain-dump-main';
+        if (!coachMarks.drag && dragAnchorReady && ticketCount >= 2) return 'drag';
+        return null;
+    }, [
+        boardCoachmarkHidden,
+        data?.tickets?.length,
+        dragAnchorReady,
+        onboardingState.coachMarks,
+    ]);
     const [sidebarExpanded, setSidebarExpanded] = useState(() => {
         if (typeof window === 'undefined') return false;
         try { return localStorage.getItem('vd-sidebar-expanded') === 'true'; } catch { return false; }
@@ -1361,7 +1442,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         return () => window.removeEventListener('keydown', handleKeyDown);
     }, [selectedTicket, showNewTicket, showBatchPane, showTerminal, termFullscreen]);
 
-    // Close filter popover on click outside (VD-111)
+    // Close filter popover on click outside
     useEffect(() => {
         if (!showFilters) return;
         const handleClick = (e: MouseEvent) => {
@@ -1373,7 +1454,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         return () => document.removeEventListener('click', handleClick);
     }, [showFilters]);
 
-    // Fetch data — with auto-retry on failure (VD-171)
+    // Fetch data — with auto-retry on failure
     const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const [fetchError, setFetchError] = useState(false);
     const fetchData = useCallback(async (options?: { force?: boolean }) => {
@@ -1612,7 +1693,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     const filteredTickets = useMemo(() => {
         if (!data) return [];
         return data.tickets.filter((t) => {
-            // Search matches title, id, description, tags, or comments (VD-110)
+            // Search matches title, id, description, tags, or comments
             if (search) {
                 const q = search.toLowerCase();
                 const matchesTitle = t.title.toLowerCase().includes(q);
@@ -1626,7 +1707,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             if (statusFilter.length > 0 && !statusFilter.includes(t.status)) return false;
             if (!matchesTimeFilter(t.createdAt, createdTimeFilter)) return false;
             if (!matchesTimeFilter(t.updatedAt, updatedTimeFilter)) return false;
-            // aiFilter removed (VD-155) — batch selection replaced AI addressable
+            // aiFilter removed — batch selection replaced AI addressable
             // Type filter: normalize old values (issue→normal, idea→discussion)
             const tType = t.ticketType === 'idea' ? 'discussion' : t.ticketType === 'discussion' ? 'discussion' : 'normal';
             if (typeFilter === 'normal' && tType !== 'normal') return false;
@@ -1791,7 +1872,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         return s;
     }, [data]);
 
-    // Active filter count (VD-111)
+    // Active filter count
     const activeFilterCount = useMemo(() => {
         let count = 0;
         if (missionFilter !== 'all') count++;
@@ -2063,7 +2144,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
 
     const activeTicket = activeId ? data?.tickets.find((t) => t.id === activeId) ?? null : null;
 
-    // Board-level drag handlers (VD-024: drop files to create new ticket)
+    // Board-level drag handlers (drop files to create new ticket)
     const handleBoardDragOver = useCallback((e: React.DragEvent) => {
         // AD-185(c): also bail when the Inbox/chat panel is open — drops
         // there should land in the chat composer, not the board's
@@ -2092,13 +2173,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             setNewTicketDefaultStatus('backlog');
             setShowNewTicket(true);
         } else {
-            // Multiple files → show choice dialog (VD-024)
+            // Multiple files → show choice dialog
             setPendingDropFiles(files);
             setShowDropChoice(true);
         }
     }, []);
 
-    // VD-024: Create one ticket with all files
+    // Create one ticket with all files
     const handleDropChoiceSingle = useCallback(() => {
         setShowDropChoice(false);
         setDroppedFiles(pendingDropFiles);
@@ -2107,7 +2188,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         setShowNewTicket(true);
     }, [pendingDropFiles]);
 
-    // VD-024: Create separate tickets per file (auto-named)
+    // Create separate tickets per file (auto-named)
     const handleDropChoiceSeparate = useCallback(async () => {
         setCreatingSeparate(true);
         for (const file of pendingDropFiles) {
@@ -2305,7 +2386,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 </div>
             )}
 
-            {/* Board-level drag overlay (VD-024) */}
+            {/* Board-level drag overlay */}
             {boardDragOver && (
                 <div className="absolute inset-0 z-40 bg-vd-accent-gold/10 border-4 border-dashed border-vd-accent-gold/50 flex items-center justify-center pointer-events-none">
                     <div className="bg-vd-bg-secondary/90 rounded-xl px-8 py-6 text-center shadow-xl">
@@ -2316,7 +2397,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 </div>
             )}
 
-            {/* Multi-file drop choice dialog (VD-024) */}
+            {/* Multi-file drop choice dialog */}
             {showDropChoice && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center">
                     <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => { setShowDropChoice(false); setPendingDropFiles([]); }} />
@@ -2359,7 +2440,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 </div>
             )}
 
-            {/* Expandable sidebar (VD-111 v2) — hidden when embedded in admin shell (VD-180) */}
+            {/* Expandable sidebar (v2) — hidden when embedded in admin shell */}
             {!isMobile && !embedded && (
                 <aside className={`fixed left-0 top-0 bottom-0 z-30 bg-vd-bg-secondary border-r border-vd-border flex flex-col py-3 transition-all duration-200 ${sidebarExpanded ? 'w-44' : 'w-12'}`}>
                     {/* Logo + expand toggle */}
@@ -2391,7 +2472,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                             {showProjectSwitcher && (
                                 <>
                                     {/* Backdrop to close on click outside */}
-                                    <div className="fixed inset-0 z-40" onClick={() => { setShowProjectSwitcher(false); setShowAddProjectForm(false); }} />
+                                    <div className="fixed inset-0 z-40" onClick={() => { setShowProjectSwitcher(false); }} />
                                     <div className={`absolute z-50 rounded-lg border border-vd-border bg-vd-bg-secondary shadow-panel overflow-hidden min-w-[200px] ${sidebarExpanded ? 'left-0 right-0 top-full mt-1' : 'left-full top-0 ml-2'}`}>
                                         <div className="px-2.5 py-1.5 text-[9px] text-vd-text-tertiary uppercase tracking-wider border-b border-vd-border">Projects</div>
                                         {projects.map(p => {
@@ -2431,56 +2512,19 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                             );
                                         })}
                                         <div className="border-t border-vd-border" />
+                                        {/* AD-286: launch the OnboardingWizard in add-project mode
+                                            instead of the legacy 3-field inline form. Closes the
+                                            switcher dropdown so the wizard owns the screen. */}
                                         <button
-                                            onClick={() => setShowAddProjectForm(prev => !prev)}
+                                            onClick={() => {
+                                                setShowProjectSwitcher(false);
+                                                setShowAddProjectWizard(true);
+                                            }}
                                             className="w-full text-left px-2.5 py-2 text-[10px] flex items-center gap-2 text-vd-accent-gold hover:bg-vd-bg-tertiary transition-colors"
                                         >
                                             <span className="text-xs">+</span>
-                                            <span>{showAddProjectForm ? 'Hide add project' : 'Add project'}</span>
+                                            <span>Add project</span>
                                         </button>
-                                        {showAddProjectForm && (
-                                            <div className="border-t border-vd-border px-2.5 py-2 space-y-2">
-                                                <input
-                                                    value={newProjectPath}
-                                                    onChange={(e) => setNewProjectPath(e.target.value)}
-                                                    placeholder="C:\\Codebases\\my-project"
-                                                    className="w-full bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-[10px] text-vd-text-primary placeholder-vd-text-tertiary focus:border-vd-accent-gold focus:outline-none"
-                                                />
-                                                <input
-                                                    value={newProjectName}
-                                                    onChange={(e) => setNewProjectName(e.target.value)}
-                                                    placeholder="Optional display name"
-                                                    className="w-full bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-[10px] text-vd-text-primary placeholder-vd-text-tertiary focus:border-vd-accent-gold focus:outline-none"
-                                                />
-                                                <input
-                                                    value={newProjectPrefix}
-                                                    onChange={(e) => setNewProjectPrefix(e.target.value.toUpperCase())}
-                                                    placeholder="AD"
-                                                    maxLength={6}
-                                                    className="w-full bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-[10px] text-vd-text-primary placeholder-vd-text-tertiary focus:border-vd-accent-gold focus:outline-none"
-                                                />
-                                                <div className="flex items-center justify-between gap-2">
-                                                    <button
-                                                        onClick={() => {
-                                                            setShowAddProjectForm(false);
-                                                            setNewProjectPath('');
-                                                            setNewProjectName('');
-                                                            setNewProjectPrefix('AD');
-                                                        }}
-                                                        className="px-2 py-1 text-[10px] text-vd-text-tertiary hover:text-vd-text-primary transition-colors"
-                                                    >
-                                                        Cancel
-                                                    </button>
-                                                    <button
-                                                        onClick={handleAddProject}
-                                                        disabled={isAddingProject}
-                                                        className="px-2.5 py-1 text-[10px] font-medium rounded-md border border-vd-accent-gold/30 text-vd-accent-gold hover:bg-vd-accent-gold/10 transition-colors disabled:opacity-50"
-                                                    >
-                                                        {isAddingProject ? 'Adding...' : 'Add Project'}
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        )}
                                     </div>
                                 </>
                             )}
@@ -2583,6 +2627,16 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     {/* Bottom: Settings */}
                     <div className="px-1.5 flex flex-col gap-0.5">
                         <button
+                            onClick={openFeedbackIssue}
+                            className={`rounded-lg flex items-center gap-2.5 text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary transition-colors ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
+                            title="Send feedback"
+                        >
+                            <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M8.625 12.75h6.75m-6.75-3h6.75m-8.25 9.75 2.25-2.25h7.125a3 3 0 0 0 3-3V7.5a3 3 0 0 0-3-3h-9a3 3 0 0 0-3 3v6.75a3 3 0 0 0 3 3h.375Z" />
+                            </svg>
+                            {sidebarExpanded && <span className="text-xs font-medium">Send feedback</span>}
+                        </button>
+                        <button
                             onClick={() => setShowSettings(true)}
                             className={`rounded-lg flex items-center gap-2.5 text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary transition-colors ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
                             title="Settings"
@@ -2597,7 +2651,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 </aside>
             )}
 
-            {/* Top toolbar — action buttons + search + filters (VD-111 v2) */}
+            {/* Top toolbar — action buttons + search + filters (v2) */}
             <div className={`sticky top-0 z-20 bg-vd-bg-primary/95 backdrop-blur-sm border-b border-vd-border flex-shrink-0 transition-all duration-200 ${!isMobile && !embedded ? (sidebarExpanded ? 'pl-44' : 'pl-12') : ''}`}>
                 <div className="px-4 py-2 flex items-center gap-2">
                     {/* Brand — mobile always, desktop when sidebar collapsed */}
@@ -2815,7 +2869,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                             </select>
                                         </label>
                                     )}
-                                    {/* AI Addressable filter removed — batch selection replaced it (VD-155) */}
+                                    {/* AI Addressable filter removed — batch selection replaced it */}
                                     {batches.length > 0 && (
                                         <label className="block">
                                             <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Batch Status</span>
@@ -2841,7 +2895,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
 
                     {/* Action buttons — right side */}
                     <div className="flex items-center gap-1.5 ml-auto flex-shrink-0">
-                        {/* Batches toggle — icon only (VD-111) */}
+                        {/* Batches toggle — icon only */}
                         <button
                             onClick={() => setShowBatchPane(prev => !prev)}
                             className={`relative p-1.5 border rounded-lg transition-colors ${
@@ -2896,7 +2950,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                             </button>
                         )}
 
-                        {/* + Batch — shown when tickets selected (VD-111).
+                        {/* + Batch — shown when tickets selected.
                             AD-198: now sits to the right of the Terminal/Shell
                             toggle so Shell-Ready reads as a sibling of the
                             Batches icon. */}
@@ -3023,7 +3077,11 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                             outlines other action buttons already use. */}
                         {!isMobile && (
                             <button
-                                onClick={() => setShowChat(prev => !prev)}
+                                ref={brainDumpButtonRef}
+                                onClick={() => {
+                                    if (activeBoardCoachmark === 'brain-dump-main') markCoachMarkSeen('brain-dump-main');
+                                    setShowChat(prev => !prev);
+                                }}
                                 className={`relative px-2.5 py-1.5 text-xs font-medium border rounded-lg transition-colors ${
                                     chatProcessing
                                         ? 'border-vd-accent-gold text-vd-accent-gold animate-pulse'
@@ -3046,7 +3104,12 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         )}
                         {/* New ticket */}
                         <button
-                            onClick={() => { setNewTicketDefaultStatus(undefined); setShowNewTicket(true); }}
+                            ref={newTicketButtonRef}
+                            onClick={() => {
+                                if (activeBoardCoachmark === 'new-ticket') markCoachMarkSeen('new-ticket');
+                                setNewTicketDefaultStatus(undefined);
+                                setShowNewTicket(true);
+                            }}
                             className="px-2.5 py-1.5 text-xs font-medium bg-vd-accent-gold text-vd-bg-primary rounded-lg hover:bg-vd-accent-gold-light transition-colors"
                         >
                             <span className="hidden sm:inline">+ New Ticket</span>
@@ -3054,7 +3117,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         </button>
                     </div>
                 </div>
-                {/* Subtle shortcut hints (VD-111) */}
+                {/* Subtle shortcut hints */}
                 <div className="px-4 pb-1 hidden sm:flex items-center gap-3 text-[10px] text-vd-text-tertiary/50">
                     <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">Ctrl+F</kbd> Search</span>
                     <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">B</kbd> Batches</span>
@@ -3295,7 +3358,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                     Create your first ticket
                                 </button>
                                 <button
-                                    onClick={() => setShowOnboardingWizard(true)}
+                                    onClick={openCodebaseScan}
                                     className="px-4 py-2 text-sm font-medium border border-vd-accent-gold/40 text-vd-accent-gold rounded-md hover:bg-vd-accent-gold/10"
                                 >
                                     Run codebase scan
@@ -3504,26 +3567,42 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 />
             </ErrorBoundary>
 
+            <CoachMark
+                show={activeBoardCoachmark === 'new-ticket'}
+                targetRef={newTicketButtonRef}
+                placement="bottom"
+                title="New ticket"
+                message="Capture work here. Press N anywhere on the board for the same action."
+                onSeen={() => markCoachMarkSeen('new-ticket')}
+                onHideAll={() => {
+                    setTipsHiddenThisSession(true);
+                    try { sessionStorage.setItem('adhdev-tips-hidden-session', '1'); } catch { /* ignore */ }
+                }}
+            />
+
+            <CoachMark
+                show={activeBoardCoachmark === 'brain-dump-main'}
+                targetRef={brainDumpButtonRef}
+                placement="bottom"
+                title="Brain Dump"
+                message="Drop loose notes here, then let ADHDev triage them into tickets when you are ready."
+                onSeen={() => markCoachMarkSeen('brain-dump-main')}
+                onHideAll={() => {
+                    setTipsHiddenThisSession(true);
+                    try { sessionStorage.setItem('adhdev-tips-hidden-session', '1'); } catch { /* ignore */ }
+                }}
+            />
+
             {/* AD-137/130: drag coach mark. Anchored to the first visible ticket card.
                 Suppressed while welcome modal is open (no stacking). Only shows when
                 no other coach mark is active at the board level — sequential reveal. */}
             <CoachMark
-                show={
-                    onboardingLoaded
-                    && dragAnchorReady
-                    && !!onboardingState.welcomeSeen
-                    && !!onboardingEvents.firstRunAt
-                    && !onboardingState.coachMarks?.drag
-                    && !onboardingState.hideTips
-                    && !tipsHiddenThisSession
-                    && !isMobile
-                    && !selectedTicket  // never stack a board-level hint behind an open ticket modal
-                }
+                show={activeBoardCoachmark === 'drag'}
                 targetRef={dragAnchorRef}
                 placement="right"
                 title="Pro tip"
                 message="Grab any card and drop it in another column. ADHDev tracks the move as activity so nothing slips through."
-                onSeen={() => { void patchOnboardingState({ coachMarks: { ...(onboardingState.coachMarks || {}), drag: true } }); }}
+                onSeen={() => markCoachMarkSeen('drag')}
                 onHideAll={() => {
                     // AD-236: session-only dismissal. Tips return on next launch.
                     setTipsHiddenThisSession(true);
@@ -3539,15 +3618,28 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 <OnboardingWizard
                     initialState={{
                         wizardCompleted: onboardingState.wizardCompleted,
-                        wizardStep: onboardingState.wizardStep,
-                        folderSource: onboardingState.folderSource,
+                        wizardStep: onboardingWizardStartStep || onboardingState.wizardStep,
+                        folderSource: onboardingWizardStartStep === 3 ? 'existing' : onboardingState.folderSource,
                         folderPath: onboardingState.folderPath,
                         agentDetected: onboardingState.agentDetected,
                         gitPosture: onboardingState.gitPosture,
                         remoteUrl: onboardingState.remoteUrl,
                     }}
                     onPatchOnboarding={patchOnboardingState}
-                    onClose={() => setShowOnboardingWizard(false)}
+                    onClose={() => { setShowOnboardingWizard(false); setOnboardingWizardStartStep(null); }}
+                />
+            )}
+
+            {/* AD-286: same wizard, "Add new project" mode. onCreateProject
+                signals the mode and is called on Finish with the wizard's full
+                state — we then POST /api/projects and apply the state to the
+                freshly-active new project. */}
+            {showAddProjectWizard && (
+                <OnboardingWizard
+                    initialState={{}}
+                    onPatchOnboarding={() => { /* deferred in add-project mode */ }}
+                    onCreateProject={handleCreateProjectFromWizard}
+                    onClose={() => setShowAddProjectWizard(false)}
                 />
             )}
 

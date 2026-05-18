@@ -55,6 +55,7 @@ export async function POST(request: NextRequest) {
                 agent: actor,
                 nowIso: now,
                 startedRef,
+                source: 'terminal-run',
             }));
             if (!data.tickets[idx].activity) data.tickets[idx].activity = [];
             data.tickets[idx].activity.push({

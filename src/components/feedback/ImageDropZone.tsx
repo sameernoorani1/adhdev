@@ -114,7 +114,7 @@ export function ImageDropZone({ images, onImagesChange, onImageClick, maxImages 
 
     return (
         <div onPaste={handlePaste}>
-            {/* Thumbnails / file list — ABOVE drop zone (VD-023) */}
+            {/* Thumbnails / file list — ABOVE drop zone */}
             {images.length > 0 && (
                 <div className="flex flex-wrap gap-3 mb-2">
                     {images.map((file, i) => {

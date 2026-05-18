@@ -7,6 +7,18 @@ function getProjectId(request: NextRequest): string | null {
     return request.headers.get('x-adhdev-project');
 }
 
+// AD-297: mission writes that omit `x-adhdev-project` silently land on the
+// registry's activeProjectId, which can differ from the project the user is
+// viewing — Sameer reported "I asked AI to make a mission, it succeeded, but
+// it doesn't show in the list." The mission was real but written to a
+// different board.json. Surface where the mission actually landed so the
+// caller can verify and so a future "mission vanished" complaint can be
+// traced from the agent transcript.
+function resolveActualProjectId(projectIdHeader: string | null): string | null {
+    const project = getProjectById(projectIdHeader) || getActiveProject();
+    return project?.id ?? null;
+}
+
 // AD-011: resolve user display name from project config, replacing the
 // previously hardcoded 'Sameer' literal in mission decision authoring.
 function resolveDisplayName(projectId: string | null): string {
@@ -60,7 +72,13 @@ export async function POST(request: NextRequest) {
             if (!Array.isArray(data.missions)) data.missions = [];
             data.missions.push(mission);
             writeFeedback(data, projectId);
-            return NextResponse.json(mission, { status: 201 });
+            // AD-297: expose where the mission actually landed so agents can
+            // verify they routed to the project the user is looking at.
+            const resolvedProjectId = resolveActualProjectId(projectId);
+            if (!projectId) {
+                console.warn('[ADHDev] /api/missions POST omitted x-adhdev-project header — routed to', resolvedProjectId);
+            }
+            return NextResponse.json({ ...mission, _resolvedProjectId: resolvedProjectId }, { status: 201 });
         });
     } catch (err) {
         console.error('[ADHDev] POST /api/missions error:', err);

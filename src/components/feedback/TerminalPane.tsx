@@ -181,6 +181,16 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
     // chars of the pasted text so the user sees what's actually leaving the
     // clipboard before they hit Enter.
     const [recentPaste, setRecentPaste] = useState<{ lines: number; chars: number; tag: number; kind: 'ok' | 'empty'; preview?: string } | null>(null);
+    // AD-155 9th pass: after a placement (orientation) change, the agent's old
+    // hard-wrapped output stays in xterm's scrollback at its original col width
+    // — xterm.js does not reflow already-rendered cells, which is the structural
+    // limit the prior 8 passes documented. The Force redraw button in the
+    // header is the supported recovery, but users (Sameer) keep reporting they
+    // don't discover it. This briefly pulses the button after a real placement
+    // change so the recovery path becomes visible without auto-clearing the
+    // chat (auto-Ctrl+L was tried in passes 5-6 and explicitly removed in
+    // pass 8 because it wiped the visible conversation).
+    const [redrawHint, setRedrawHint] = useState(false);
     const [size, setSize] = useState(() => {
         if (typeof window === 'undefined') return 500;
         const saved = parseInt(localStorage.getItem(SIZE_KEY) || '', 10);
@@ -459,12 +469,36 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
             const colsChanged = term.cols !== lastCols;
             const rowsChanged = term.rows !== lastRows;
             if (!colsChanged && !rowsChanged) return;
+            const colsActuallyChanged = colsChanged && initialResizeDone;
             lastCols = term.cols;
             lastRows = term.rows;
             ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-            // Preserve the transcript during automatic layout changes. A PTY
-            // resize is enough here; Ctrl+L is reserved for the explicit Force
-            // redraw button because agent TUIs often treat it as a screen clear.
+            // AD-155 10th pass: Sameer's specific ask was "when you resize the
+            // shape it gets messed up; when the agent writes any new text in
+            // its history, then everything gets resized properly. Can we have
+            // it update the layout upon resize as well and not just on writing
+            // something?"
+            //
+            // The reason new agent text reflows everything is that Claude
+            // Code's Ink TUI re-renders its in-memory React tree on each
+            // input event (stdin chunk) and on SIGWINCH. On Windows ConPTY
+            // the SIGWINCH propagation through node-pty's resize() is not
+            // reliable, so Ink can sit on stale dimensions until the next
+            // stdin chunk arrives. We nudge it with an empty bracketed
+            // paste — the terminal strips the delimiters, Ink's stdin sees a
+            // zero-byte input event, Ink re-renders at the now-current cols
+            // without adding any visible content. Pure paste-mode noise; no
+            // characters are committed to Claude's input box.
+            //
+            // Pass 8 explicitly disabled auto-Ctrl+L because it cleared the
+            // visible chat — the empty paste is different (no clear escape,
+            // no visible bytes) and is the smallest valid nudge.
+            //
+            // Only fire on a *real* cols change (post-initial-fit). Rows-only
+            // changes don't affect wrapping so the nudge would be noise.
+            if (colsActuallyChanged) {
+                ws.send(JSON.stringify({ type: 'input', data: '\x1b[200~\x1b[201~' }));
+            }
             initialResizeDone = true;
         };
 
@@ -547,8 +581,21 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
             prevLayoutRef.current = layout;
             return;
         }
+        const prevPlacement = prevLayoutRef.current.split('|')[0];
+        const placementChanged = prevPlacement !== placement;
         if (prevLayoutRef.current === layout) return;
         prevLayoutRef.current = layout;
+
+        // AD-155 9th pass: surface the Force-redraw button after a true
+        // placement change (right ↔ left ↔ top ↔ bottom). Skip fullscreen
+        // toggles — those were flagged in pass 8 as too noisy. Only pulse
+        // when content has been written (lastOutputAtRef > 0), otherwise
+        // we'd hint at a redraw of an empty terminal on initial layout.
+        let fadeTimer: ReturnType<typeof setTimeout> | null = null;
+        if (placementChanged && lastOutputAtRef.current > 0) {
+            setRedrawHint(true);
+            fadeTimer = setTimeout(() => setRedrawHint(false), 8000);
+        }
 
         // Give CSS transition a beat to settle, then fit + refresh + prompt
         // the running agent to redraw.
@@ -565,7 +612,10 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                 }
             } catch {}
         }, 220);
-        return () => clearTimeout(t);
+        return () => {
+            clearTimeout(t);
+            if (fadeTimer) clearTimeout(fadeTimer);
+        };
     }, [placement, isFullscreen]);
 
     // AD-150 v2: when the user flips dark ↔ light (or switches skin), the CSS
@@ -637,6 +687,10 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
     // running TUI repaints its prompt cleanly. The shell process is NOT
     // killed — Reset Session is still the option for that.
     const handleForceRedraw = useCallback(() => {
+        // AD-155 9th pass: clicking the button consumes the post-placement
+        // pulse hint immediately so it doesn't keep nudging after the user
+        // has already acted on it.
+        setRedrawHint(false);
         try {
             const term = termInstanceRef.current;
             if (term) {
@@ -774,11 +828,17 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                         )}
                         {/* AD-155 5th pass: Force redraw — recovers from
                             stale xterm scrollback after a resize without
-                            killing the shell. */}
+                            killing the shell.
+                            AD-155 9th pass: pulses after a placement change
+                            so the recovery path is discoverable when the
+                            user just rearranged the layout and the old
+                            output is now mis-sized. */}
                         <button
                             onClick={handleForceRedraw}
-                            className="text-[9px] px-1.5 py-0.5 rounded text-vd-text-tertiary hover:text-vd-text-secondary hover:bg-vd-bg-tertiary"
-                            title="Force redraw — clears stale scrollback and asks the running agent to repaint. Use when a resize left things looking broken."
+                            className={`text-[9px] px-1.5 py-0.5 rounded text-vd-text-tertiary hover:text-vd-text-secondary hover:bg-vd-bg-tertiary${redrawHint ? ' text-vd-accent-gold bg-vd-accent-gold/15 ring-1 ring-vd-accent-gold/40 adhdev-redraw-pulse' : ''}`}
+                            title={redrawHint
+                                ? 'Layout changed — click to redraw the terminal at the new size'
+                                : 'Force redraw — clears stale scrollback and asks the running agent to repaint. Use when a resize left things looking broken.'}
                         >
                             <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                                 <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.582m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />

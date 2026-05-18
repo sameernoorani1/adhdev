@@ -42,6 +42,13 @@ interface OnboardingWizardProps {
     initialState: WizardOnboardingState;
     onPatchOnboarding: (patch: Record<string, unknown>) => Promise<void> | void;
     onClose: () => void;
+    // AD-286: when provided, the wizard runs in "add new project" mode — opened
+    // from the project switcher's "+ Add project" entry. Mid-wizard persistence
+    // is deferred (the new project doesn't exist yet, so writing onboarding
+    // state to the current active project would be wrong); on Finish the
+    // accumulated state is handed to this callback, which creates the project
+    // and then applies the state to it.
+    onCreateProject?: (state: WizardOnboardingState) => Promise<void> | void;
 }
 
 type ScanKind =
@@ -63,7 +70,10 @@ function tagForCandidate(kind: ScanKind | undefined): string[] {
 // Agent catalogue moved to src/lib/feedback/agentCatalog.ts so the persistent
 // terminal-header launcher can share the same source of truth.
 
-export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: OnboardingWizardProps) {
+export function OnboardingWizard({ initialState, onPatchOnboarding, onClose, onCreateProject }: OnboardingWizardProps) {
+    // AD-286: "add new project" mode — defer persistence until Finish, then
+    // hand the full state to onCreateProject which creates + switches + applies.
+    const addProjectMode = !!onCreateProject;
     const [step, setStep] = useState<number>(initialState.wizardStep || 1);
     const [folderSource, setFolderSource] = useState<'existing' | 'new' | null>(initialState.folderSource || null);
     const [folderPath, setFolderPath] = useState<string>(initialState.folderPath || '');
@@ -251,11 +261,16 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
         const customFlags = variantId === 'custom' ? (agentCustomFlags[agentId] || '').trim() : undefined;
         const next = { id: agentId, variantId, ...(customFlags ? { customFlags } : {}) };
         setPreferredAgent(next);
+        // AD-286: in add-project mode, defer — the new project doesn't exist
+        // yet so writing preferredAgent to the current project's onboarding
+        // state would target the wrong project. The pick is captured in local
+        // state and replayed against the new project after creation.
+        if (addProjectMode) return;
         // Use onPatchOnboarding directly rather than the `persist` wrapper —
         // `persist` is declared later in this component and using it here
         // would create an unnecessary forward reference.
         void onPatchOnboarding({ preferredAgent: next } as Record<string, unknown>);
-    }, [agentVariantSel, agentCustomFlags, onPatchOnboarding]);
+    }, [agentVariantSel, agentCustomFlags, onPatchOnboarding, addProjectMode]);
 
     // Fire detect on Step 2 mount.
     useEffect(() => {
@@ -284,9 +299,13 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
     }, [step]);
 
     // Persist progress on step transitions so a mid-wizard close resumes cleanly.
+    // AD-286: in add-project mode, persistence is deferred until Finish — the
+    // active project is still the old one, and we don't want to pollute its
+    // onboarding state with the new project's wizard progress.
     const persist = useCallback((patch: Partial<WizardOnboardingState>) => {
+        if (addProjectMode) return Promise.resolve();
         return onPatchOnboarding(patch as Record<string, unknown>);
-    }, [onPatchOnboarding]);
+    }, [onPatchOnboarding, addProjectMode]);
 
     // AD-230: existing-folder branch must also validate (exists + writable).
     // The new-folder branch trusts /api/onboarding/create-folder's success path.
@@ -429,7 +448,7 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
                     return;
                 }
             }
-            await persist({
+            const finalState: WizardOnboardingState = {
                 wizardCompleted: true,
                 wizardStep: 4,
                 folderSource,
@@ -441,12 +460,22 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
                 populated: !!importResult && importResult.imported > 0,
                 gitPosture,
                 remoteUrl: remoteUrl || null,
+                preferredAgent,
                 // §5.1 / first-time-intro fix: do NOT flip welcomeSeen here.
                 // Setting it pre-emptively at wizard finish suppresses the
                 // WelcomeModal (the actual product intro), leaving fresh
                 // users with no first-time guidance after the wizard. The
                 // WelcomeModal flips it itself when the user dismisses it.
-            } as Record<string, unknown>);
+            };
+            // AD-286: in add-project mode, hand the final state to the caller
+            // which creates the project and applies the state to it. Skip the
+            // regular persist (active project is still the old one).
+            if (addProjectMode && onCreateProject) {
+                await onCreateProject(finalState);
+                onClose();
+                return;
+            }
+            await persist(finalState);
             onClose();
         } catch (err) {
             setFinishError(String(err));
@@ -456,6 +485,9 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
     };
 
     const handleSkipAll = async () => {
+        // AD-286: in add-project mode, just close — nothing to persist (the
+        // new project was never created so there's no state to flip).
+        if (addProjectMode) { onClose(); return; }
         // §5.1 fix: do NOT pre-flip welcomeSeen here. A user who skips the
         // wizard still benefits from the WelcomeModal's product intro on
         // the next paint. Welcome dismissal flips its own flag.
@@ -467,13 +499,16 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
     const goNext = async () => {
         let next = step + 1;
         // Skip Step 3 entirely for the *new folder* path — there's nothing to scan.
-        if (step === 2 && folderSource === 'new') next = 4;
+        // AD-286: also skip in add-project mode — scan would import into the
+        // *current* active project, not the new one. Users can re-run the
+        // scan from the new project once it's the active one.
+        if (step === 2 && (folderSource === 'new' || addProjectMode)) next = 4;
         await persist({ wizardStep: next, folderSource, folderPath, agentDetected });
         setStep(next);
     };
     const goBack = () => {
         let prev = step - 1;
-        if (step === 4 && folderSource === 'new') prev = 2;
+        if (step === 4 && (folderSource === 'new' || addProjectMode)) prev = 2;
         if (prev < 1) prev = 1;
         setStep(prev);
     };
@@ -492,7 +527,7 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
                 {/* Header */}
                 <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-vd-border">
                     <div>
-                        <h2 className="text-sm font-semibold text-vd-text-primary">Welcome to ADHDev</h2>
+                        <h2 className="text-sm font-semibold text-vd-text-primary">{addProjectMode ? 'Add a new project' : 'Welcome to ADHDev'}</h2>
                         {/* AD-235: 4-dot progress indicator. Stays four dots regardless of
                             folder-source path (new-folder skips Step 3 silently). */}
                         <div className="flex items-center gap-1 mt-1.5">
@@ -519,9 +554,9 @@ export function OnboardingWizard({ initialState, onPatchOnboarding, onClose }: O
                     <button
                         onClick={handleSkipAll}
                         className="text-[10px] text-vd-text-tertiary hover:text-vd-text-secondary px-2 py-1 rounded hover:bg-vd-bg-tertiary"
-                        title="Skip the whole wizard — you can re-run it later via ?wizard=onboarding"
+                        title={addProjectMode ? 'Cancel — close without adding a project' : 'Skip the whole wizard — you can re-run it later via ?wizard=onboarding'}
                     >
-                        Skip
+                        {addProjectMode ? 'Cancel' : 'Skip'}
                     </button>
                 </div>
 

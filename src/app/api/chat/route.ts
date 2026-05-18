@@ -19,6 +19,33 @@ function getProjectId(request: NextRequest): string | null {
 }
 
 const VALID_STATUSES: ChatMessageStatus[] = ['unaddressed', 'in_progress', 'addressed', 'noted'];
+const CHAT_PATCH_FIELDS = ['content', 'status', 'images', 'actions'] as const;
+
+function normalizePatchUpdates(body: Record<string, unknown>): Partial<ChatMessage> {
+    const nested = body.updates && typeof body.updates === 'object'
+        ? body.updates as Record<string, unknown>
+        : {};
+    const updates: Record<string, unknown> = { ...nested };
+
+    // AD-287: ADHDEV.md documents a flat PATCH body
+    // `{ id, status, actions }`, while the API originally only accepted
+    // `{ id, updates: { status, actions } }`. Support both so the execution
+    // contract and API do not silently diverge again.
+    for (const field of CHAT_PATCH_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(body, field) && !Object.prototype.hasOwnProperty.call(updates, field)) {
+            updates[field] = body[field];
+        }
+    }
+
+    const next: Partial<ChatMessage> = {};
+    if (typeof updates.content === 'string') next.content = updates.content;
+    if (typeof updates.status === 'string' && VALID_STATUSES.includes(updates.status as ChatMessageStatus)) {
+        next.status = updates.status as ChatMessageStatus;
+    }
+    if (Array.isArray(updates.images)) next.images = updates.images;
+    if (Array.isArray(updates.actions)) next.actions = updates.actions as ChatActionRecord[];
+    return next;
+}
 
 export async function GET(request: NextRequest) {
     const auth = await checkAdmin();
@@ -69,14 +96,14 @@ export async function PATCH(request: NextRequest) {
         if (!id) return NextResponse.json({ error: 'Required: { id, updates }' }, { status: 400 });
         const idx = store.messages.findIndex(m => m.id === id);
         if (idx < 0) return NextResponse.json({ error: 'Message not found' }, { status: 404 });
-        const updates = body.updates || {};
-        const next: ChatMessage = { ...store.messages[idx] };
-        if (typeof updates.content === 'string') next.content = updates.content;
-        if (typeof updates.status === 'string' && VALID_STATUSES.includes(updates.status as ChatMessageStatus)) {
-            next.status = updates.status as ChatMessageStatus;
+        const updates = normalizePatchUpdates(body);
+        if (Object.keys(updates).length === 0) {
+            return NextResponse.json(
+                { error: 'Required: at least one recognized update field (content, status, images, actions).' },
+                { status: 400 },
+            );
         }
-        if (Array.isArray(updates.images)) next.images = updates.images;
-        if (Array.isArray(updates.actions)) next.actions = updates.actions as ChatActionRecord[];
+        const next: ChatMessage = { ...store.messages[idx], ...updates };
         store.messages[idx] = next;
         writeChat(store, projectId);
         return NextResponse.json(next);

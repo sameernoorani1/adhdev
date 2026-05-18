@@ -1,53 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { readFeedback, writeFeedback, withFeedbackLock } from '@/lib/feedback/core';
-import { applyCaptureHeartbeat } from '@/lib/feedback/captureHeartbeat';
-import { heartbeatActiveRuns } from '@/lib/feedback/runs';
 
 const TERMINAL_URL = 'http://localhost:3112';
-
-// AD-154 / AD-244: Next.js-side heartbeat for live runs. Bumps
-// execution.updatedAt for tickets the terminal server reports as capturing,
-// so the client's 45 s freshness backstop keeps the indicator visible even
-// when an older terminal-server build (without its own heartbeat) is still
-// running. Debounced per ticket so we don't write on every 2 s poll.
-//
-// AD-244: heartbeat-ONLY. This path used to also CREATE a fresh
-// `status: in_progress` execution if the ticket had none — which meant any
-// ticket the terminal flagged as capturing (whether or not Run had been
-// clicked) would flip into a false-running state on the next poll. Mirrors
-// the AD-232 heartbeat-only contract from `feedback/[id]/comments/route.ts`:
-// running state must come from an explicit Run (UI button → /api/run, or
-// terminal-server's own `bumpExecutionForActiveTickets` on /execute with
-// ticketIds). Polling never creates execution rows.
-const lastBumpMs = new Map<string, number>();
-const HEARTBEAT_DEBOUNCE_MS = 5_000;
-
-async function bumpCaptureTickets(projectId: string | null, ticketIds: string[], agentActive: boolean): Promise<void> {
-    if (!agentActive) return;
-    if (!Array.isArray(ticketIds) || ticketIds.length === 0) return;
-    const now = Date.now();
-    const toBump = ticketIds.filter(id => {
-        const key = `${projectId || 'default'}:${id}`;
-        const prev = lastBumpMs.get(key) || 0;
-        if (now - prev < HEARTBEAT_DEBOUNCE_MS) return false;
-        lastBumpMs.set(key, now);
-        return true;
-    });
-    if (toBump.length === 0) return;
-
-    try {
-        await withFeedbackLock(projectId, () => {
-            const data = readFeedback(projectId);
-            const nowIso = new Date(now).toISOString();
-            const ticketHeartbeatChanged = applyCaptureHeartbeat(data, toBump, nowIso);
-            const runHeartbeatChanged = heartbeatActiveRuns(data, toBump, nowIso);
-            const changed = ticketHeartbeatChanged || runHeartbeatChanged;
-            if (changed) writeFeedback(data, projectId);
-        });
-    } catch {
-        // Heartbeat is best-effort — never throw into the status response.
-    }
-}
 
 /**
  * GET /api/terminal-status
@@ -55,7 +8,7 @@ async function bumpCaptureTickets(projectId: string | null, ticketIds: string[],
  *
  * AD-141: forwards ?project=<id> to the terminal server so each board gets
  * its own run/agent state. Without a project param the terminal server falls
- * back to its most-recent session — legacy behaviour preserved.
+ * back to its most-recent session, preserving legacy behaviour.
  */
 export async function GET(request: NextRequest) {
     try {
@@ -70,11 +23,10 @@ export async function GET(request: NextRequest) {
 
         if (res && res.ok) {
             const data = await res.json();
-            // AD-154: Next.js-side heartbeat. Bump execution.updatedAt for any
-            // ticket the terminal server reports as capturing, so the client's
-            // freshness backstop keeps showing the indicator even when the
-            // old terminal-server code (pre-heartbeat) is still running.
-            await bumpCaptureTickets(projectId, Array.isArray(data.captureTicketIds) ? data.captureTicketIds : [], Boolean(data.agentActive));
+            // AD-307/AD-221: terminal-status is volatile liveness data. The
+            // client consumes captureTicketIds directly for the running UI, so
+            // this 2s poll must not write board.json. Persist only lifecycle
+            // edges: run start, completion, interruption, and stale recovery.
             return NextResponse.json({
                 connected: true,
                 capturing: data.capturing || false,

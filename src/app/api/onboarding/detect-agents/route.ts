@@ -26,6 +26,17 @@ const AGENTS: Array<{ id: string; runCommand: string; versionFlag: string }> = [
     { id: 'Continue',     runCommand: 'continue',     versionFlag: '--version' },
 ];
 
+function externalPathEnv(): NodeJS.ProcessEnv {
+    const env = { ...process.env };
+    const pathKey = Object.keys(env).find(k => k.toLowerCase() === 'path') || 'PATH';
+    const pathSep = process.platform === 'win32' ? ';' : ':';
+    env[pathKey] = String(env[pathKey] || '')
+        .split(pathSep)
+        .filter(entry => !entry.replace(/\\/g, '/').toLowerCase().includes('/node_modules/.bin'))
+        .join(pathSep);
+    return env;
+}
+
 function probe(runCommand: string, versionFlag: string): Promise<{ installed: boolean; version: string | null }> {
     return new Promise((resolve) => {
         const isWin = process.platform === 'win32';
@@ -42,7 +53,7 @@ function probe(runCommand: string, versionFlag: string): Promise<{ installed: bo
 
         let child;
         try {
-            child = spawn(cmd, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+            child = spawn(cmd, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: externalPathEnv() });
         } catch {
             finish(false, null);
             return;

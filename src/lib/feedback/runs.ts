@@ -2,6 +2,7 @@ import type { FeedbackData, FeedbackRun } from './core';
 
 export const RUN_HEARTBEAT_STALE_MS = 90 * 1000;
 export const RUN_DISPATCH_STALE_MS = 20 * 1000;
+export const RUN_AGENT_CLAIM_STALE_MS = 60 * 60 * 1000;
 
 export const ACTIVE_RUN_STATUSES = new Set<FeedbackRun['status']>([
     'dispatching',
@@ -18,6 +19,7 @@ export function normalizeRuns(runs: unknown): FeedbackRun[] {
             projectId: typeof run.projectId === 'string' ? run.projectId : null,
             ticketIds: Array.isArray(run.ticketIds) ? Array.from(new Set(run.ticketIds.map(id => String(id).toUpperCase()).filter(Boolean))) : [],
             status: isRunStatus(run.status) ? run.status : 'running',
+            source: isRunSource(run.source) ? run.source : undefined,
             terminalSessionId: typeof run.terminalSessionId === 'string' ? run.terminalSessionId : null,
             agent: typeof run.agent === 'string' ? run.agent : 'Coding Agent',
             startedAt: typeof run.startedAt === 'string' ? run.startedAt : new Date().toISOString(),
@@ -38,12 +40,14 @@ export function createRunRecord(params: {
     agent: string;
     nowIso: string;
     startedRef?: string;
+    source?: FeedbackRun['source'];
 }): FeedbackRun {
     return {
         runId: params.runId,
         projectId: params.projectId ?? null,
         ticketIds: Array.from(new Set(params.ticketIds.map(id => String(id).toUpperCase()).filter(Boolean))),
         status: 'dispatching',
+        source: params.source,
         terminalSessionId: null,
         agent: params.agent,
         startedAt: params.nowIso,
@@ -80,8 +84,9 @@ export function markRunDispatched(data: FeedbackData, runId: string, nowIso: str
 export function markRunSubmitted(data: FeedbackData, runId: string, nowIso: string, terminalSessionId?: string | null): boolean {
     const run = findRun(data, runId);
     if (!run) return false;
-    run.status = 'dispatching';
+    run.status = 'running';
     run.updatedAt = nowIso;
+    run.lastHeartbeatAt = nowIso;
     run.terminalSessionId = terminalSessionId ?? run.terminalSessionId ?? null;
     run.dispatchResult = 'sent';
     run.failure = null;
@@ -168,7 +173,11 @@ export function sweepStaleRuns(data: FeedbackData, nowIso = new Date().toISOStri
     for (const run of data.activeRuns) {
         if (!ACTIVE_RUN_STATUSES.has(run.status)) continue;
         const priorStatus = run.status;
-        const staleMsForRun = priorStatus === 'dispatching' ? RUN_DISPATCH_STALE_MS : staleMs;
+        const staleMsForRun = priorStatus === 'dispatching'
+            ? RUN_DISPATCH_STALE_MS
+            : run.source === 'agent-claim'
+                ? RUN_AGENT_CLAIM_STALE_MS
+                : staleMs;
         const heartbeatRaw = run.lastHeartbeatAt || run.updatedAt || run.startedAt;
         const heartbeatMs = new Date(heartbeatRaw).getTime();
         if (!Number.isFinite(heartbeatMs) || nowMs - heartbeatMs <= staleMsForRun) continue;
@@ -177,7 +186,9 @@ export function sweepStaleRuns(data: FeedbackData, nowIso = new Date().toISOStri
         run.completedAt = nowIso;
         run.blocker = run.blocker || (priorStatus === 'dispatching'
             ? 'Recovered: prompt was sent but no active agent confirmed the run.'
-            : 'Recovered: active run heartbeat expired without completion.');
+            : run.source === 'agent-claim'
+                ? 'Recovered: direct agent claim exceeded the max live-run window without completion.'
+                : 'Recovered: active run heartbeat expired without completion.');
         changed = true;
     }
     return changed;
@@ -199,4 +210,8 @@ function isRunStatus(value: unknown): value is FeedbackRun['status'] {
         value === 'interrupted' ||
         value === 'stale'
     );
+}
+
+function isRunSource(value: unknown): value is FeedbackRun['source'] {
+    return value === 'ui-run' || value === 'agent-claim' || value === 'terminal-run';
 }

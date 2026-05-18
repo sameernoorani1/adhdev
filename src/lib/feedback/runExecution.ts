@@ -233,7 +233,7 @@ export async function executeRunPrompt(ticketIds: string[], projectId?: string |
         // AD-149: pass the resolved ids through so the terminal server can
         // populate activeRunTicketIds — the live /api/terminal-status poll becomes
         // authoritative and every affected card lights up, regardless of status.
-        const activeRun = createRunRecord({ runId, projectId, ticketIds: ids, agent: actor, nowIso: new Date().toISOString(), startedRef });
+        const activeRun = createRunRecord({ runId, projectId, ticketIds: ids, agent: actor, nowIso: new Date().toISOString(), startedRef, source: 'ui-run' });
         upsertRun(data, activeRun);
 
         // AD-184: reports of "coding agent isn't working" toasts firing

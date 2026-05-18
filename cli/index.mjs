@@ -1,13 +1,49 @@
 #!/usr/bin/env node
+// adhdev-board — Copyright (c) 2026 Sameer Noorani. Licensed under AGPL-3.0-or-later.
+// See LICENSE at the repo root for the full text.
 
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
-import { join, resolve, basename } from 'path';
+import { join, resolve, basename, dirname } from 'path';
 import { execSync, spawn } from 'child_process';
 import { homedir } from 'os';
+import { fileURLToPath } from 'url';
 import readline from 'readline';
+import { checkVersion } from './version-check.mjs';
 
 const args = process.argv.slice(2);
 const command = args[0];
+
+// AD-280: read the running package version from package.json so the
+// version check can compare against the manifest. Best-effort; if the
+// read fails for any reason, the check is skipped entirely (fail open).
+function getPackageVersion() {
+    try {
+        const here = dirname(fileURLToPath(import.meta.url));
+        const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf-8'));
+        return typeof pkg.version === 'string' ? pkg.version : null;
+    } catch {
+        return null;
+    }
+}
+
+// AD-280: gate startup on the manifest. Returns when the caller can continue.
+// On 'block' actions, prints the message and exits with code 1.
+async function runVersionCheckOrExit() {
+    const currentVersion = getPackageVersion();
+    if (!currentVersion) return; // No version to compare → fail open.
+    const result = await checkVersion({ currentVersion });
+    if (result.action === 'block') {
+        console.log('');
+        console.log(`  ${result.message}`);
+        console.log('');
+        process.exit(1);
+    }
+    if (result.action === 'nudge') {
+        console.log('');
+        console.log(`  ${result.message}`);
+        console.log('');
+    }
+}
 
 // AD-134: minimal interactive prompt. Resolves to the user's trimmed input, or
 // `fallback` when the user just hits Enter (mirrors `npm init` UX).
@@ -47,7 +83,7 @@ function probeClaudeVersion() {
 const LOGO = `
   ╔═══════════════════════════════╗
   ║        A D H D e v            ║
-  ║   AI Agent Control Plane      ║
+  ║   The board for AI work       ║
   ╚═══════════════════════════════╝
 `;
 
@@ -391,6 +427,7 @@ function configureClaudeHooks(projectRoot) {
 
 async function init() {
   console.log(LOGO);
+  await runVersionCheckOrExit();
   // First positional arg after "init" is the path; skip flags like --name=, -y, etc.
   const positional = args.slice(1).find(a => !a.startsWith('-'));
   const projectRoot = resolve(positional || '.');
@@ -543,6 +580,7 @@ async function isPortInUse(port) {
 
 async function start() {
   console.log(LOGO);
+  await runVersionCheckOrExit();
 
   const registry = readRegistry();
   if (registry.projects.length === 0) {
@@ -582,8 +620,54 @@ async function start() {
   const port = 3111;
   const termPort = 3112;
 
-  // Check if ports are already in use — if board port is taken, just open browser
+  const pkgDir = findPackageDir();
+  if (!pkgDir) {
+    console.log('  Error: Cannot find ADHDev package.\n');
+    process.exit(1);
+  }
+
+  // AD-293: probe terminal server independently of the board. Earlier code
+  // returned early as soon as the board port was busy, which left the board
+  // half-broken when Next survived but the terminal server had died (or had
+  // never been started — e.g. the user restarted Next manually). Run the
+  // terminal probe + launch first so it heals in either branch below.
   const boardInUse = await isPortInUse(port);
+  const termInUse = await isPortInUse(termPort);
+  const terminalScript = join(pkgDir, 'server', 'terminal.mjs');
+  let termChild = null;
+  if (existsSync(terminalScript) && !termInUse) {
+    // When the board is already up we're about to exit this process, so the
+    // terminal server has to outlive us — detach + unref. When the board is
+    // also being started here, keep it attached so cleanup() tears both down
+    // together on Ctrl-C.
+    const detach = boardInUse;
+    termChild = spawn('node', [terminalScript], {
+      cwd: active?.path || process.cwd(),
+      env: { ...process.env, TERMINAL_PORT: String(termPort), ADHDEV_CWD: active?.path || process.cwd() },
+      stdio: detach ? 'ignore' : ['ignore', 'pipe', 'pipe'],
+      detached: detach,
+      windowsHide: true,
+    });
+    if (detach) {
+      termChild.unref();
+      console.log(`  ✓ Terminal server starting on ws://localhost:${termPort} (detached)`);
+    } else {
+      termChild.stdout.on('data', (d) => {
+        const msg = d.toString().trim();
+        if (msg) console.log(`  [terminal] ${msg}`);
+      });
+      termChild.stderr.on('data', (d) => {
+        const msg = d.toString().trim();
+        if (msg && !msg.includes('ExperimentalWarning')) console.error(`  [terminal] ${msg}`);
+      });
+      console.log(`  ✓ Terminal server starting on ws://localhost:${termPort}`);
+    }
+  } else if (termInUse) {
+    console.log(`  ✓ Terminal server already running on ws://localhost:${termPort}`);
+  }
+
+  // Board already up → open the browser and exit (terminal server above has
+  // already been healed if it was missing).
   if (boardInUse) {
     console.log(`  ✓ Board already running on http://localhost:${port}`);
     console.log('  Opening browser...\n');
@@ -592,33 +676,6 @@ async function start() {
       execSync(`${openCmd} http://localhost:${port}`, { stdio: 'ignore' });
     } catch { /* fine */ }
     return;
-  }
-
-  const pkgDir = findPackageDir();
-  if (!pkgDir) {
-    console.log('  Error: Cannot find ADHDev package.\n');
-    process.exit(1);
-  }
-
-  // Start terminal WebSocket server (background, skip if already running)
-  const terminalScript = join(pkgDir, 'server', 'terminal.mjs');
-  let termChild = null;
-  const termInUse = await isPortInUse(termPort);
-  if (existsSync(terminalScript) && !termInUse) {
-    termChild = spawn('node', [terminalScript], {
-      cwd: active?.path || process.cwd(),
-      env: { ...process.env, TERMINAL_PORT: String(termPort), ADHDEV_CWD: active?.path || process.cwd() },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    termChild.stdout.on('data', (d) => {
-      const msg = d.toString().trim();
-      if (msg) console.log(`  [terminal] ${msg}`);
-    });
-    termChild.stderr.on('data', (d) => {
-      const msg = d.toString().trim();
-      if (msg && !msg.includes('ExperimentalWarning')) console.error(`  [terminal] ${msg}`);
-    });
-    console.log(`  ✓ Terminal server starting on ws://localhost:${termPort}`);
   }
 
   // Start Next.js board server

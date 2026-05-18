@@ -67,7 +67,7 @@ describe('run lifecycle helpers', () => {
         });
     });
 
-    it('marks terminal submit as sent without confirming the run is working yet', () => {
+    it('marks terminal submit as a live run immediately', () => {
         const data = makeData();
         upsertRun(data, createRunRecord({
             runId: 'run-1',
@@ -79,10 +79,10 @@ describe('run lifecycle helpers', () => {
         expect(markRunSubmitted(data, 'run-1', '2026-05-07T20:00:05.000Z', 'session-1')).toBe(true);
 
         expect(data.activeRuns?.[0]).toMatchObject({
-            status: 'dispatching',
+            status: 'running',
             terminalSessionId: 'session-1',
             dispatchResult: 'sent',
-            lastHeartbeatAt: '2026-05-07T20:00:00.000Z',
+            lastHeartbeatAt: '2026-05-07T20:00:05.000Z',
         });
     });
 
@@ -171,13 +171,37 @@ describe('run lifecycle helpers', () => {
             agent: 'Claude Code',
             nowIso: '2026-05-07T20:00:00.000Z',
         }));
-        markRunSubmitted(data, 'run-1', '2026-05-07T20:00:01.000Z');
+        const run = data.activeRuns![0];
+        run.updatedAt = '2026-05-07T20:00:00.000Z';
+        run.lastHeartbeatAt = '2026-05-07T20:00:00.000Z';
 
         expect(sweepStaleRuns(data, '2026-05-07T20:00:25.000Z')).toBe(true);
 
         expect(data.activeRuns?.[0]).toMatchObject({
             status: 'stale',
             blocker: 'Recovered: prompt was sent but no active agent confirmed the run.',
+        });
+    });
+
+    it('lets explicit direct-agent claims stay live longer than terminal heartbeat runs', () => {
+        const data = makeData();
+        upsertRun(data, {
+            ...createRunRecord({
+                runId: 'run-direct',
+                ticketIds: ['AD-221'],
+                agent: 'Codex',
+                nowIso: '2026-05-07T20:00:00.000Z',
+                source: 'agent-claim',
+            }),
+            status: 'running',
+            lastHeartbeatAt: '2026-05-07T20:00:00.000Z',
+        });
+
+        expect(sweepStaleRuns(data, '2026-05-07T20:10:00.000Z')).toBe(false);
+        expect(sweepStaleRuns(data, '2026-05-07T21:01:00.000Z')).toBe(true);
+        expect(data.activeRuns?.[0]).toMatchObject({
+            status: 'stale',
+            blocker: 'Recovered: direct agent claim exceeded the max live-run window without completion.',
         });
     });
 });

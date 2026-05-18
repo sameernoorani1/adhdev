@@ -15,7 +15,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { hasActiveRunExceededMaxDuration, shouldAutoCompleteOnClear } from './clearActiveRunRules.mjs';
+import { shouldAutoCompleteOnClear } from './clearActiveRunRules.mjs';
 
 const PORT = parseInt(process.env.TERMINAL_PORT || '3112', 10);
 
@@ -153,7 +153,7 @@ let uiContext = {
 
 const clients = new Set();
 const REGISTRY_PATH = path.join(os.homedir(), '.adhdev', 'registry.json');
-const BOARD_RELATIVE_PATH = path.join('.adhdev', 'board.json');
+const BOARD_API_URL = process.env.ADHDEV_BOARD_URL || 'http://localhost:3111';
 
 function normalizeProjectId(id) {
     return id && typeof id === 'string' ? id : DEFAULT_PROJECT_ID;
@@ -174,10 +174,6 @@ function getProjectRoot(projectId) {
     } catch {}
 
     return process.env.ADHDEV_CWD || process.cwd();
-}
-
-function getBoardPath(projectId) {
-    return path.join(getProjectRoot(projectId), BOARD_RELATIVE_PATH);
 }
 
 // AD-144: per-project terminal history persistence.
@@ -223,80 +219,64 @@ function clearHistoryBuffer(projectId) {
     } catch {}
 }
 
-function readBoard(projectId) {
-    try {
-        const boardPath = getBoardPath(projectId);
-        if (!fs.existsSync(boardPath)) return null;
-        return JSON.parse(fs.readFileSync(boardPath, 'utf-8'));
-    } catch {
-        return null;
-    }
+// AD-301: the Next.js API at BOARD_API_URL takes ~5s to come up while this
+// terminal server starts immediately, so the first batch of POSTs from
+// `recoverStaleInProgressTickets` (and any heartbeat racing the boot)
+// reliably fails with ECONNREFUSED. The original error path dumped the
+// full undici stack with an AggregateError tree for each retry — looked
+// alarming on a clean startup and drowned the actually-useful boot log.
+// We now suppress ECONNREFUSED during a brief startup grace period (the
+// expected boot race) and downgrade the post-grace failure to a one-line
+// warning without the stack tree.
+const POST_STARTUP_GRACE_MS = 15_000;
+const POST_RETRY_LOG_THROTTLE_MS = 30_000;
+const postStartedAt = Date.now();
+let lastPostRetryLogAt = 0;
+
+function isConnectionRefused(err) {
+    if (!err) return false;
+    if (err.code === 'ECONNREFUSED') return true;
+    if (err.cause && isConnectionRefused(err.cause)) return true;
+    if (Array.isArray(err.errors)) return err.errors.some(isConnectionRefused);
+    return false;
 }
 
-// AD-175: write-temp-then-rename so a kill mid-flush leaves the existing
-// board.json intact instead of a half-written file. The rename is atomic on
-// POSIX, and on Windows fs.renameSync replaces the destination atomically as
-// long as both paths are on the same filesystem (we always write the tmp
-// file alongside the target, so they are).
-function writeBoard(data, projectId) {
-    const target = getBoardPath(projectId);
-    const tmp = `${target}.tmp-${process.pid}-${Date.now().toString(36)}`;
-    try {
-        fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
-        fs.renameSync(tmp, target);
-    } catch {
-        try { fs.unlinkSync(tmp); } catch {}
-    }
+function postTerminalRunState(projectId, payload) {
+    fetch(`${BOARD_API_URL}/api/runs/heartbeat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId, ...payload }),
+    }).catch(err => {
+        const refused = isConnectionRefused(err);
+        const withinGrace = Date.now() - postStartedAt < POST_STARTUP_GRACE_MS;
+        if (refused && withinGrace) return;
+        if (refused) {
+            const now = Date.now();
+            if (now - lastPostRetryLogAt < POST_RETRY_LOG_THROTTLE_MS) return;
+            lastPostRetryLogAt = now;
+            console.warn(`[terminal] board API unreachable at ${BOARD_API_URL} (will keep retrying silently).`);
+            return;
+        }
+        console.error('[terminal] terminal run-state API update failed:', err?.message || err);
+    });
 }
-
-const ACTIVE_RUN_STATUSES = new Set(['dispatching', 'running', 'finishing']);
 
 function heartbeatActiveRuns(projectId, ticketIds, runId) {
     if (!ticketIds?.length) return;
-    const boardData = readBoard(projectId);
-    if (!boardData) return;
-    if (!Array.isArray(boardData.activeRuns)) boardData.activeRuns = [];
-    const ids = new Set(ticketIds.map(id => String(id).toUpperCase()));
-    const now = new Date().toISOString();
-    let changed = false;
-
-    for (const run of boardData.activeRuns) {
-        if (!ACTIVE_RUN_STATUSES.has(run.status)) continue;
-        if (runId && run.runId !== runId) continue;
-        const runTicketIds = Array.isArray(run.ticketIds) ? run.ticketIds : [];
-        if (!runTicketIds.some(id => ids.has(String(id).toUpperCase()))) continue;
-        run.status = 'running';
-        run.updatedAt = now;
-        run.lastHeartbeatAt = now;
-        changed = true;
-    }
-
-    if (changed) writeBoard(boardData, projectId);
+    postTerminalRunState(projectId, {
+        action: 'heartbeat',
+        ticketIds,
+        runId: runId || undefined,
+    });
 }
 
 function markActiveRunsTerminal(projectId, ticketIds, reason) {
     if (!ticketIds?.length) return;
-    const boardData = readBoard(projectId);
-    if (!boardData || !Array.isArray(boardData.activeRuns)) return;
-    const ids = new Set(ticketIds.map(id => String(id).toUpperCase()));
-    const now = new Date().toISOString();
-    const status = reason === 'interrupted' ? 'interrupted' : 'stale';
-    let changed = false;
-
-    for (const run of boardData.activeRuns) {
-        if (!ACTIVE_RUN_STATUSES.has(run.status)) continue;
-        const runTicketIds = Array.isArray(run.ticketIds) ? run.ticketIds : [];
-        if (!runTicketIds.some(id => ids.has(String(id).toUpperCase()))) continue;
-        run.status = status;
-        run.updatedAt = now;
-        run.completedAt = now;
-        run.blocker = run.blocker || (reason === 'interrupted'
-            ? 'Interrupted by user (Esc / Ctrl+C).'
-            : `Recovered: terminal run cleared (${reason}).`);
-        changed = true;
-    }
-
-    if (changed) writeBoard(boardData, projectId);
+    postTerminalRunState(projectId, {
+        action: 'clear-active-runs',
+        ticketIds,
+        reason,
+    });
 }
 
 // AD-149 follow-up: when the user presses Esc or Ctrl+C in the terminal the
@@ -308,36 +288,10 @@ function markActiveRunsTerminal(projectId, ticketIds, reason) {
 // on the next fetch — the indicator clears within a poll.
 function markTicketsInterrupted(projectId, ticketIds) {
     if (!ticketIds?.length) return;
-    const boardData = readBoard(projectId);
-    if (!boardData?.tickets?.length) return;
-
-    const ids = new Set(ticketIds.map(id => String(id).toUpperCase()));
-    const now = new Date().toISOString();
-    let changed = false;
-
-    for (const ticket of boardData.tickets) {
-        if (!ids.has(String(ticket.id || '').toUpperCase())) continue;
-        if (ticket.execution?.status !== 'in_progress') continue;
-
-        ticket.execution = {
-            ...ticket.execution,
-            status: 'blocked',
-            updatedAt: now,
-            blocker: ticket.execution.blocker || 'Interrupted by user (Esc / Ctrl+C).',
-        };
-
-        if (!Array.isArray(ticket.activity)) ticket.activity = [];
-        ticket.activity.push({
-            action: 'execution_interrupted',
-            by: ticket.execution.actor || 'Coding Agent',
-            byType: 'ai',
-            at: now,
-        });
-        ticket.updatedAt = now;
-        changed = true;
-    }
-
-    if (changed) writeBoard(boardData, projectId);
+    postTerminalRunState(projectId, {
+        action: 'interrupt-tickets',
+        ticketIds,
+    });
 }
 
 // AD-149 permanent fix — the heartbeat architecture.
@@ -390,75 +344,13 @@ function expireStaleAgent(session, reason = 'detection_stale') {
     return true;
 }
 
-// AD-247: heartbeat-ONLY. Mirrors AD-232 (comments route) and AD-244
-// (terminal-status poll + captureHeartbeat). This path used to CREATE a fresh
-// in_progress execution if the ticket had none — which meant any ticket the
-// terminal session merely *saw* (typed-in ID, /execute call) would flip into a
-// false Running state. Per Sameer's spec on AD-232: Running must come from an
-// explicit UI Run button (/api/run → runExecution.ts already writes the
-// in_progress record before /execute is called). Polling/heartbeat never
-// creates execution rows; it only keeps alive what's already alive.
-function bumpExecutionForActiveTickets(projectId, ticketIds) {
-    if (!ticketIds?.length) return;
-    const boardData = readBoard(projectId);
-    if (!boardData?.tickets?.length) return;
-
-    const ids = new Set(ticketIds.map(id => String(id).toUpperCase()));
-    const now = new Date().toISOString();
-    let changed = false;
-
-    for (const ticket of boardData.tickets) {
-        if (!ids.has(String(ticket.id || '').toUpperCase())) continue;
-        const prior = ticket.execution;
-        // Heartbeat-only: only refresh updatedAt on tickets already running.
-        // Tickets without an in_progress execution stay idle — Run button is
-        // the sole creator (runExecution.ts).
-        if (prior?.status !== 'in_progress') continue;
-
-        ticket.execution = { ...prior, updatedAt: now };
-        ticket.updatedAt = now;
-        changed = true;
-    }
-
-    if (changed) writeBoard(boardData, projectId);
-}
-
 function autoCompleteTickets(projectId, ticketIds, reason = 'auto_cleared') {
     if (!ticketIds?.length) return;
-    const boardData = readBoard(projectId);
-    if (!boardData?.tickets?.length) return;
-
-    const ids = new Set(ticketIds.map(id => String(id).toUpperCase()));
-    const now = new Date().toISOString();
-    let changed = false;
-
-    for (const ticket of boardData.tickets) {
-        if (!ids.has(String(ticket.id || '').toUpperCase())) continue;
-        const prior = ticket.execution || {};
-        // Respect explicit agent completion — don't overwrite a proper done/
-        // blocked record that was PATCHed via the feedback API.
-        if (prior.status !== 'in_progress') continue;
-
-        ticket.execution = {
-            ...prior,
-            status: 'done',
-            result: reason,
-            completedAt: now,
-            updatedAt: now,
-        };
-        if (!Array.isArray(ticket.activity)) ticket.activity = [];
-        ticket.activity.push({
-            action: 'execution_completed',
-            by: prior.actor || 'Coding Agent',
-            byType: 'ai',
-            at: now,
-            reason,
-        });
-        ticket.updatedAt = now;
-        changed = true;
-    }
-
-    if (changed) writeBoard(boardData, projectId);
+    postTerminalRunState(projectId, {
+        action: 'auto-complete-tickets',
+        ticketIds,
+        reason,
+    });
 }
 
 function startHeartbeat(session) {
@@ -489,9 +381,10 @@ function startHeartbeat(session) {
 
 function anyActiveRunExceededMaxDuration(projectId, ticketIds, runId = null) {
     if (!ticketIds?.length) return false;
-    const boardData = readBoard(projectId);
-    const cutoff = Date.now() - MAX_RUN_DURATION_MS;
-    return hasActiveRunExceededMaxDuration(boardData, ticketIds, cutoff, runId);
+    const session = getSession(projectId);
+    if (!session || (runId && session.activeRunId !== runId)) return false;
+    const startedMs = new Date(session.activeRunStartedAt || session.requestState?.startedAt || '').getTime();
+    return Number.isFinite(startedMs) && Date.now() - startedMs > MAX_RUN_DURATION_MS;
 }
 
 function stopHeartbeat(session) {
@@ -505,8 +398,10 @@ function confirmActiveRunTickets(session) {
     session.requestState.status = 'running';
     session.requestState.updatedAt = new Date().toISOString();
     session.requestState.lastEvent = 'agent_confirmed';
-    try { bumpExecutionForActiveTickets(session.projectId, session.activeRunTicketIds); } catch {}
-    try { heartbeatActiveRuns(session.projectId, session.activeRunTicketIds, session.activeRunId); } catch {}
+    // AD-307/AD-221: keep heartbeats in memory. The browser polls /status for
+    // captureTicketIds and renders running state directly; persisting every
+    // tick to board.json caused multi-minute feedback-lock queues while a run
+    // animation was active.
 }
 
 // Server-startup recovery: any ticket left with execution.status='in_progress'
@@ -518,40 +413,8 @@ function recoverStaleInProgressTickets() {
         const registry = JSON.parse(fs.readFileSync(REGISTRY_PATH, 'utf-8'));
         const projects = Array.isArray(registry.projects) ? registry.projects : [];
         for (const project of projects) {
-            try {
-                const boardPath = path.join(project.path, BOARD_RELATIVE_PATH);
-                if (!fs.existsSync(boardPath)) continue;
-                const boardData = JSON.parse(fs.readFileSync(boardPath, 'utf-8'));
-                if (!boardData?.tickets?.length) continue;
-                const now = new Date().toISOString();
-                let changed = false;
-                if (Array.isArray(boardData.activeRuns)) {
-                    for (const run of boardData.activeRuns) {
-                        if (!ACTIVE_RUN_STATUSES.has(run.status)) continue;
-                        run.status = 'stale';
-                        run.updatedAt = now;
-                        run.completedAt = now;
-                        run.blocker = run.blocker || 'Terminal server restarted while run was in progress.';
-                        changed = true;
-                    }
-                }
-                for (const ticket of boardData.tickets) {
-                    if (ticket.execution?.status === 'in_progress') {
-                        ticket.execution = {
-                            ...ticket.execution,
-                            status: 'blocked',
-                            updatedAt: now,
-                            blocker: ticket.execution.blocker || 'Terminal server restarted while run was in progress.',
-                        };
-                        ticket.updatedAt = now;
-                        changed = true;
-                    }
-                }
-                if (changed) {
-                    fs.writeFileSync(boardPath, JSON.stringify(boardData, null, 2) + '\n', 'utf-8');
-                    console.log(`Recovered stale in_progress executions for project ${project.id || project.path}`);
-                }
-            } catch {}
+            if (!project?.id) continue;
+            postTerminalRunState(project.id, { action: 'recover-stale' });
         }
     } catch {}
 }
@@ -595,8 +458,9 @@ function setActiveRunTickets(session, ticketIds = [], runId = null) {
     if (!session) return;
     session.activeRunTicketIds = Array.from(new Set(ticketIds.filter(Boolean)));
     session.activeRunId = runId || null;
+    session.activeRunStartedAt = session.activeRunTicketIds.length > 0 ? new Date().toISOString() : null;
     session.requestState.status = session.activeRunTicketIds.length > 0 ? 'dispatching' : 'idle';
-    session.requestState.startedAt = session.activeRunTicketIds.length > 0 ? new Date().toISOString() : null;
+    session.requestState.startedAt = session.activeRunStartedAt;
     session.requestState.updatedAt = new Date().toISOString();
     session.requestState.lastEvent = session.activeRunTicketIds.length > 0 ? 'request_started' : 'request_cleared';
     scheduleActiveRunClear(session);
@@ -635,6 +499,7 @@ function clearActiveRunTickets(session, reason = 'cleared') {
     }
     session.requestState.status = reason === 'interrupted' ? 'interrupted' : 'idle';
     session.requestState.startedAt = null;
+    session.activeRunStartedAt = null;
     session.requestState.updatedAt = new Date().toISOString();
     session.requestState.lastEvent = reason;
     // AD-149 permanent fix: close out the heartbeat. Skip auto-complete for
@@ -685,6 +550,33 @@ function stripAnsi(text) {
     return text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\x1b\][^]*(?:|\x1b\\)/g, '');
 }
 
+function restoreAgentFromTail(session) {
+    if (!session || session.agentState.active) return;
+    const normalized = String(session.outputTail || '').toLowerCase();
+    if (!normalized.trim()) return;
+    if (
+        normalized.includes('openai codex') ||
+        normalized.includes('codex (v') ||
+        normalized.includes('codex cli') ||
+        normalized.includes('codex v') ||
+        normalized.includes('full auto mode') ||
+        normalized.includes('ctrl+e to explain')
+    ) {
+        setAgentActive(session, 'Codex');
+        return;
+    }
+    if (
+        normalized.includes('esc to interrupt') ||
+        normalized.includes('summarize code changes after completion') ||
+        normalized.includes('press ctrl-c again to quit') ||
+        normalized.includes('claude code v') ||
+        normalized.includes('bypass permissions on') ||
+        normalized.includes('shift+tab to cycle')
+    ) {
+        setAgentActive(session, 'Claude Code');
+    }
+}
+
 function detectAgentCommand(session, command) {
     if (!session) return;
     const normalized = command.trim().toLowerCase();
@@ -728,6 +620,28 @@ function detectAgentCommand(session, command) {
     if (normalized === 'continue' || normalized.startsWith('continue ')) {
         setAgentActive(session, 'Continue');
     }
+}
+
+function extractDirectWorkTicketIds(text) {
+    const normalized = String(text || '').toLowerCase();
+    if (!normalized.trim()) return [];
+    const hasWorkIntent = /\b(work(?:ing)? on|fix(?:ing)?|implement(?:ing)?|handle|address|take|start|run|do|look at|investigate|claim)\b/.test(normalized);
+    if (!hasWorkIntent) return [];
+    const ids = new Set();
+    for (const match of String(text).matchAll(/\b(?:AD|VD)-\d+\b/gi)) {
+        ids.add(match[0].toUpperCase());
+    }
+    return Array.from(ids);
+}
+
+function maybeStartDirectTerminalRun(session, text) {
+    if (!session?.agentState?.active) return;
+    if (session.activeRunTicketIds.length > 0) return;
+    const ticketIds = extractDirectWorkTicketIds(text);
+    if (ticketIds.length === 0) return;
+    const runId = `direct-${Date.now().toString(36)}-${ticketIds.join('-').toLowerCase()}`;
+    setActiveRunTickets(session, ticketIds, runId);
+    confirmActiveRunTickets(session);
 }
 
 function detectAgentOutput(session, data) {
@@ -917,6 +831,10 @@ function inspectTerminalInput(session, data) {
     // them into the agent-command detector; pasted text can contain arbitrary
     // ticket IDs and newlines, but it is still just user input.
     if (data.startsWith('\x1b[200~')) {
+        const pasted = data
+            .replace(/^\x1b\[200~/, '')
+            .replace(/\x1b\[201~$/, '');
+        maybeStartDirectTerminalRun(session, pasted);
         return data;
     }
 
@@ -927,6 +845,7 @@ function inspectTerminalInput(session, data) {
 
     const command = buf.slice(0, newlineIndex);
     session.agentInputBuffer = buf.slice(newlineIndex + 1);
+    maybeStartDirectTerminalRun(session, command);
     detectAgentCommand(session, command);
     // Raw terminal input is opaque user data. Ticket context is injected only
     // via the explicit run paths, never by heuristically rewriting typed or
@@ -952,9 +871,10 @@ function createSessionState(projectId) {
         shellBuffer: seededBuffer,
         shellBufferLength: seededLength,
         agentInputBuffer: '',
-        outputTail: '',
+        outputTail: seededBuffer.join('').slice(-4000),
         activeRunTicketIds: [],
         activeRunId: null,
+        activeRunStartedAt: null,
         clearActiveRunTimeout: null,
         historyWriteTimeout: null,
         agentState: { active: false, name: null, lastDetectedAt: 0 },
@@ -1061,10 +981,12 @@ function getOrCreateSession(projectId) {
 }
 
 function snapshotSessionStatus(session) {
-    // AD-156 reopen #2: also check on the read path so /status (which Run's
-    // agentReady gate consults) reports an honest agentActive even when no
-    // output has flowed since the agent exited.
-    if (session) expireStaleAgent(session, 'detection_stale');
+    // AD-221: status reads must not clear active runs. The browser polls this
+    // endpoint every 2s, so using it as a detection-stale sweeper recreated the
+    // premature mascot-stop bug while agents were busy in long quiet turns.
+    if (session) {
+        restoreAgentFromTail(session);
+    }
     if (!session) {
         return {
             connected: false,

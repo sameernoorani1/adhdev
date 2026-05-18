@@ -35,6 +35,14 @@ Codebase 1.zip
 .relates.txt
 .tags.txt
 *.bak
+adhdev-board-*.tgz
+next-env.d.zip
+.tmp-tgz-audit/
+
+# Per-ticket audit / report outputs (private, gitignored)
+audit-report.md
+build-check.md
+adhdev-overview.md
 ─────────────────────────────────────────────────────────────────
 
 # Per-user Claude Code permissions (shared settings.json, if any, stays tracked)

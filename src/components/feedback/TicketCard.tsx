@@ -167,7 +167,7 @@ export function TicketCard({
     const isExecuting = activeRunStatus === 'running'
         || activeRunStatus === 'finishing'
         || (!activeRunStatus && isTicketExecutionActive(ticket, activeExecutionIds));
-    // VD-109: detect AI-created tickets
+    // detect AI-created tickets
     const createdActivity = ticket.activity?.find(entry => entry.action === 'created');
     const createdByType = ticket.createdByType || createdActivity?.byType;
     const isAiCreated = ticket.sourceMessageId ||
@@ -179,7 +179,7 @@ export function TicketCard({
         ticket.reporter?.toLowerCase().includes('codex') ||
         ticket.reporter?.toLowerCase() === 'ai';
     const creatorLabel = ticket.sourceMessageId
-        ? `AI for ${ticket.reporter || 'Sameer'}`
+        ? `AI for ${ticket.reporter || 'you'}`
         : isAiCreated
             ? 'AI'
             : 'Human';

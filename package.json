@@ -1,9 +1,9 @@
 {
   "name": "adhdev-board",
-  "version": "0.1.0",
-  "description": "The AI agent control plane for developers who don't want to babysit their agents.",
+  "version": "0.2.0",
+  "description": "The board that holds what your brain can't — a local kanban for AI-assisted software work.",
   "author": "Sameer Noorani <github.com/sameernoorani1>",
-  "license": "Apache-2.0",
+  "license": "AGPL-3.0-or-later",
   "homepage": "https://github.com/sameernoorani1/adhdev#readme",
   "repository": {
     "type": "git",
@@ -33,7 +33,6 @@
     ".next/react-loadable-manifest.json",
     "next.config.mjs",
     "tsconfig.json",
-    "ADHDEV.md",
     "README.md",
     "CONTRIBUTING.md",
     "LICENSE"

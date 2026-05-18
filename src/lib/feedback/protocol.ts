@@ -73,7 +73,7 @@ export function buildInlineContractNotice(
     contract: AdhdevExecutionContract = getDefaultExecutionContract(),
     userName: string = DEFAULT_USER_DISPLAY_NAME,
 ): string {
-    return `⚠️ AI EXECUTION CONTRACT v${contract.version} — MANDATORY. Before acting on this ticket: (1) Read ADHDEV.md in the project root (2) Read the FULL ticket entry including all comments and activity (3) Post a plan comment before implementation (4) Keep status and execution state accurate (5) Reply to ${userName}'s @mentions in comments (6) Post completion comment with summary, files_touched, verification (7) AI may only set status: ${contract.allowedAgentStatuses.join(', ')} (8) Done requires: ${contract.doneRequires.join(', ')} (9) Address the user as "${userName}" — never as "human"/"user" (10) Include in your Ack Block: ✅ ACK: Embedded Contract Read + ✅ ACK: ADHDev.MD Read`;
+    return `⚠️ AI EXECUTION CONTRACT v${contract.version} — MANDATORY. Before acting on this ticket: (1) Read ADHDEV.md in the project root (2) Read the FULL ticket entry including all comments and activity (3) Use POST /api/feedback/agent-claim before implementation so the live running state starts (4) Keep status and execution state accurate (5) Reply to ${userName}'s @mentions in comments (6) Post completion comment with summary, files_touched, verification (7) AI may only set status: ${contract.allowedAgentStatuses.join(', ')} (8) Done requires: ${contract.doneRequires.join(', ')} (9) Address the user as "${userName}" — never as "human"/"user" (10) Include in your Ack Block: ✅ ACK: Embedded Contract Read + ✅ ACK: ADHDev.MD Read`;
 }
 
 export function buildAdhdevProtocol(prefix = 'AD', userName: string = DEFAULT_USER_DISPLAY_NAME): string {
@@ -135,6 +135,7 @@ Rules:
 ## Commenting Rules
 
 - Comment before implementation with a plan.
+- For direct CLI work, claim the ticket through \`POST http://localhost:3111/api/feedback/agent-claim\` before implementation. That explicit claim opens the ticket's live running state; ordinary comments do not.
 - Comment after implementation with summary, files touched, and verification.
 - If a human mentions an AI in comments, agents should respond in comments rather than silently changing state.
 - Comments should capture reasoning, not only outcomes.
@@ -291,7 +292,11 @@ function ensureClaudeMdReference(projectRoot: string) {
     fs.writeFileSync(claudeMdPath, existing + separator + block + '\n', 'utf-8');
 }
 
-export function ensureAdhdevProtocol(projectRoot: string, prefix = 'AD') {
+export function ensureAdhdevProtocol(
+    projectRoot: string,
+    prefix = 'AD',
+    options: { writeClaudeMdRef?: boolean } = {},
+) {
     const protocolPath = path.join(projectRoot, ADHDEV_PROTOCOL_FILENAME);
     const userName = readUserDisplayName(projectRoot);
     const nextContent = buildAdhdevProtocol(prefix, userName);
@@ -303,7 +308,17 @@ export function ensureAdhdevProtocol(projectRoot: string, prefix = 'AD') {
         fs.writeFileSync(protocolPath, nextContent, 'utf-8');
     }
 
-    // TODO: re-enable after testing — ensureClaudeMdReference(projectRoot);
+    // AD-302: inject a CLAUDE.md ADHDev block so a fresh Claude Code session
+    // in a registered project knows the board exists even before any ticket
+    // is run (the per-run execution contract only fires when an agent is
+    // dispatched against a specific ticket). Gated to project-init only —
+    // running it from every readFeedback would race against users editing
+    // their own CLAUDE.md and would also re-append the auto-injected block
+    // to existing CLAUDE.md files that already had the same content
+    // hand-authored without the marker pair.
+    if (options.writeClaudeMdRef) {
+        ensureClaudeMdReference(projectRoot);
+    }
 
     return protocolPath;
 }

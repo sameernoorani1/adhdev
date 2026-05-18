@@ -3,6 +3,7 @@ import { readFeedback, resolveTicketById, writeFeedback, withFeedbackLock, check
 import { addPendingMention, clearPendingMention } from '@/lib/feedback/pendingMentions';
 import { readUserDisplayName, DEFAULT_USER_DISPLAY_NAME } from '@/lib/feedback/protocol';
 import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
+import { heartbeatActiveRuns } from '@/lib/feedback/runs';
 
 // AD-011: resolve user display name from project config, replacing the
 // previously hardcoded 'Sameer' literal in author/activity defaults.
@@ -76,15 +77,13 @@ export async function POST(
             data.tickets[index].updatedAt = now;
             if (!data.tickets[index].activity) data.tickets[index].activity = [];
 
-            // AD-232: AI comments only HEARTBEAT an already-running execution
-            // ON A TICKET WHOSE STATUS INDICATES ACTIVE WORK. They no longer
-            // START executions, and they no longer keep stale ones alive.
+            // AD-221 final: AI comments only HEARTBEAT an already-running
+            // execution/activeRun. They never start running state; explicit
+            // starts come from UI Run, run-terminal, or agent-claim.
             // The double guard (execution=in_progress AND ticket.status active)
             // closes the regression where an auto-claim comment landing on an
             // already-done ticket bumped updatedAt and resurrected the
-            // running indicator. Sameer's call: running state must be linked
-            // to UI triggers alone (Run button → /api/run / /api/run-terminal),
-            // not to the existence of any AI comment.
+            // running indicator.
             if (body.authorType === 'ai') {
                 const t = data.tickets[index];
                 const prior = t.execution as Record<string, unknown> | undefined;
@@ -94,11 +93,11 @@ export async function POST(
                     // Heartbeat keep-alive — keeps the running indicator from
                     // decaying while the agent is mid-run posting comments.
                     t.execution = { ...prior, updatedAt: now } as typeof t.execution;
+                    heartbeatActiveRuns(data, [t.id], now, typeof prior.runId === 'string' ? prior.runId : null);
                 }
-                // Otherwise: leave execution untouched. Tickets worked via
-                // direct terminal chat without first clicking Run won't show
-                // running state, and stale executions on done/backlog/reopen
-                // tickets won't be resurrected by an AI comment.
+                // Otherwise: leave execution untouched. Direct CLI work must
+                // call agent-claim to open running state; ordinary comments do
+                // not resurrect stale or completed work.
             }
 
             // Targeted AI mention detection — supports @claude, @codex, @chatgpt, and @ai

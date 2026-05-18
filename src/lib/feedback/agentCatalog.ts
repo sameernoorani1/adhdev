@@ -32,7 +32,7 @@ export const RECOGNISED_CLIS: AgentDef[] = [
     },
     {
         id: 'Codex', label: 'Codex', runCommand: 'codex',
-        installSupported: true, installHint: 'npm i -g @openai/codex',
+        installSupported: true, installHint: 'npm i -g @openai/codex@latest',
         variants: [
             { id: 'standard',  label: 'Standard',       flags: '',                                                       help: 'Default Codex CLI behavior.' },
             { id: 'auto-edit', label: 'Workspace auto', flags: '--sandbox workspace-write --ask-for-approval on-request', help: 'Allows workspace edits and asks before riskier actions.' },

@@ -5,6 +5,7 @@ import { terminalAuthHeaders } from './sessionToken';
 import { getCurrentGitSha } from './gitDiff';
 import { getActiveProject, getProjectById } from './registry';
 import { createRunRecord, markRunFailed, markRunSubmitted, upsertRun } from './runs';
+import { buildRunContextBrief } from './runContextBrief';
 import fs from 'fs';
 import path from 'path';
 
@@ -30,6 +31,7 @@ export interface RunExecutionResult {
     success: boolean;
     terminal: boolean;
     agentReady: boolean;
+    pendingLaunch?: boolean;
     agentName?: string | null;
     ticketIds: string[];
     prompt: string;
@@ -40,6 +42,11 @@ export interface RunExecutionResult {
     activeRun?: FeedbackRun;
 }
 
+interface AgentPromptOptions {
+    agentRequirement?: 'optional' | 'required';
+    taskLabel?: string;
+}
+
 interface TerminalAgentStatus {
     connected: boolean;
     agentActive: boolean;
@@ -48,8 +55,14 @@ interface TerminalAgentStatus {
 
 async function getTerminalAgentStatus(projectId?: string | null): Promise<TerminalAgentStatus> {
     try {
+        // AD-300: the original 2s budget timed out under load (4-shell sessions,
+        // mid-cogitation), so the Run pre-flight saw `connected: false` and
+        // refused to dispatch even though the user could see the agent
+        // chugging in the pane. 6s comfortably covers a busy terminal server
+        // without making the UI feel stuck — the /status snapshot is otherwise
+        // cheap, so a longer tail is fine.
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 2000);
+        const timeout = setTimeout(() => controller.abort(), 6000);
         // AD-141: scope the status probe to this project so a run on one board
         // doesn't see another board's agent state.
         const statusUrl = projectId
@@ -78,6 +91,7 @@ export async function executeAgentPrompt(
     projectId?: string | null,
     ticketIds?: string[],
     runId?: string | null,
+    options: AgentPromptOptions = {},
 ): Promise<RunExecutionResult> {
     const trimmedPrompt = prompt.trim();
     const terminalStatus = await getTerminalAgentStatus(projectId);
@@ -106,6 +120,21 @@ export async function executeAgentPrompt(
             prompt: trimmedPrompt,
             autoOpenTerminal: true,
             message: 'Terminal is not connected. Open the terminal pane and start your coding agent.',
+            guidance,
+        };
+    }
+
+    if (options.agentRequirement === 'required' && !terminalStatus.agentActive) {
+        return {
+            success: false,
+            terminal: true,
+            agentReady: false,
+            agentName: terminalStatus.agentName,
+            ticketIds: ticketIds || [],
+            prompt: trimmedPrompt,
+            autoOpenTerminal: true,
+            pendingLaunch: true,
+            message: `${options.taskLabel || 'This task'} needs a running coding agent. Launch an agent in the terminal, then retry.`,
             guidance,
         };
     }
@@ -173,9 +202,10 @@ export async function executeAgentPrompt(
     };
 }
 
-export async function executeRunPrompt(ticketIds: string[], projectId?: string | null): Promise<RunExecutionResult> {
+export async function executeRunPrompt(ticketIds: string[], projectId?: string | null, options: AgentPromptOptions = {}): Promise<RunExecutionResult> {
     const ids = Array.from(new Set(ticketIds.map(id => id.trim()).filter(Boolean)));
-    const prompt = buildRunPrompt(ids, boardSizeWarning());
+    const contextBrief = ids.length > 0 ? buildRunContextBrief(readFeedback(projectId), ids) : '';
+    const prompt = buildRunPrompt(ids, boardSizeWarning(), contextBrief);
 
     if (ids.length === 0) {
         return {
@@ -201,6 +231,21 @@ export async function executeRunPrompt(ticketIds: string[], projectId?: string |
             prompt,
             autoOpenTerminal: true,
             message: 'Terminal is not connected. Open the terminal pane and start your coding agent.',
+            guidance,
+        };
+    }
+
+    if (options.agentRequirement === 'required' && !terminalStatus.agentActive) {
+        return {
+            success: false,
+            terminal: true,
+            agentReady: false,
+            agentName: terminalStatus.agentName,
+            ticketIds: ids,
+            prompt,
+            autoOpenTerminal: true,
+            pendingLaunch: true,
+            message: `${options.taskLabel || 'This run'} needs a running coding agent. Launch an agent in the terminal, then retry.`,
             guidance,
         };
     }

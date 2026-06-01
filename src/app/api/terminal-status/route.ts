@@ -13,7 +13,7 @@ const TERMINAL_URL = 'http://localhost:3112';
 export async function GET(request: NextRequest) {
     try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 2000);
+        const timeout = setTimeout(() => controller.abort(), 6000);
         const projectId = request.nextUrl.searchParams.get('project');
         const statusUrl = projectId
             ? `${TERMINAL_URL}/status?project=${encodeURIComponent(projectId)}`
@@ -25,7 +25,7 @@ export async function GET(request: NextRequest) {
             const data = await res.json();
             // AD-307/AD-221: terminal-status is volatile liveness data. The
             // client consumes captureTicketIds directly for the running UI, so
-            // this 2s poll must not write board.json. Persist only lifecycle
+            // this status poll must not write board.json. Persist only lifecycle
             // edges: run start, completion, interruption, and stale recovery.
             return NextResponse.json({
                 connected: true,

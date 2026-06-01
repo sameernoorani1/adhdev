@@ -79,6 +79,17 @@ export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessage
         return () => clearInterval(t);
     }, [open, load]);
 
+    // AD-294: focus the composer textarea when the pane opens so paste/type
+    // works without an extra click. Defer one frame so the slide-in transition
+    // has mounted the textarea and the panel is on-screen — focusing while the
+    // pane is still translated off-screen has caused mobile Safari to scroll
+    // the parent unexpectedly.
+    useEffect(() => {
+        if (!open) return;
+        const t = setTimeout(() => textareaRef.current?.focus(), 60);
+        return () => clearTimeout(t);
+    }, [open]);
+
     // Scroll to bottom on new messages.
     useEffect(() => {
         if (!open) return;
@@ -297,11 +308,19 @@ export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessage
 
     return (
         <>
-            {/* AD-188: backdrop for click-outside dismiss + dim/blur */}
+            {/* AD-188: backdrop for click-outside dismiss + dim/blur.
+                AD-321: bumped opacity from black/40 + blur-sm to black/70 +
+                blur-md. The lighter backdrop was leaving the terminal pane's
+                Launch button (and the rest of the topbar) visibly bleeding
+                through, which the user read as "the terminal Launch button
+                shows on the Brain Dump" — a layering artifact, not an actual
+                button in this panel. The darker backdrop makes the Brain Dump
+                read as the active surface without changing the terminal pane's
+                layout. */}
             <div
                 onClick={onClose}
                 aria-hidden="true"
-                className={`fixed inset-0 z-30 bg-black/40 backdrop-blur-sm transition-opacity duration-200 ${
+                className={`fixed inset-0 z-30 bg-black/70 backdrop-blur-md transition-opacity duration-200 ${
                     open ? 'opacity-100' : 'opacity-0 pointer-events-none'
                 }`}
             />

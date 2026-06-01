@@ -7,6 +7,7 @@ import { validateAgentTransition } from '@/lib/feedback/transitions';
 import { recordOnboardingEvent } from '@/lib/feedback/onboardingEvents';
 import { getDiffFiles } from '@/lib/feedback/gitDiff';
 import { markRunTerminal } from '@/lib/feedback/runs';
+import { getMissingExecutionCommentError, hasSubstantiveAiCommentForExecution } from '@/lib/feedback/executionComments';
 
 const ALLOWED_PRIORITIES = new Set(['low', 'medium', 'high', 'critical']);
 const ALLOWED_TICKET_TYPES = new Set(['normal', 'discussion', 'issue', 'idea', 'onboarding']);
@@ -469,6 +470,17 @@ export async function PATCH(request: NextRequest) {
             const completionComment = buildAiCompletionComment(actor, mergedExecution);
             nextComments.push(completionComment);
             syntheticComments.push(completionComment);
+        }
+
+        if (
+            actorType === 'ai' &&
+            updates.execution?.status === 'done' &&
+            !hasSubstantiveAiCommentForExecution(nextComments, actor, mergedExecution?.startedAt)
+        ) {
+            return NextResponse.json(
+                { error: getMissingExecutionCommentError(ticket.id) },
+                { status: 403 },
+            );
         }
 
         // ── Agent transition enforcement ────────────────────────

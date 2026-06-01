@@ -16,6 +16,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { shouldAutoCompleteOnClear } from './clearActiveRunRules.mjs';
+import { detectAgentFromTerminalTail, extractDirectWorkTicketIds } from './directWorkIntent.mjs';
 
 const PORT = parseInt(process.env.TERMINAL_PORT || '3112', 10);
 
@@ -508,13 +509,18 @@ function clearActiveRunTickets(session, reason = 'cleared') {
     // AD-178 — they fire mid-run). 'cleared' (the default) is also skipped
     // because callers that pass no reason haven't asserted the agent is gone.
     stopHeartbeat(session);
-    if (priorIds.length > 0 && (reason === 'interrupted' || shouldAutoCompleteOnClear(reason))) {
+    if (priorIds.length > 0 && reason !== 'cleared') {
         try { markActiveRunsTerminal(session.projectId, priorIds, reason); } catch {}
     }
     session.activeRunId = null;
     if (priorIds.length > 0 && shouldAutoCompleteOnClear(reason)) {
         try { autoCompleteTickets(session.projectId, priorIds, reason); } catch {}
     }
+}
+
+function isActiveRunOldEnoughToClear(session) {
+    const startedMs = new Date(session?.activeRunStartedAt || session?.requestState?.startedAt || '').getTime();
+    return Number.isFinite(startedMs) && Date.now() - startedMs > 5000;
 }
 
 function setAgentActive(session, name) {
@@ -552,29 +558,8 @@ function stripAnsi(text) {
 
 function restoreAgentFromTail(session) {
     if (!session || session.agentState.active) return;
-    const normalized = String(session.outputTail || '').toLowerCase();
-    if (!normalized.trim()) return;
-    if (
-        normalized.includes('openai codex') ||
-        normalized.includes('codex (v') ||
-        normalized.includes('codex cli') ||
-        normalized.includes('codex v') ||
-        normalized.includes('full auto mode') ||
-        normalized.includes('ctrl+e to explain')
-    ) {
-        setAgentActive(session, 'Codex');
-        return;
-    }
-    if (
-        normalized.includes('esc to interrupt') ||
-        normalized.includes('summarize code changes after completion') ||
-        normalized.includes('press ctrl-c again to quit') ||
-        normalized.includes('claude code v') ||
-        normalized.includes('bypass permissions on') ||
-        normalized.includes('shift+tab to cycle')
-    ) {
-        setAgentActive(session, 'Claude Code');
-    }
+    const agentName = detectAgentFromTerminalTail(session.outputTail || '');
+    if (agentName) setAgentActive(session, agentName);
 }
 
 function detectAgentCommand(session, command) {
@@ -620,18 +605,6 @@ function detectAgentCommand(session, command) {
     if (normalized === 'continue' || normalized.startsWith('continue ')) {
         setAgentActive(session, 'Continue');
     }
-}
-
-function extractDirectWorkTicketIds(text) {
-    const normalized = String(text || '').toLowerCase();
-    if (!normalized.trim()) return [];
-    const hasWorkIntent = /\b(work(?:ing)? on|fix(?:ing)?|implement(?:ing)?|handle|address|take|start|run|do|look at|investigate|claim)\b/.test(normalized);
-    if (!hasWorkIntent) return [];
-    const ids = new Set();
-    for (const match of String(text).matchAll(/\b(?:AD|VD)-\d+\b/gi)) {
-        ids.add(match[0].toUpperCase());
-    }
-    return Array.from(ids);
 }
 
 function maybeStartDirectTerminalRun(session, text) {
@@ -796,12 +769,15 @@ function detectAgentOutput(session, data) {
         session.activeRunTicketIds.length > 0 &&
         (
             chunk.includes('waiting for your input') ||
-            chunk.includes('awaiting your input')
+            chunk.includes('awaiting your input') ||
+            (
+                (chunk.includes('bypass permissions on') || chunk.includes('shift+tab to cycle')) &&
+                !chunk.includes('esc to interrupt') &&
+                isActiveRunOldEnoughToClear(session)
+            )
         )
     ) {
-        // Keep the active Run visible while the agent is awaiting input.
-        // This is still live work from the board's perspective.
-        scheduleActiveRunClear(session);
+        clearActiveRunTickets(session, 'agent_idle');
     }
 }
 
@@ -1111,7 +1087,7 @@ const httpServer = createServer((req, res) => {
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
             try {
-                const { command, ticketId, ticketIds, batchId, projectId: rawProjectId, runId } = JSON.parse(body);
+                const { command, ticketId, ticketIds, batchId, projectId: rawProjectId, runId, submitMode } = JSON.parse(body);
                 if (!command) {
                     res.writeHead(400);
                     res.end(JSON.stringify({ error: 'Command required' }));
@@ -1131,7 +1107,19 @@ const httpServer = createServer((req, res) => {
                         : batchId
                             ? [batchId]
                             : [];
-                setActiveRunTickets(session, normalizedTicketIds, typeof runId === 'string' ? runId : null);
+                const shellSubmit = submitMode === 'shell';
+                if (!shellSubmit) {
+                    setActiveRunTickets(session, normalizedTicketIds, typeof runId === 'string' ? runId : null);
+                }
+
+                if (shellSubmit) {
+                    const stripped = command.replace(/[\r\n]+$/, '');
+                    session.shell.write(stripped + '\r');
+                    console.log(`Terminal shell command submitted for project ${projectId}`);
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ success: true, message: 'Shell command submitted', projectId }));
+                    return;
+                }
 
                 // AD-184 → AD-140 (round 2): the 80ms-gap fix from round 1
                 // was insufficient — reports kept coming in of the failure

@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { isTicketExecutionActive } from '@/lib/feedback/executionState';
+import { isUnreadAiTicket, type ReadTicketCursors } from '@/lib/feedback/readState';
 import { AgentMascot, type MascotAgent } from './AgentMascot';
 
 function inferMascotAgent(actor?: string | null): MascotAgent {
@@ -80,7 +81,7 @@ interface TicketCardProps {
     isSelected?: boolean;
     onToggleSelect?: (id: string) => void;
     isDragDisabled?: boolean;
-    readTickets?: Set<string>;
+    readTicketCursors?: ReadTicketCursors;
     activeExecutionIds?: Set<string>;
     activeRunStatus?: 'dispatching' | 'running' | 'finishing';
     hiddenFields?: Array<'status' | 'priority' | 'wave' | 'session' | 'mission'>;
@@ -137,7 +138,7 @@ export function TicketCard({
     isSelected,
     onToggleSelect,
     isDragDisabled,
-    readTickets,
+    readTicketCursors,
     activeExecutionIds,
     activeRunStatus,
     hiddenFields = [],
@@ -161,7 +162,7 @@ export function TicketCard({
     const priority = PRIORITY_CONFIG[ticket.priority] || PRIORITY_CONFIG.medium;
     const recent = isRecent(ticket.updatedAt);
     // 3-state dot: gold pulsing = unread AI response, purple = AI was last (read), grey = recently updated
-    const lastComment = ticket.comments.length > 0 ? ticket.comments[ticket.comments.length - 1] as { authorType?: string } : null;
+    const lastComment = ticket.comments.length > 0 ? ticket.comments[ticket.comments.length - 1] : null;
     const lastIsAi = lastComment?.authorType === 'ai';
     const isDispatching = activeRunStatus === 'dispatching';
     const isExecuting = activeRunStatus === 'running'
@@ -183,9 +184,7 @@ export function TicketCard({
         : isAiCreated
             ? 'AI'
             : 'Human';
-    // "Unread" = AI commented AND user hasn't opened this ticket since (tracked via readTickets set)
-    const isRead = readTickets?.has(ticket.id) ?? false;
-    const isUnreadAi = lastIsAi && !isRead;
+    const isUnreadAi = isUnreadAiTicket(ticket, readTicketCursors || {});
     const hiddenFieldSet = new Set(hiddenFields);
 
     return (

@@ -1,6 +1,8 @@
 'use client';
 
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 import { Ticket } from './TicketCard';
 import { CommentTimeline } from './CommentTimeline';
 import { ImageDropZone, UploadedFile } from './ImageDropZone';
@@ -284,38 +286,47 @@ interface TicketDetailModalProps {
 
 /** Description block with "See more" truncation for long descriptions */
 const DESC_MAX_LINES = 12;
+// AD-323: render the description as markdown so **bold**, lists, code spans and
+// links land formatted instead of as raw asterisks. Pipeline copied from
+// NotepadPane.tsx (AD-206): marked → DOMPurify → dangerouslySetInnerHTML.
+// DOMPurify strips <script>, on* handlers and javascript: URLs, so a ticket
+// description copied from anywhere is safe to render via innerHTML.
+function renderDescriptionHtml(md: string): string {
+    const raw = marked.parse(md, { async: false }) as string;
+    return DOMPurify.sanitize(raw, { USE_PROFILES: { html: true } });
+}
+
 function DescriptionBlock({ description }: { description: string }) {
     const [expanded, setExpanded] = useState(false);
     const lines = description.split('\n');
     const needsTruncation = lines.length > DESC_MAX_LINES || description.length > 600;
+    const visibleSource = needsTruncation && !expanded
+        ? lines.slice(0, DESC_MAX_LINES).join('\n') + (lines.length > DESC_MAX_LINES ? '\n…' : '')
+        : description;
+    const html = useMemo(() => renderDescriptionHtml(visibleSource), [visibleSource]);
 
     return (
         <div>
             <h4 className="text-xs text-vd-text-tertiary uppercase tracking-wider mb-1">Description</h4>
-            {needsTruncation && !expanded ? (
-                <>
-                    <p className="text-sm text-vd-text-secondary whitespace-pre-wrap">
-                        {lines.slice(0, DESC_MAX_LINES).join('\n')}{lines.length > DESC_MAX_LINES ? '…' : ''}
-                    </p>
-                    <button
-                        onClick={() => setExpanded(true)}
-                        className="text-xs text-vd-accent-gold hover:text-vd-accent-gold-light mt-1 font-medium"
-                    >
-                        See more ({lines.length - DESC_MAX_LINES > 0 ? `${lines.length - DESC_MAX_LINES} more lines` : 'full text'})
-                    </button>
-                </>
-            ) : (
-                <>
-                    <p className="text-sm text-vd-text-secondary whitespace-pre-wrap">{description}</p>
-                    {needsTruncation && (
-                        <button
-                            onClick={() => setExpanded(false)}
-                            className="text-xs text-vd-accent-gold hover:text-vd-accent-gold-light mt-1 font-medium"
-                        >
-                            See less
-                        </button>
-                    )}
-                </>
+            <div
+                className="text-sm text-vd-text-secondary adhdev-markdown"
+                dangerouslySetInnerHTML={{ __html: html }}
+            />
+            {needsTruncation && !expanded && (
+                <button
+                    onClick={() => setExpanded(true)}
+                    className="text-xs text-vd-accent-gold hover:text-vd-accent-gold-light mt-1 font-medium"
+                >
+                    See more ({lines.length - DESC_MAX_LINES > 0 ? `${lines.length - DESC_MAX_LINES} more lines` : 'full text'})
+                </button>
+            )}
+            {needsTruncation && expanded && (
+                <button
+                    onClick={() => setExpanded(false)}
+                    className="text-xs text-vd-accent-gold hover:text-vd-accent-gold-light mt-1 font-medium"
+                >
+                    See less
+                </button>
             )}
         </div>
     );
@@ -374,6 +385,10 @@ export function TicketDetailModal({
     const [toast, setToast] = useState<string | null>(null);
     const [isDraggingOver, setIsDraggingOver] = useState(false);
     const dragLeaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // AD-322: ref to the modal's root element so the paste handler can scope
+    // itself to the ticket-modal subtree (instead of listening on `document`,
+    // which leaked Brain Dump pastes into the ticket comment composer).
+    const modalRootRef = useRef<HTMLDivElement | null>(null);
     const [showAllStatuses, setShowAllStatuses] = useState(false);
     const [showMentionPopup, setShowMentionPopup] = useState(false);
     const commentTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -526,11 +541,30 @@ export function TicketDetailModal({
         }
     }, [uploadAndAdd]);
 
-    // Global paste handler — paste images anywhere in modal adds to comment images (+ )
+    // Modal-scoped paste handler — paste images anywhere INSIDE the ticket
+    // modal adds to the comment images.
+    //
+    // AD-322: previously this was attached to `document` and fired for ANY
+    // Ctrl+V on the page. When the Brain Dump pane was open alongside an
+    // open ticket detail (a common combo — triage one, dump another), a paste
+    // intended for the chat composer ALSO got swallowed by the ticket modal,
+    // duplicating the screenshot into both surfaces.
+    //
+    // Fix: bind the listener to the modal's root element instead of document.
+    // The modal occupies the viewport (z-50 fixed inset-0), so pastes that
+    // target the ticket area still fire normally — but the Brain Dump panel
+    // sits at a higher z-index and its textarea pastes never bubble here.
+    // ChatPane's own paste handler is already textarea-scoped (AD-186 reopen),
+    // and NewTicketModal's global paste only mounts when its `open` is true
+    // (not when only the detail modal is open), so the user's "don't break
+    // ticket comment / board-paste / brain-dump-paste" constraints all hold.
     useEffect(() => {
         if (!open) return;
-        const handlePaste = (e: ClipboardEvent) => {
-            const items = e.clipboardData?.items;
+        const root = modalRootRef.current;
+        if (!root) return;
+        const handlePaste = (e: Event) => {
+            const ev = e as ClipboardEvent;
+            const items = ev.clipboardData?.items;
             if (!items) return;
             const files: File[] = [];
             for (let i = 0; i < items.length; i++) {
@@ -540,12 +574,12 @@ export function TicketDetailModal({
                 }
             }
             if (files.length > 0) {
-                e.preventDefault();
+                ev.preventDefault();
                 uploadAndAdd(files);
             }
         };
-        document.addEventListener('paste', handlePaste);
-        return () => document.removeEventListener('paste', handlePaste);
+        root.addEventListener('paste', handlePaste);
+        return () => root.removeEventListener('paste', handlePaste);
     }, [open, uploadAndAdd]);
 
     // Escape to close
@@ -732,6 +766,7 @@ export function TicketDetailModal({
     return (
         <>
             <div
+                ref={modalRootRef}
                 className="fixed inset-0 z-50 flex items-end md:items-center justify-center"
                 style={modalViewportStyle}
                 onDragOver={handleModalDragOver}

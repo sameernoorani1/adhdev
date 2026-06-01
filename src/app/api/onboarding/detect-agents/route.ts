@@ -15,7 +15,7 @@ import { spawn } from 'node:child_process';
 // Args are passed array-form (no `shell: true`) per AD-238 to dodge DEP0190.
 // Response: { agents: { [id]: { installed: boolean, version: string|null } } }
 
-const PROBE_TIMEOUT_MS = 4000;
+const PROBE_TIMEOUT_MS = 2500;
 
 const AGENTS: Array<{ id: string; runCommand: string; versionFlag: string }> = [
     { id: 'Claude Code',  runCommand: 'claude',       versionFlag: '--version' },

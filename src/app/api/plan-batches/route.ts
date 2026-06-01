@@ -11,7 +11,11 @@ export async function POST(request: NextRequest) {
             : [];
 
         const prompt = buildBatchPlanningPrompt(normalizedMode, normalizedTicketIds);
-        const result = await executeAgentPrompt(prompt);
+        const projectId = request.headers.get('x-adhdev-project');
+        const result = await executeAgentPrompt(prompt, projectId, [], null, {
+            agentRequirement: 'required',
+            taskLabel: 'Batch planning',
+        });
 
         return NextResponse.json({
             ...result,

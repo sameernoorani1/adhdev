@@ -156,6 +156,27 @@
 .adhdev-terminal-host .xterm-screen {
   box-sizing: border-box;
 }
+/* AD-319: shield the xterm canvas + its DOM helpers from theme-level font
+   and letter-spacing overrides. The skin engine in SettingsModal applies
+   `body, button, input, select, textarea { font-family ... letter-spacing ... }`
+   with !important; letter-spacing is an inherited property, so EVERY
+   descendant — including xterm's internal <textarea> and renderer DOM —
+   picked up the spacing. xterm.js measures one glyph in isolation and
+   assumes all subsequent glyphs are exactly that wide, so a 0.04em or
+   0.02em theme letter-spacing accumulated across a long line and shifted
+   later characters off-screen. The "co     minutes" / "couple" → "co" + gap
+   symptom in light/cream themes was this drift hitting the right edge.
+   Force the host subtree back to a known monospace stack with no extra
+   spacing so the fit-addon's column count stays truthful regardless of
+   which theme is selected. */
+.adhdev-terminal-host,
+.adhdev-terminal-host *,
+.adhdev-terminal-host .xterm,
+.adhdev-terminal-host .xterm * {
+  letter-spacing: normal !important;
+  font-family: "Cascadia Code", "Cascadia Mono", "Fira Code", "JetBrains Mono", "Consolas", "Menlo", monospace !important;
+  text-transform: none !important;
+}
 /* AD-155 9th pass: pulse the Force-redraw button briefly after a placement
    change so users discover the recovery path when their old output is now
    mis-sized at the new pane width. xterm.js does not reflow already-rendered
@@ -232,3 +253,32 @@
     transparent 70%
   );
 }
+
+/* AD-323: minimal markdown styles for rendered ticket descriptions.
+   The Tailwind Typography plugin isn't installed; this is a deliberately
+   narrow rule set covering only the elements marked emits. Inherits text
+   color from the parent so theme switches still apply. */
+.adhdev-markdown { line-height: 1.55; }
+.adhdev-markdown p { margin: 0.4em 0; }
+.adhdev-markdown p:first-child { margin-top: 0; }
+.adhdev-markdown p:last-child { margin-bottom: 0; }
+.adhdev-markdown strong { color: rgb(var(--vd-text-primary)); font-weight: 600; }
+.adhdev-markdown em { font-style: italic; }
+.adhdev-markdown ul { list-style: disc; padding-left: 1.25em; margin: 0.4em 0; }
+.adhdev-markdown ol { list-style: decimal; padding-left: 1.5em; margin: 0.4em 0; }
+.adhdev-markdown li { margin: 0.15em 0; }
+.adhdev-markdown h1,
+.adhdev-markdown h2,
+.adhdev-markdown h3,
+.adhdev-markdown h4 { color: rgb(var(--vd-text-primary)); font-weight: 600; margin: 0.6em 0 0.3em; }
+.adhdev-markdown h1 { font-size: 1.05rem; }
+.adhdev-markdown h2 { font-size: 1rem; }
+.adhdev-markdown h3 { font-size: 0.95rem; }
+.adhdev-markdown h4 { font-size: 0.9rem; }
+.adhdev-markdown a { color: #F5B97F; text-decoration: underline; }
+.adhdev-markdown a:hover { color: #FFD2A0; }
+.adhdev-markdown code { color: #F5B97F; background: rgb(var(--vd-bg-tertiary)); padding: 0.05em 0.3em; border-radius: 3px; font-size: 0.9em; }
+.adhdev-markdown pre { background: rgb(var(--vd-bg-tertiary)); border: 1px solid rgb(var(--vd-border)); padding: 0.6em 0.75em; border-radius: 4px; overflow-x: auto; margin: 0.5em 0; }
+.adhdev-markdown pre code { background: transparent; padding: 0; color: inherit; }
+.adhdev-markdown blockquote { border-left: 3px solid rgb(var(--vd-border)); padding-left: 0.7em; margin: 0.4em 0; color: rgb(var(--vd-text-tertiary)); }
+.adhdev-markdown hr { border: 0; border-top: 1px solid rgb(var(--vd-border)); margin: 0.7em 0; }

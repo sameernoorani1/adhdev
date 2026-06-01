@@ -116,6 +116,26 @@ describe('terminal run-state mutations', () => {
         expect(data.activeRuns?.[0].status).toBe('interrupted');
     });
 
+    it('clears active runs for agent-idle without auto-completing tickets', () => {
+        const data = makeData();
+        upsertRun(data, createRunRecord({
+            runId: 'run-1',
+            ticketIds: ['AD-1'],
+            agent: 'Codex',
+            nowIso: '2026-05-15T00:00:00.000Z',
+        }));
+
+        expect(markTerminalActiveRunsCleared(data, ['AD-1'], 'agent_idle', '2026-05-15T00:01:00.000Z')).toBe(true);
+
+        expect(data.activeRuns?.[0]).toMatchObject({
+            status: 'stale',
+            blocker: 'Recovered: terminal run cleared (agent_idle).',
+        });
+        expect(data.tickets[0].execution).toMatchObject({
+            status: 'in_progress',
+        });
+    });
+
     it('auto-completes only still in-progress executions', () => {
         const data = makeData();
 

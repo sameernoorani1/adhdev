@@ -44,6 +44,13 @@ import { ErrorBoundary } from './ErrorBoundary';
 import { ChatPane } from './ChatPane';
 import { OnboardingWizard } from './OnboardingWizard';
 import { fetchWithAdhdevToken } from '@/lib/api/sessionToken';
+import {
+    getLatestCommentCursor,
+    LEGACY_READ_TICKETS_KEY,
+    migrateLegacyReadTickets,
+    READ_CURSORS_KEY,
+    type ReadTicketCursors,
+} from '@/lib/feedback/readState';
 
 // ADHDev brand icon — detailed brain with multi-directional arrows (v2 SVG)
 function ADHDevIcon({ className = 'w-6 h-6' }: { className?: string }) {
@@ -179,7 +186,6 @@ const FEEDBACK_POLL_MS = 2500;
 // AD-012: cross-tab broadcast channel. Renamed in the past; worst case during
 // a cutover is a stale tab missing one round of cross-tab updates until refresh.
 const FEEDBACK_BROADCAST_CHANNEL = 'adhdev-feedback-board';
-
 type PriorityFilter = Ticket['priority'];
 type SortBy = 'default' | 'priority' | 'newest' | 'updated';
 type TimeFilter = 'all' | 'today' | '7d' | '30d';
@@ -204,13 +210,20 @@ const STACK_FIELD_OPTIONS: Array<{ value: StackField; label: string }> = [
 ];
 
 const EMPTY_STACK_VALUE = '__empty__';
-const PRIORITY_GROUP_ORDER: Array<Ticket['priority']> = ['critical', 'high', 'medium', 'low'];
-const PRIORITY_GROUP_META: Record<Ticket['priority'], { label: string; colorBar: string }> = {
+// AD-320: "Unset" lane id for tickets whose priority is missing or not one
+// of the canonical four. dnd-kit needs a non-empty string id, so the lane is
+// keyed by '__unset_priority__' internally and translated back to '' when
+// the PATCH fires (the API treats falsy priority as "no priority set").
+const UNSET_PRIORITY_ID = '__unset_priority__';
+const PRIORITY_GROUP_ORDER: string[] = ['critical', 'high', 'medium', 'low', UNSET_PRIORITY_ID];
+const PRIORITY_GROUP_META: Record<string, { label: string; colorBar: string }> = {
     critical: { label: 'Critical', colorBar: 'bg-red-500' },
     high: { label: 'High', colorBar: 'bg-orange-500' },
     medium: { label: 'Medium', colorBar: 'bg-yellow-500' },
     low: { label: 'Low', colorBar: 'bg-blue-500' },
+    [UNSET_PRIORITY_ID]: { label: 'Unset', colorBar: 'bg-slate-500' },
 };
+const CANONICAL_PRIORITIES = new Set(['critical', 'high', 'medium', 'low']);
 const PLANNING_COLOR_BARS = ['bg-cyan-500', 'bg-sky-500', 'bg-teal-500', 'bg-fuchsia-500', 'bg-violet-500', 'bg-emerald-500'];
 
 function matchesTimeFilter(value: string | undefined | null, filter: TimeFilter): boolean {
@@ -509,7 +522,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 stackBy === 'status'
                     ? ticket.status
                     : stackBy === 'priority'
-                        ? ticket.priority
+                        // AD-320: route non-canonical priorities (missing,
+                        // empty, legacy strings) into the Unset lane id.
+                        ? (CANONICAL_PRIORITIES.has(String(ticket.priority || '')) ? ticket.priority : UNSET_PRIORITY_ID)
                         : (stackBy === 'wave' ? ticket.wave : ticket.session)?.trim() || EMPTY_STACK_VALUE;
             return ticketGroupId === groupId;
         }).map(t => t.id);
@@ -894,23 +909,40 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         }
     }, [showToast]);
 
-    // Track which tickets the user has "read" (opened) — persisted in localStorage
-    const [readTickets, setReadTickets] = useState<Set<string>>(() => {
-        if (typeof window === 'undefined') return new Set();
+    // Track the exact latest comment the user has read per ticket.
+    const [readTicketCursors, setReadTicketCursors] = useState<ReadTicketCursors>(() => {
+        if (typeof window === 'undefined') return {};
         try {
-            const stored = localStorage.getItem('vd-read-tickets');
-            return stored ? new Set(JSON.parse(stored)) : new Set();
-        } catch { return new Set(); }
+            const stored = localStorage.getItem(READ_CURSORS_KEY);
+            return stored ? JSON.parse(stored) : {};
+        } catch { return {}; }
     });
 
-    const markTicketRead = useCallback((ticketId: string) => {
-        setReadTickets(prev => {
-            const next = new Set(prev);
-            next.add(ticketId);
-            try { localStorage.setItem('vd-read-tickets', JSON.stringify(Array.from(next))); } catch {}
+    const markTicketRead = useCallback((ticket: Ticket) => {
+        const cursor = getLatestCommentCursor(ticket);
+        if (!cursor) return;
+        setReadTicketCursors(prev => {
+            if (prev[ticket.id] === cursor) return prev;
+            const next = { ...prev, [ticket.id]: cursor };
+            try { localStorage.setItem(READ_CURSORS_KEY, JSON.stringify(next)); } catch {}
             return next;
         });
     }, []);
+
+    useEffect(() => {
+        if (!data || typeof window === 'undefined') return;
+        if (localStorage.getItem(READ_CURSORS_KEY)) return;
+        const legacyRaw = localStorage.getItem(LEGACY_READ_TICKETS_KEY);
+        if (!legacyRaw) return;
+
+        try {
+            const migrated = migrateLegacyReadTickets(data.tickets, JSON.parse(legacyRaw));
+            localStorage.setItem(READ_CURSORS_KEY, JSON.stringify(migrated));
+            setReadTicketCursors(migrated);
+        } catch {
+            localStorage.setItem(READ_CURSORS_KEY, JSON.stringify({}));
+        }
+    }, [data]);
 
     const setLaneHidden = useCallback((status: string, hidden: boolean) => {
         setHiddenStatusIds(prev => {
@@ -1206,6 +1238,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
 
     // When ticket data refreshes, clear read state for tickets with NEW comments since last read
     // (This resets the dot when AI posts a new comment after the user read it)
+    /*
     const lastSeenRef = useRef<Record<string, string>>({});
     useEffect(() => {
         if (!data) return;
@@ -1226,6 +1259,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             lastSeenRef.current[t.id] = lastTime;
         }
     }, [data, readTickets]);
+    */
 
     // Detect mobile
     useEffect(() => {
@@ -1780,9 +1814,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         }
 
         if (stackBy === 'priority') {
+            // AD-320: PRIORITY_GROUP_ORDER ends with an Unset lane so tickets
+            // with a missing/legacy priority field stop disappearing from the
+            // view. The lane uses a sentinel id; drag-end translates it to ''
+            // when PATCHing the ticket.
             return PRIORITY_GROUP_ORDER.map((priority) => ({
                 id: priority,
-                value: priority,
+                value: priority === UNSET_PRIORITY_ID ? '' : priority,
                 label: PRIORITY_GROUP_META[priority].label,
                 colorBar: PRIORITY_GROUP_META[priority].colorBar,
                 instruction: '',
@@ -1823,7 +1861,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 stackBy === 'status'
                     ? ticket.status
                     : stackBy === 'priority'
-                        ? ticket.priority
+                        // AD-320: non-canonical priorities fall into the Unset
+                        // lane (sentinel id) instead of vanishing from the view.
+                        ? (CANONICAL_PRIORITIES.has(String(ticket.priority || '')) ? ticket.priority : UNSET_PRIORITY_ID)
                         : (stackBy === 'wave' ? ticket.wave : ticket.session)?.trim() || '';
             const groupId = rawValue || EMPTY_STACK_VALUE;
             if (!grouped[groupId]) grouped[groupId] = [];
@@ -1925,7 +1965,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 const overTicket = data.tickets.find((ticket) => ticket.id === overId);
                 if (!overTicket) return null;
                 if (stackBy === 'status') return overTicket.status;
-                if (stackBy === 'priority') return overTicket.priority;
+                // AD-320: when hovering over another ticket whose priority
+                // isn't canonical, bucket the drop into the Unset lane id so
+                // the comparison below matches the lane's sentinel.
+                if (stackBy === 'priority') {
+                    const p = String(overTicket.priority || '');
+                    return CANONICAL_PRIORITIES.has(p) ? overTicket.priority : UNSET_PRIORITY_ID;
+                }
                 return (stackBy === 'wave' ? overTicket.wave : overTicket.session)?.trim() || EMPTY_STACK_VALUE;
             })();
 
@@ -1934,12 +1980,18 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         const ticket = data.tickets.find((t) => t.id === ticketId);
         if (!ticket) return;
 
-        const normalizedValue = groupId === EMPTY_STACK_VALUE ? '' : groupId;
+        // AD-320: translate the Unset sentinel back to '' for the actual
+        // PATCH/optimistic update; the API stores priority as the bare value.
+        const normalizedValue = groupId === EMPTY_STACK_VALUE
+            ? ''
+            : groupId === UNSET_PRIORITY_ID
+                ? ''
+                : groupId;
         const currentValue =
             stackBy === 'status'
                 ? ticket.status
                 : stackBy === 'priority'
-                    ? ticket.priority
+                    ? (CANONICAL_PRIORITIES.has(String(ticket.priority || '')) ? ticket.priority : '')
                     : (stackBy === 'wave' ? ticket.wave : ticket.session)?.trim() || '';
 
         if (currentValue === normalizedValue) return;
@@ -2487,6 +2539,20 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                                     // AD-127: surface switching state so the click feels acknowledged.
                                                     setSwitchingProjectId(p.id);
                                                     showToast(`Switching to ${p.name}…`);
+                                                    // AD-316: clear the old board state and write the new
+                                                    // project id to sessionStorage *before* fetchData runs.
+                                                    // Without this, the fetch wrapper at L420ish still reads
+                                                    // the OLD project id (sessionStorage hasn't been mirrored
+                                                    // yet by its useEffect), and setData(d) pours the previous
+                                                    // project's tickets into the new project's header — the
+                                                    // "stale cards under new theme" flash that AD-316 reports.
+                                                    // Clearing `data` flips the render into the loading screen
+                                                    // while the new fetch is in flight.
+                                                    if (typeof window !== 'undefined') {
+                                                        sessionStorage.setItem('adhdev-active-project-id', p.id);
+                                                    }
+                                                    setData(null);
+                                                    setLoading(true);
                                                     try {
                                                         await fetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ switchTo: p.id }) });
                                                         setActiveProjectId(p.id);
@@ -2815,7 +2881,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                     <div className="block">
                                         <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Priority</span>
                                         <div className="mt-1 flex flex-wrap gap-1.5">
-                                            {PRIORITY_GROUP_ORDER.map((priority) => {
+                                            {/* AD-320: filter buttons stay limited to the canonical priorities;
+                                                the Unset lane sentinel is a stack-view-only construct. */}
+                                            {(PRIORITY_GROUP_ORDER.filter(p => p !== UNSET_PRIORITY_ID) as Ticket['priority'][]).map((priority) => {
                                                 const selected = priorityFilter.includes(priority);
                                                 return (
                                                     <button
@@ -3283,7 +3351,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                         {colTickets.map((ticket) => (
                                             <div
                                                 key={ticket.id}
-                                                onClick={() => { markTicketRead(ticket.id); setSelectedTicket(ticket); }}
+                                                onClick={() => { markTicketRead(ticket); setSelectedTicket(ticket); }}
                                                 className="bg-vd-bg-secondary rounded-lg p-3 border border-vd-border active:bg-vd-bg-hover"
                                             >
                                                 <div className="flex items-start gap-2">
@@ -3396,8 +3464,8 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                             config={{ label: group.label, aiInstruction: group.instruction || '' }}
                                             tickets={groupedTickets[group.id] || []}
                                             colorBar={group.colorBar}
-                                            onTicketClick={(ticket) => { markTicketRead(ticket.id); setSelectedTicket(ticket); }}
-                                            readTickets={readTickets}
+                                            onTicketClick={(ticket) => { markTicketRead(ticket); setSelectedTicket(ticket); }}
+                                            readTicketCursors={readTicketCursors}
                                             onUpdateInstruction={stackBy === 'status' ? handleUpdateInstruction : () => {}}
                                             onToggleAi={handleToggleAi}
                                             onAddTicket={stackBy === 'status' && ['backlog', 'todo'].includes(group.id) ? handleAddTicketToColumn : undefined}

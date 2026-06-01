@@ -15,7 +15,11 @@ export async function POST(request: NextRequest) {
             'Do not start implementation unless explicitly asked. Focus on planning, architecture, sequencing, and risk.',
         ].join('\n');
 
-        const result = await executeAgentPrompt(prompt);
+        const projectId = request.headers.get('x-adhdev-project');
+        const result = await executeAgentPrompt(prompt, projectId, [], null, {
+            agentRequirement: 'required',
+            taskLabel: 'Mission discussion',
+        });
         return NextResponse.json({
             ...result,
             missionId,

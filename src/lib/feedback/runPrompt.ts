@@ -6,8 +6,10 @@
 // (FeedbackBoard, TicketDetailModal) just omit it — the static "don't read
 // the whole thing if it's large" instruction in the prompt body still fires.
 
-export function buildRunPrompt(ticketIds: string[], sizeNote: string = ''): string {
+export function buildRunPrompt(ticketIds: string[], sizeNote: string = '', contextBrief: string = ''): string {
     const ids = Array.from(new Set(ticketIds.map(id => id.trim()).filter(Boolean)));
+    const contextNote = contextBrief.trim() ? `\n\n${contextBrief.trim()}` : '';
+    sizeNote = `${sizeNote}${contextNote}`;
 
     if (ids.length === 0) {
         return `Read ADHDEV.md. Inspect only the relevant entries in .adhdev/board.json or use targeted search if the board file is large. Follow the ADHDev execution contract and work on all actionable tickets.${sizeNote}\nAdd this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Prompt ADHDev Guidance.`;

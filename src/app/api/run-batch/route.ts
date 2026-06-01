@@ -13,7 +13,11 @@ export async function POST(request: NextRequest) {
             return Response.json({ error: 'Required: ticketIds array' }, { status: 400 });
         }
 
-        const result = await executeRunPrompt(ticketIds);
+        const projectId = request.headers.get('x-adhdev-project');
+        const result = await executeRunPrompt(ticketIds, projectId, {
+            agentRequirement: 'required',
+            taskLabel: 'Batch run',
+        });
         return Response.json({
             ...result,
             mode,

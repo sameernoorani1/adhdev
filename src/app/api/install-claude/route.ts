@@ -18,7 +18,7 @@ export async function POST(request: NextRequest) {
         const r = await fetch('http://localhost:3112/execute', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...terminalAuthHeaders() },
-            body: JSON.stringify({ command: INSTALL_COMMAND, projectId: projectId ?? undefined }),
+            body: JSON.stringify({ command: INSTALL_COMMAND, projectId: projectId ?? undefined, submitMode: 'shell' }),
         });
 
         if (!r.ok) {

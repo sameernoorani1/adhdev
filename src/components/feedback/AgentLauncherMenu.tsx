@@ -16,6 +16,7 @@ interface AgentLauncherMenuProps {
 }
 
 const LAST_VARIANT_KEY = 'adhdev-launcher-last-variant';
+const KNOWN_INSTALLED_KEY = 'adhdev-launcher-known-installed';
 const PROBE_TTL_MS = 30_000;
 
 let probeCache: { ts: number; data: ProbeMap } | null = null;
@@ -58,6 +59,23 @@ function writeLastVariant(agentId: string, variantId: string) {
     } catch { /* ignore */ }
 }
 
+function readKnownInstalled(): Record<string, true> {
+    if (typeof window === 'undefined') return {};
+    try {
+        const raw = localStorage.getItem(KNOWN_INSTALLED_KEY);
+        return raw ? JSON.parse(raw) : {};
+    } catch { return {}; }
+}
+
+function writeKnownInstalled(agentId: string) {
+    if (typeof window === 'undefined' || !agentId) return;
+    try {
+        const cur = readKnownInstalled();
+        cur[agentId] = true;
+        localStorage.setItem(KNOWN_INSTALLED_KEY, JSON.stringify(cur));
+    } catch { /* ignore */ }
+}
+
 export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncherMenuProps) {
     const [open, setOpen] = useState(false);
     const [probe, setProbe] = useState<ProbeMap>({});
@@ -67,6 +85,7 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
     const [installError, setInstallError] = useState<string | null>(null);
     const [preferredAgent, setPreferredAgent] = useState<PreferredAgent | null>(null);
     const [lastVariants, setLastVariants] = useState<Record<string, string>>({});
+    const [knownInstalled, setKnownInstalled] = useState<Record<string, true>>({});
     // AD-296: track whether an agent is actively running so we can boost the
     // Launch button's prominence on idle. We poll terminal-status here rather
     // than pull from a parent prop to keep the launcher self-contained.
@@ -83,7 +102,19 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
 
     const refreshProbe = useCallback(async (force = false) => {
         setProbeLoading(true);
-        try { setProbe(await fetchProbeAgents(force)); }
+        try {
+            const nextProbe = await fetchProbeAgents(force);
+            setProbe(nextProbe);
+            const detectedInstalled: Record<string, true> = {};
+            for (const [agentId, status] of Object.entries(nextProbe)) {
+                if (status?.installed) detectedInstalled[agentId] = true;
+            }
+            if (Object.keys(detectedInstalled).length > 0) {
+                const merged = { ...readKnownInstalled(), ...detectedInstalled };
+                localStorage.setItem(KNOWN_INSTALLED_KEY, JSON.stringify(merged));
+                setKnownInstalled(merged);
+            }
+        }
         finally { setProbeLoading(false); }
     }, []);
 
@@ -96,6 +127,7 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
     // Pull preferredAgent + last-used variants once.
     useEffect(() => {
         setLastVariants(readLastVariants());
+        setKnownInstalled(readKnownInstalled());
         let cancelled = false;
         (async () => {
             try {
@@ -126,7 +158,12 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
                 const r = await fetch(`/api/terminal-status?project=${encodeURIComponent(projectId)}`);
                 if (!r.ok) return;
                 const j = await r.json();
-                if (!cancelled) setAgentActive(Boolean(j?.agentActive));
+                if (cancelled) return;
+                setAgentActive(Boolean(j?.agentActive));
+                if (j?.agentActive && typeof j?.agentName === 'string' && j.agentName) {
+                    writeKnownInstalled(j.agentName);
+                    setKnownInstalled(readKnownInstalled());
+                }
             } catch { /* ignore — keep last known value */ }
         };
         fetchStatus();
@@ -147,18 +184,55 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
         return () => document.removeEventListener('mousedown', handler);
     }, [open]);
 
-    const launchVariant = useCallback((agent: AgentDef, variantId: string) => {
+    const launchVariant = useCallback(async (agent: AgentDef, variantId: string) => {
         const ws = wsRef.current;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
         const cmd = buildLaunchCommand(agent.id, variantId, preferredAgent?.id === agent.id ? preferredAgent.customFlags : undefined);
         if (!cmd) return;
-        ws.send(JSON.stringify({ type: 'agent-hint', agentId: agent.id }));
-        ws.send(JSON.stringify({ type: 'input', data: cmd + '\r' }));
+        // AD-321: previously a Launch click while an agent was already running
+        // just typed the launch command into the running agent's prompt — the
+        // user saw "nothing happened" because the agent treated the command
+        // as a chat message. Guard with a confirm; if accepted, interrupt the
+        // running agent with Ctrl+C, wait briefly for it to release the TTY,
+        // then send the launch command. If the user cancels, leave the
+        // session untouched.
+        if (ws && ws.readyState === WebSocket.OPEN && agentActive && typeof window !== 'undefined') {
+            const ok = window.confirm('An agent is already running in this shell. Interrupt it and launch the new one?');
+            if (!ok) return;
+            ws.send(JSON.stringify({ type: 'input', data: '\x03' })); // Ctrl+C
+            setTimeout(() => {
+                try {
+                    ws.send(JSON.stringify({ type: 'agent-hint', agentId: agent.id }));
+                    ws.send(JSON.stringify({ type: 'input', data: cmd + '\r' }));
+                } catch { /* ws may have dropped */ }
+            }, 400);
+        } else if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'agent-hint', agentId: agent.id }));
+            ws.send(JSON.stringify({ type: 'input', data: cmd + '\r' }));
+        } else {
+            const headers: HeadersInit = { 'Content-Type': 'application/json' };
+            if (projectId) (headers as Record<string, string>)['x-adhdev-project'] = projectId;
+            const r = await fetch('/api/launch-agent', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    agentId: agent.id,
+                    variantId,
+                    customFlags: preferredAgent?.id === agent.id ? preferredAgent.customFlags : undefined,
+                }),
+            });
+            const j = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                setInstallError(j?.error || `Launch failed (${r.status}).`);
+                return;
+            }
+        }
         writeLastVariant(agent.id, variantId);
+        writeKnownInstalled(agent.id);
         setLastVariants(prev => ({ ...prev, [agent.id]: variantId }));
+        setKnownInstalled(prev => ({ ...prev, [agent.id]: true }));
         setOpen(false);
         setHoveredAgent(null);
-    }, [wsRef, preferredAgent]);
+    }, [wsRef, preferredAgent, agentActive, projectId]);
 
     const installAgent = useCallback(async (agent: AgentDef) => {
         if (installing) return;
@@ -188,6 +262,8 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
                 const fresh = await fetchProbeAgents(true);
                 setProbe(fresh);
                 if (fresh[agent.id]?.installed) {
+                    writeKnownInstalled(agent.id);
+                    setKnownInstalled(prev => ({ ...prev, [agent.id]: true }));
                     setHoveredAgent(agent.id);
                     return;
                 }
@@ -199,34 +275,47 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
         }
     }, [installing, projectId]);
 
-    const buttonDisabled = !connected || !projectId;
+    const buttonDisabled = !projectId;
     // AD-296: when an agent isn't running we want the Launch button to read
-    // as the obvious next step. Bumps text size + gold accent + ring. Active
-    // sessions keep the low-key tertiary look so it doesn't compete with
-    // the live terminal output.
-    const idleProminent = !buttonDisabled && !agentActive;
+    // as the obvious next step. Bumps text size + gold accent + ring.
+    // AD-321: previously the running state demoted it back to tertiary chrome
+    // ("it doesn't compete with the live terminal output"), but the user
+    // reported it as effectively invisible — they could not find it when
+    // looking to switch agents mid-session. Keep the prominent style for
+    // both states; running just adds an emerald dot to signal liveness.
     const launchButtonClass = buttonDisabled
         ? 'text-[9px] px-1.5 py-0.5 text-vd-text-tertiary opacity-50 cursor-not-allowed'
-        : idleProminent
-            ? 'text-[10px] px-2 py-1 text-vd-accent-gold bg-vd-accent-gold/10 ring-1 ring-vd-accent-gold/40 hover:bg-vd-accent-gold/20'
-            : 'text-[9px] px-1.5 py-0.5 text-vd-text-tertiary hover:text-vd-text-secondary hover:bg-vd-bg-tertiary';
+        : 'text-[10px] px-2 py-1 text-vd-accent-gold bg-vd-accent-gold/10 ring-1 ring-vd-accent-gold/40 hover:bg-vd-accent-gold/20';
 
     return (
-        <div ref={wrapperRef} className="relative z-[120]">
+        <div ref={wrapperRef} className="relative z-20">
             <button
                 onClick={() => setOpen(o => !o)}
                 disabled={buttonDisabled}
-                className={`${launchButtonClass} rounded flex items-center gap-1`}
-                title={buttonDisabled ? 'Connect a terminal session first' : agentActive ? 'Launch a coding agent' : 'Launch a coding agent — none running'}
+                className={`${launchButtonClass} rounded flex items-center gap-1.5`}
+                title={buttonDisabled
+                    ? 'Select a project first'
+                    : agentActive
+                        ? 'An agent is already running — launching will interrupt it (you will be asked to confirm)'
+                        : 'Launch a coding agent — none running'}
             >
                 <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                     <path d="M3.5 2.5 L12.5 8 L3.5 13.5 z" />
                 </svg>
                 <span>Launch</span>
+                {/* AD-321: emerald liveness dot when an agent is already
+                    running, so the prominent style still communicates the
+                    "agent is alive" state — clicking will prompt to interrupt. */}
+                {agentActive && (
+                    <span
+                        className="w-1.5 h-1.5 rounded-full bg-emerald-400 ring-1 ring-emerald-400/40"
+                        aria-label="agent running"
+                    />
+                )}
             </button>
             {open && (
                 <div
-                    className="absolute right-0 top-full mt-1 bg-vd-bg-secondary border border-vd-border rounded-lg shadow-panel z-[120] py-1 min-w-[230px]"
+                    className="absolute right-0 top-full mt-1 bg-vd-bg-secondary border border-vd-border rounded-lg shadow-panel z-50 py-1 min-w-[230px]"
                     onMouseLeave={() => setHoveredAgent(null)}
                 >
                     <div className="px-3 py-1.5 text-[9px] uppercase tracking-wider text-vd-text-tertiary border-b border-vd-border flex items-center justify-between">
@@ -264,7 +353,7 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
                         ))
                     ) : RECOGNISED_CLIS.map(agent => {
                         const status = probe[agent.id];
-                        const isInstalled = status?.installed === true;
+                        const isInstalled = status?.installed === true || knownInstalled[agent.id] === true;
                         const isHovered = hoveredAgent === agent.id;
                         const defaultVariantId = resolveDefaultVariant(agent);
                         const isInstallingThis = installing === agent.id;
@@ -300,7 +389,7 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
                                 </button>
                                 {/* Variant flyout — only when installed and hovered */}
                                 {isInstalled && isHovered && (
-                                    <div className="absolute right-full top-0 mr-1 bg-vd-bg-secondary border border-vd-border rounded-lg shadow-panel z-[130] py-1 min-w-[210px]">
+                                    <div className="absolute right-full top-0 mr-1 bg-vd-bg-secondary border border-vd-border rounded-lg shadow-panel z-50 py-1 min-w-[210px]">
                                         <div className="px-3 py-1 text-[9px] uppercase tracking-wider text-vd-text-tertiary border-b border-vd-border">
                                             {agent.label} variants
                                         </div>
@@ -328,7 +417,7 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
                                 )}
                                 {/* Manual-install guidance shows inline (Cursor/Continue) */}
                                 {!isInstalled && !agent.installSupported && isHovered && (
-                                    <div className="absolute right-full top-0 mr-1 bg-vd-bg-secondary border border-vd-border rounded-lg shadow-panel z-[130] py-2 px-3 min-w-[240px] text-[10px] text-vd-text-secondary leading-relaxed">
+                                    <div className="absolute right-full top-0 mr-1 bg-vd-bg-secondary border border-vd-border rounded-lg shadow-panel z-50 py-2 px-3 min-w-[240px] text-[10px] text-vd-text-secondary leading-relaxed">
                                         {agent.installHint}
                                     </div>
                                 )}

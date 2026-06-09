@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { terminalAuthHeaders } from '@/lib/feedback/sessionToken';
+import { checkAdmin } from '@/lib/feedback/core';
 
 // AD-228: one-shot trigger that runs `npm i -g @anthropic-ai/claude-code@latest`
 // in the embedded terminal session. Used by the friendly first-run install card
@@ -12,6 +13,8 @@ import { terminalAuthHeaders } from '@/lib/feedback/sessionToken';
 const INSTALL_COMMAND = 'npm i -g @anthropic-ai/claude-code@latest';
 
 export async function POST(request: NextRequest) {
+    const auth = await checkAdmin(request);
+    if (!auth.authorized) return auth.error!;
     const projectId = request.headers.get('x-adhdev-project');
 
     try {

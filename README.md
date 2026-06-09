@@ -4,7 +4,7 @@
 
 ADHDev is the board that holds what your brain can't — when you're shipping software with AI. You queue work. The AI does it. You review. The board keeps everything straight.
 
-![ADHDev board](assets/board-screenshot.png)
+![ADHDev board](assets/Screenshots/main-screen.png)
 
 ## Quick start
 
@@ -24,13 +24,13 @@ Four things your brain drops when an AI is doing the work:
 
 **Sequencing.** Work runs in the right order, not in random order. Tickets have status. Reopens get priority. The board enforces a queue so you're not picking what to look at next every five minutes.
 
-**Verification.** The AI doesn't get to mark its own homework. An agent can flip a ticket to *done* — but only you can move it to *reviewed*. And every "files touched" claim is ground-truthed against `git diff`. Not the agent's word.
+**Verification.** The AI doesn't get to mark its own homework. An agent can flip a ticket to *done* — but only you can move it to *reviewed*. And in a git repo, every "files touched" claim is ground-truthed against `git diff`, not taken on the agent's word. (Outside a git repo it falls back to the agent's self-report, labeled as such.)
 
 **Chronology.** Reopens get the full history, no backwards-guessing. If a fix didn't hold, the agent picks up the ticket with every prior comment loaded — yours and the AI's — so it knows what was tried and what failed.
 
 ## While the AI works, you keep working
 
-You queue the next ticket. Review the last one. Look at the bug from yesterday. The agent doesn't need you holding its hand. The board manages itself. You don't have to sit and watch.
+You queue the next ticket. Review the last one. Look at the bug from yesterday. The agent doesn't need you holding its hand. You don't have to sit and watch.
 
 ## Who it's for
 

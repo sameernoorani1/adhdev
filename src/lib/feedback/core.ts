@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
+import { readSessionToken } from './sessionToken';
 import { getActiveProject, getProjectBoardPath, initProjectDir, getProjectById } from './registry';
 import { ensureAdhdevProtocol, getDefaultExecutionContract, buildInlineContractNotice, type AdhdevExecutionContract } from './protocol';
 import { ACTIVE_RUN_STATUSES, normalizeRuns, sweepStaleRuns } from './runs';
@@ -668,8 +669,51 @@ export function resolveTicketById(data: FeedbackData, ticketId: string): TicketL
     };
 }
 
-// ─── Auth (standalone: no auth gate, always authorized) ─────────────
-export async function checkAdmin(): Promise<{ authorized: boolean; error?: NextResponse }> {
+// ─── Auth ───────────────────────────────────────────────────────────
+// AD-346: the board API used to be wide open (checkAdmin always authorized).
+// Defense is now two-layer: src/middleware.ts gates cross-origin/cross-site
+// browser requests at the edge; this guards the no-Origin path (non-browser
+// callers — agent CLI / curl) with the session token. GET stays open so the
+// agent can curl read endpoints without a token.
+const STATE_CHANGING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/**
+ * Pure token-guard decision. Returns null to allow, or a reason string (403).
+ * - Non-state-changing methods: allow.
+ * - Requests carrying an Origin: allow here (the edge middleware already
+ *   enforced the origin allowlist for those).
+ * - No Origin + no server token configured: allow (can't verify; don't lock
+ *   the user out when the terminal server never wrote a token).
+ * - No Origin + server token configured: require a matching x-adhdev-token.
+ */
+export function tokenGuardReason(
+    method: string,
+    origin: string | null,
+    providedToken: string | null,
+    serverToken: string | null,
+): string | null {
+    if (!STATE_CHANGING_METHODS.has(method.toUpperCase())) return null;
+    if (origin !== null) return null;
+    if (!serverToken) return null;
+    if (providedToken && providedToken === serverToken) return null;
+    return 'missing or invalid session token for a no-origin state-changing request';
+}
+
+export async function checkAdmin(
+    request?: { method: string; headers: { get(name: string): string | null } },
+): Promise<{ authorized: boolean; error?: NextResponse }> {
+    // Back-compat: callers that don't pass a request stay permissive — they are
+    // still covered by the edge middleware against the browser CSRF vector.
+    if (!request) return { authorized: true };
+    const reason = tokenGuardReason(
+        request.method,
+        request.headers.get('origin'),
+        request.headers.get('x-adhdev-token'),
+        readSessionToken(),
+    );
+    if (reason) {
+        return { authorized: false, error: NextResponse.json({ error: `Forbidden: ${reason}` }, { status: 403 }) };
+    }
     return { authorized: true };
 }
 

@@ -11,32 +11,32 @@ interface WelcomeModalProps {
 
 const steps = [
     {
-        eyebrow: 'Control plane',
-        title: 'ADHDev keeps AI coding work visible.',
-        body: 'Capture requests as tickets, keep the agent run attached to the work, and review the receipt before you close the loop.',
+        eyebrow: 'Shared memory',
+        title: "The board holds what your brain can't.",
+        body: 'When you ship with an AI agent, the context lives in your head and keeps falling out of it. ADHDev keeps the work, the history, and the receipts in one place, so you and the agent share the same memory.',
         points: [
-            ['Tickets', 'Concrete work items with status, comments, screenshots, and execution history.'],
-            ['Brain Dump', 'Fast capture for messy thoughts; Run Chat turns them into board actions.'],
+            ['Tickets', 'Concrete work items with status, comments, screenshots, and the full run history.'],
+            ['Brain Dump', 'Fast capture for messy thoughts; processing turns them into board actions when you run it.'],
             ['Batches', 'Group related tickets so an agent can handle a coherent pass.'],
         ],
     },
     {
         eyebrow: 'Connect',
-        title: 'Start with your repo and a coding agent.',
-        body: 'Pick a project folder, connect Codex, Claude, or another supported CLI, then choose the run mode you want ADHDev to use.',
+        title: 'Point it at your repo and an agent.',
+        body: 'Pick a project folder and connect Claude Code or another CLI agent. The board lives beside the code it tracks, and everything stays on this machine.',
         points: [
             ['Project folder', 'The board lives beside the code it controls.'],
-            ['Agent status', 'The terminal button shows whether a shell, agent, or ticket run is active.'],
+            ['Agent', 'First-class with Claude Code; other CLI agents run with reduced telemetry.'],
             ['Local first', 'Tickets and run receipts stay on this machine.'],
         ],
     },
     {
         eyebrow: 'Run loop',
         title: 'Run the ticket, then review the result.',
-        body: 'When an agent is active, Run sends the selected ticket prompt into the terminal. If no agent is active, ADHDev opens the terminal flow instead of silently dropping the request.',
+        body: "Run sends a ticket to the connected agent. When it reports back, you review the receipt and decide what is done, reopened, or closed. The AI doesn't get to mark its own homework.",
         points: [
             ['Run', 'Send one ticket or a batch to the connected agent.'],
-            ['Receipt', 'The agent comments back with changed files, checks, and result.'],
+            ['Receipt', 'The agent reports changed files and checks; the file list is verified against git diff when the project is a git repo.'],
             ['Review', 'You decide what is done, reopened, or closed.'],
         ],
     },
@@ -102,7 +102,7 @@ export function WelcomeModal({ demoTicketId, onClose, onRunDemo, onStartSetup }:
                     <div className="bg-vd-bg-tertiary/70 border-b md:border-b-0 md:border-r border-vd-border p-5 md:p-6 flex flex-col justify-between gap-6">
                         <div>
                             <div className="text-[10px] uppercase tracking-[0.2em] text-vd-accent-gold font-semibold mb-3">Welcome to ADHDev</div>
-                            <h2 className="text-2xl md:text-3xl font-semibold text-vd-text-primary leading-tight">Your AI workbench for shipping with agents.</h2>
+                            <h2 className="text-2xl md:text-3xl font-semibold text-vd-text-primary leading-tight">The board that holds what your brain can&apos;t.</h2>
                         </div>
                         <div className="space-y-2">
                             {steps.map((item, i) => (

@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { readFeedback, writeFeedback, withFeedbackLock, resolveTicketById } from '@/lib/feedback/core';
+import { readFeedback, writeFeedback, withFeedbackLock, resolveTicketById, checkAdmin } from '@/lib/feedback/core';
 import { terminalAuthHeaders } from '@/lib/feedback/sessionToken';
 import { getCurrentGitSha } from '@/lib/feedback/gitDiff';
 import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
@@ -16,6 +16,8 @@ import { markRunSent } from '@/lib/feedback/runLifecycle';
  * for execution within the terminal session.
  */
 export async function POST(request: NextRequest) {
+    const auth = await checkAdmin(request);
+    if (!auth.authorized) return auth.error!;
     try {
         const { ticketId, mode = 'claude-code' } = await request.json();
         if (!ticketId) return Response.json({ error: 'Required: ticketId' }, { status: 400 });

@@ -11,6 +11,7 @@ import { type Relation, type RelationKind, RELATION_KINDS, RELATION_LABEL } from
 import { compressImage } from '@/lib/feedback/imageCompress';
 import { buildRunPrompt } from '@/lib/feedback/runPrompt';
 import { isTicketExecutionActive } from '@/lib/feedback/executionState';
+import type { TicketExecution } from '@/lib/feedback/core';
 import { CoachMark } from './CoachMark';
 import {
     buildComparisonRows,
@@ -1401,6 +1402,48 @@ export function TicketDetailModal({
                                 Delete
                             </button>
                         </div>
+
+                        {/* AD-347: verified change set. The pitch is "the AI says
+                            done but isn't — verify it." filesTouched is ground-truthed
+                            against `git diff` at done-time (in a git repo), so surface
+                            the file list with a provenance badge instead of leaving the
+                            receipt as prose only. */}
+                        {(() => {
+                            const exec = ticket.execution as TicketExecution | undefined;
+                            if (!exec || !Array.isArray(exec.filesTouched) || exec.filesTouched.length === 0) return null;
+                            return (
+                                <div className="rounded-md border border-vd-border bg-vd-bg-primary/40 p-3">
+                                    <div className="flex items-center justify-between gap-2 mb-2">
+                                        <h4 className="text-xs text-vd-text-tertiary uppercase tracking-wider">
+                                            Changed files ({exec.filesTouched.length})
+                                        </h4>
+                                        {exec.filesTouchedSource === 'git-diff' ? (
+                                            <span
+                                                className="inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2 py-0.5 text-[10px] font-medium text-green-400"
+                                                title="Verified: this file list was ground-truthed against `git diff` between the run baseline and HEAD, not taken on the agent's word."
+                                            >
+                                                <span className="h-1.5 w-1.5 rounded-full bg-green-400" />
+                                                verified against git diff
+                                            </span>
+                                        ) : (
+                                            <span
+                                                className="inline-flex items-center gap-1 rounded-full bg-vd-bg-tertiary px-2 py-0.5 text-[10px] font-medium text-vd-text-tertiary"
+                                                title="Agent-reported — not ground-truthed (the project isn't a git repo, or no run baseline was captured)."
+                                            >
+                                                agent-reported
+                                            </span>
+                                        )}
+                                    </div>
+                                    <ul className="space-y-0.5">
+                                        {exec.filesTouched.map((file: string, i: number) => (
+                                            <li key={`${file}-${i}`} className="font-mono text-[11px] text-vd-text-secondary truncate" title={file}>
+                                                {file}
+                                            </li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            );
+                        })()}
 
                         {/* Divider */}
                         <hr className="border-vd-border" />

@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 
-export const DEFAULT_MANIFEST_URL = 'https://adhdev.dev/version.json';
+export const DEFAULT_MANIFEST_URL = 'https://adhdev.app/version.json';
 export const DEFAULT_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 export const DEFAULT_TIMEOUT_MS = 3000;
 const DEFAULT_CACHE_PATH = join(homedir(), '.adhdev', 'manifest-cache.json');

@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { buildLaunchCommand } from '@/lib/feedback/agentCatalog';
 import { terminalAuthHeaders } from '@/lib/feedback/sessionToken';
+import { checkAdmin } from '@/lib/feedback/core';
 
 export async function POST(request: NextRequest) {
+    const auth = await checkAdmin(request);
+    if (!auth.authorized) return auth.error!;
     let body: { agentId?: string; variantId?: string; customFlags?: string };
     try {
         body = await request.json();

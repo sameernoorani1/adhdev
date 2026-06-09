@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { terminalAuthHeaders } from '@/lib/feedback/sessionToken';
+import { checkAdmin } from '@/lib/feedback/core';
 import { existsSync } from 'node:fs';
 
 // §5.4 follow-up: generic agent-install endpoint. Same shape as AD-228's
@@ -40,6 +41,8 @@ const GUIDANCE_ONLY: Record<string, string> = {
 };
 
 export async function POST(request: NextRequest) {
+    const auth = await checkAdmin(request);
+    if (!auth.authorized) return auth.error!;
     let body: { agentId?: string };
     try {
         body = await request.json();

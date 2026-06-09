@@ -2,6 +2,9 @@ node_modules/
 .next/
 .next-dev/
 .next-build/
+# Next auto-generates this and rewrites its <reference path> to the active
+# distDir on every dev/build — committing it would churn between .next / .next-dev.
+next-env.d.ts
 .claude-tmp/
 *.tsbuildinfo
 

@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
     AUTO_COMPLETE_ON_CLEAR_REASONS,
+    GRACEFUL_CLEAR_REASONS,
     hasActiveRunExceededMaxDuration,
+    isGracefulClearReason,
     shouldAutoCompleteOnClear,
 } from '../../server/clearActiveRunRules.mjs';
 
@@ -11,14 +13,30 @@ import {
 // heuristic reasons (the AD-178 regression) trips the suite.
 
 describe('AUTO_COMPLETE_ON_CLEAR_REASONS', () => {
-    it('is a Set of exactly the four reliable reasons', () => {
+    it('is a Set of exactly the reliable reasons (incl. AD-341 turn_end)', () => {
         expect(AUTO_COMPLETE_ON_CLEAR_REASONS).toBeInstanceOf(Set);
         expect([...AUTO_COMPLETE_ON_CLEAR_REASONS].sort()).toEqual([
             'detection_stale',
             'max_runtime_exceeded',
             'shell_exited',
             'timed_out',
+            'turn_end',
         ]);
+    });
+});
+
+describe('GRACEFUL_CLEAR_REASONS (AD-341)', () => {
+    it('turn_end is graceful (auto-completes, but no "auto-cleared" warning)', () => {
+        expect(isGracefulClearReason('turn_end')).toBe(true);
+        expect(shouldAutoCompleteOnClear('turn_end')).toBe(true);
+        expect(GRACEFUL_CLEAR_REASONS.has('turn_end')).toBe(true);
+    });
+
+    it('crash/abandon reasons are NOT graceful (they keep the warning comment)', () => {
+        expect(isGracefulClearReason('shell_exited')).toBe(false);
+        expect(isGracefulClearReason('detection_stale')).toBe(false);
+        expect(isGracefulClearReason('timed_out')).toBe(false);
+        expect(isGracefulClearReason('max_runtime_exceeded')).toBe(false);
     });
 });
 

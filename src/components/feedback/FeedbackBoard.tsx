@@ -391,6 +391,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         folderSource?: 'existing' | 'new' | null;
         folderPath?: string | null;
         agentDetected?: string | null;
+        // AD-332: the agent the user picked in the wizard (id + variant + flags).
+        // Drives the one-click connectAgent launch.
+        preferredAgent?: { id: string; variantId: string; customFlags?: string } | null;
         populated?: boolean;
         gitPosture?: 'experiment' | 'github' | 'remote' | null;
         remoteUrl?: string | null;
@@ -1283,6 +1286,17 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     const filterRef = useRef<HTMLDivElement>(null);
     const newTicketButtonRef = useRef<HTMLButtonElement | null>(null);
     const brainDumpButtonRef = useRef<HTMLButtonElement | null>(null);
+    // AD-332: anchor for the "connect your agent" coachmark — the first thing a
+    // new user should do after the intro, but nothing pointed them at it before.
+    const terminalButtonRef = useRef<HTMLButtonElement | null>(null);
+    // AD-335: the connect coachmark routes the user to the in-terminal agent
+    // PICKER (where they choose + install/launch any agent) rather than auto-
+    // picking one. launcherOpenSignal is a counter we bump to fling that menu
+    // open. Dismissal uses the standard coachMarks['connect-agent'] flag (same
+    // as the other tips) so an onboarding reset clears it and the step reappears
+    // first — AD-335: a sessionStorage flag here leaked across resets and let the
+    // new-ticket / brain-dump tips jump the queue ahead of connecting an agent.
+    const [launcherOpenSignal, setLauncherOpenSignal] = useState(0);
     const liveActiveRun = useMemo(() => {
         const runs = data?.activeRuns || [];
         return runs.find(run => run.status === 'running' || run.status === 'finishing')
@@ -1318,6 +1332,19 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     const markCoachMarkSeen = useCallback((key: string) => {
         void patchOnboardingState({ coachMarks: { ...(onboardingState.coachMarks || {}), [key]: true } });
     }, [onboardingState.coachMarks, patchOnboardingState]);
+
+    // AD-335: open the terminal and fling the agent PICKER open, so the user
+    // chooses + installs/launches any agent themselves (fixes "it only offered
+    // Codex"). It deliberately does NOT mark the step seen — opening the picker
+    // is the START of the step, not the end. The tutorial stays paused on
+    // "connect" until an agent is actually running (auto-advances via the
+    // terminalAgentRunning gate) or the user explicitly clicks "Later". Marking
+    // it seen here made the New Ticket tip pop the instant the terminal opened,
+    // before the user had installed/launched anything.
+    const openAgentPicker = useCallback(() => {
+        setShowTerminal(true);
+        setLauncherOpenSignal(n => n + 1);
+    }, []);
     const boardCoachmarkHidden = !onboardingLoaded
         || !onboardingState.welcomeSeen
         || !!onboardingState.hideTips
@@ -1328,6 +1355,12 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         if (boardCoachmarkHidden) return null;
         const coachMarks = onboardingState.coachMarks || {};
         const ticketCount = data?.tickets?.length ?? 0;
+        // AD-332/AD-335: connecting the agent is step zero — Run does nothing
+        // without it. Show it FIRST and keep showing until an agent is actually
+        // running (not merely picked/installed) or the user dismisses it, so the
+        // rest of the tutorial never jumps the queue. Gated on the coachMarks
+        // flag (cleared by an onboarding reset) so a fresh user always sees it.
+        if (!terminalAgentRunning && !coachMarks['connect-agent']) return 'connect-agent';
         if (!coachMarks['new-ticket']) return 'new-ticket';
         if (!coachMarks['brain-dump-main']) return 'brain-dump-main';
         if (!coachMarks.drag && dragAnchorReady && ticketCount >= 2) return 'drag';
@@ -1337,7 +1370,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         data?.tickets?.length,
         dragAnchorReady,
         onboardingState.coachMarks,
+        terminalAgentRunning,
     ]);
+
     const [sidebarExpanded, setSidebarExpanded] = useState(() => {
         if (typeof window === 'undefined') return false;
         try { return localStorage.getItem('vd-sidebar-expanded') === 'true'; } catch { return false; }
@@ -2986,6 +3021,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                             outline reads against the topbar background. */}
                         {!isMobile && (
                             <button
+                                ref={terminalButtonRef}
                                 onClick={() => setShowTerminal(!showTerminal)}
                                 className={`relative px-2.5 py-1.5 text-xs font-medium border rounded-lg transition-colors ${
                                     (terminalRunRunning || terminalRunDispatching)
@@ -3223,6 +3259,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     onToggleFullscreen={() => setTermFullscreen(f => !f)}
                     sidebarPad={sidebarPad}
                     order={termOrder}
+                    launcherOpenSignal={launcherOpenSignal}
                 />
             )}
             {/* Board or Missions */}
@@ -3632,8 +3669,31 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     scrollToMessageId={chatScrollToId}
                     onScrollHandled={() => setChatScrollToId(null)}
                     onProcessingChange={setChatProcessing}
+                    onRequireAgent={() => setShowTerminal(true)}
                 />
             </ErrorBoundary>
+
+            {/* AD-332 / AD-335: step zero — get the user to connect a coding
+                agent right after the intro. "Choose an agent" opens the terminal
+                and the agent picker, where they install/launch ANY agent (not
+                auto-pointed at one) and pick a variant. Dismisses on click so the
+                tutorial proceeds whether they launch or back out. Persists until
+                an agent is actually running; "Later" defers for the session only,
+                so a user who skips is re-nudged next launch. */}
+            <CoachMark
+                show={activeBoardCoachmark === 'connect-agent' && !showTerminal}
+                targetRef={terminalButtonRef}
+                placement="bottom"
+                title="Start your agent"
+                message="Run needs a coding agent. Open the picker to install or launch one — your choice of agent and mode."
+                actionLabel="Choose an agent"
+                onAction={openAgentPicker}
+                onSeen={() => markCoachMarkSeen('connect-agent')}
+                onHideAll={() => {
+                    setTipsHiddenThisSession(true);
+                    try { sessionStorage.setItem('adhdev-tips-hidden-session', '1'); } catch { /* ignore */ }
+                }}
+            />
 
             <CoachMark
                 show={activeBoardCoachmark === 'new-ticket'}

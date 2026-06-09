@@ -5,6 +5,7 @@ import { terminalAuthHeaders } from './sessionToken';
 import { getCurrentGitSha } from './gitDiff';
 import { getActiveProject, getProjectById } from './registry';
 import { createRunRecord, markRunFailed, markRunSubmitted, upsertRun } from './runs';
+import { markRunSent } from './runLifecycle';
 import { buildRunContextBrief } from './runContextBrief';
 import fs from 'fs';
 import path from 'path';
@@ -339,7 +340,17 @@ export async function executeRunPrompt(ticketIds: string[], projectId?: string |
     await withFeedbackLock(projectId, () => {
         const data = readFeedback(projectId);
         if (executionResult.success) {
-            markRunSubmitted(data, runId, completedAt);
+            // AD-341: the prompt was dispatched to a terminal where an agent is
+            // ALIVE — that IS the agent working it, so animate immediately. No
+            // claim handshake (agents don't reliably claim; the dispatcher's own
+            // placeholder claim even gets the agent's agent-claim rejected as
+            // stale). If NO agent is present, keep it 'dispatching' ("Sending")
+            // rather than falsely showing "running".
+            if (terminalStatus.agentActive) {
+                markRunSubmitted(data, runId, completedAt);
+            } else {
+                markRunSent(data, runId, completedAt);
+            }
         } else {
             markRunFailed(data, runId, completedAt, executionResult.message || 'Failed to dispatch run to terminal.');
             const idSet = new Set(ids.map(id => id.toUpperCase()));

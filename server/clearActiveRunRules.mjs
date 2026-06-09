@@ -28,7 +28,23 @@ export const AUTO_COMPLETE_ON_CLEAR_REASONS = new Set([
     'detection_stale',
     'timed_out',
     'max_runtime_exceeded',
+    // AD-341: turn-end — shell quiet AND no tool/command running under the agent
+    // (it's idle at its prompt). Unlike the old heuristic `agent_idle`, this is
+    // process-gated (probeAgentBusy), so it does not fire mid-turn while a tool
+    // runs. Auto-complete so the mascot actually drops; the graceful flag below
+    // suppresses the "silently auto-cleared" warning since this IS a clean end.
+    'turn_end',
 ]);
+
+// AD-341: reasons that are a GRACEFUL end (agent finished its turn) vs a
+// crash/abandonment. Graceful ends auto-complete the execution but skip the
+// "⚠ Run auto-cleared — without a closing comment" warning, which only makes
+// sense when the agent really vanished mid-work.
+export const GRACEFUL_CLEAR_REASONS = new Set(['turn_end']);
+
+export function isGracefulClearReason(reason) {
+    return GRACEFUL_CLEAR_REASONS.has(reason);
+}
 
 const ACTIVE_RUN_STATUSES = new Set(['dispatching', 'running', 'finishing']);
 

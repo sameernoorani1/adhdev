@@ -136,6 +136,9 @@ interface TerminalPaneProps {
     onToggleFullscreen?: () => void;
     sidebarPad?: string;
     order?: number;
+    // AD-335: bumped to fling the agent-launcher menu open (from the board's
+    // "connect your agent" coachmark) so the user lands on the agent picker.
+    launcherOpenSignal?: number;
     // AD-144 reopen: stay mounted across pane toggles so xterm's 10k-line
     // scrollback doesn't evaporate every time the user closes and reopens the
     // pane. When hidden, the outer container uses display:none; the xterm
@@ -144,7 +147,7 @@ interface TerminalPaneProps {
     hidden?: boolean;
 }
 
-export function TerminalPane({ onClose, placement, onPlacementChange, activeProjectId, activeProjectName, isFullscreen, onToggleFullscreen, sidebarPad, order, hidden = false }: TerminalPaneProps) {
+export function TerminalPane({ onClose, placement, onPlacementChange, activeProjectId, activeProjectName, isFullscreen, onToggleFullscreen, sidebarPad, order, launcherOpenSignal, hidden = false }: TerminalPaneProps) {
     const containerRef = useRef<HTMLDivElement>(null);
     const outerRef = useRef<HTMLDivElement>(null);
     // AD-150 v2: keep a handle on the xterm instance itself so the theme-change
@@ -275,12 +278,23 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
             await new Promise(r => setTimeout(r, 200));
         }
 
+        // AD-155 root cause: xterm was never told its PTY backend. On Windows
+        // ConPTY, line-wrapping/reflow on resize is handled differently from a
+        // unix PTY — without `windowsPty`, xterm mis-tracks wrapped lines, which
+        // is the "breaks the work instead of going to the new line" artifact the
+        // 10 prior *timing-nudge* passes could not fix. For a local-first tool the
+        // browser OS matches the server OS, so navigator gives the initial guess;
+        // the server's `ready` message corrects it authoritatively (and supplies
+        // the build number for ConPTY quirk handling). No effect on unix backends.
+        const isLikelyWindows = typeof navigator !== 'undefined'
+            && /^win/i.test(navigator.platform || '');
         const term = new Terminal({
             cursorBlink: true, fontSize: 13, scrollback: 10000,
             cursorStyle: 'bar',
             fontFamily: '"Cascadia Code", "Fira Code", "Consolas", monospace',
             theme: computeXtermTheme(),
             allowProposedApi: true,
+            ...(isLikelyWindows ? { windowsPty: { backend: 'conpty' as const } } : {}),
         });
 
         const fitAddon = new FitAddon();
@@ -419,6 +433,23 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                     lastOutputAtRef.current = Date.now();
                     term.write(msg.data);
                 } else if (msg.type === 'clear') { term.clear(); term.reset(); }
+                else if (msg.type === 'ready') {
+                    // AD-155: the server reports its real platform + Windows build.
+                    // Set xterm's ConPTY config authoritatively — corrects the
+                    // navigator guess and supplies the build number; a unix backend
+                    // ensures windowsPty is off (e.g. remote Windows browser → unix
+                    // server).
+                    try {
+                        if (msg.platform === 'win32') {
+                            term.options.windowsPty = {
+                                backend: 'conpty',
+                                buildNumber: typeof msg.osBuild === 'number' ? msg.osBuild : undefined,
+                            };
+                        } else if (msg.platform) {
+                            term.options.windowsPty = undefined;
+                        }
+                    } catch { /* options may be locked mid-write; ignore */ }
+                }
                 else if (msg.type === 'exit') { term.write('\r\n\x1b[33m[Session ended]\x1b[0m\r\n'); setConnected(false); }
             } catch {}
         };
@@ -845,7 +876,7 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                             </svg>
                         </button>
                         {/* Agent launcher — click to start an installed agent or install a missing one */}
-                        <AgentLauncherMenu wsRef={wsRef} connected={connected} projectId={activeProjectId} />
+                        <AgentLauncherMenu wsRef={wsRef} connected={connected} projectId={activeProjectId} openSignal={launcherOpenSignal} />
                         {/* Reset session */}
                         <button
                             onClick={() => setShowResetModal(true)}

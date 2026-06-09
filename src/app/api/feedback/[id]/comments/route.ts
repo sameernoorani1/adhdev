@@ -4,6 +4,8 @@ import { addPendingMention, clearPendingMention } from '@/lib/feedback/pendingMe
 import { readUserDisplayName, DEFAULT_USER_DISPLAY_NAME } from '@/lib/feedback/protocol';
 import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
 import { heartbeatActiveRuns } from '@/lib/feedback/runs';
+import { shouldStartDirectRun } from '@/lib/feedback/directRun';
+import { claimRun } from '@/lib/feedback/runLifecycle';
 
 // AD-011: resolve user display name from project config, replacing the
 // previously hardcoded 'Sameer' literal in author/activity defaults.
@@ -94,10 +96,37 @@ export async function POST(
                     // decaying while the agent is mid-run posting comments.
                     t.execution = { ...prior, updatedAt: now } as typeof t.execution;
                     heartbeatActiveRuns(data, [t.id], now, typeof prior.runId === 'string' ? prior.runId : null);
+                } else if (shouldStartDirectRun({
+                    content,
+                    ticketStatus: t.status,
+                    priorExecutionStatus: priorStatus ?? null,
+                })) {
+                    // AD-269/AD-338: an agent posted a claim/plan comment on an
+                    // active ticket — it is declaring work, so light the mascot +
+                    // pill, identical to a Run-initiated execution. The
+                    // active-ticket + claim-marker + not-already-running guards
+                    // keep this from resurrecting a finished ticket (AD-221/AD-244)
+                    // or firing on an analysis comment.
+                    const runId = `direct-${Date.now().toString(36)}`;
+                    t.execution = {
+                        runId,
+                        actor: comment.author,
+                        actorType: 'ai',
+                        status: 'in_progress',
+                        startedAt: now,
+                        updatedAt: now,
+                        filesTouched: [],
+                        verification: [],
+                    } as typeof t.execution;
+                    t.activity.push({ action: 'execution_started', by: comment.author, byType: 'ai', at: now });
+                    // AD-269: open the running LEASE too, so the animation is
+                    // lease-driven (the single source) rather than only
+                    // execution.status. Promotes a matching dispatch lease or
+                    // opens a fresh one for this direct-terminal claim.
+                    claimRun(data, { ticketIds: [t.id], agent: comment.author, source: 'agent-claim', nowIso: now, projectId, runId });
                 }
-                // Otherwise: leave execution untouched. Direct CLI work must
-                // call agent-claim to open running state; ordinary comments do
-                // not resurrect stale or completed work.
+                // Otherwise: leave execution untouched — ordinary comments do not
+                // resurrect stale or completed work.
             }
 
             // Targeted AI mention detection — supports @claude, @codex, @chatgpt, and @ai

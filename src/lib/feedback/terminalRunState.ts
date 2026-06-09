@@ -110,6 +110,11 @@ export function autoCompleteTerminalTickets(
 ): boolean {
     if (!Array.isArray(data.tickets)) return false;
     const ids = idSet(ticketIds);
+    // AD-341: a graceful turn-end (agent finished its turn, just didn't post a
+    // closing comment) is NOT a silent crash — auto-complete it quietly without
+    // the "⚠ Run auto-cleared" warning, which only makes sense when the agent
+    // actually vanished mid-work.
+    const graceful = reason === 'turn_end';
     let changed = false;
 
     for (const ticket of data.tickets) {
@@ -134,17 +139,19 @@ export function autoCompleteTerminalTickets(
                 reason,
             },
         ];
-        ticket.comments = [
-            ...(ticket.comments || []),
-            {
-                id: `c-silent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-                author: prior.actor || 'ADHDev',
-                authorType: 'system',
-                content: buildSilentEndCommentContent(reason),
-                images: [],
-                createdAt: nowIso,
-            },
-        ];
+        if (!graceful) {
+            ticket.comments = [
+                ...(ticket.comments || []),
+                {
+                    id: `c-silent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+                    author: prior.actor || 'ADHDev',
+                    authorType: 'system',
+                    content: buildSilentEndCommentContent(reason),
+                    images: [],
+                    createdAt: nowIso,
+                },
+            ];
+        }
         ticket.updatedAt = nowIso;
         changed = true;
     }

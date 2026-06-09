@@ -16,6 +16,11 @@ export interface CoachMarkProps {
     placement?: 'top' | 'bottom' | 'left' | 'right';
     onSeen: () => void;
     onHideAll: () => void;
+    // AD-332: optional primary action. When set, renders a prominent button
+    // (e.g. "Start my agent") that actually performs the step instead of just
+    // acknowledging the tip — turns a passive pointer into a one-click action.
+    actionLabel?: string;
+    onAction?: () => void;
 }
 
 interface Position {
@@ -85,7 +90,7 @@ function computePosition(rect: DOMRect, placement: NonNullable<CoachMarkProps['p
     return { top: clampedTop, left: clampedLeft, arrowOffset, maxWidth: bubbleWidth, effectivePlacement: effective };
 }
 
-export function CoachMark({ show, targetRef, message, title, placement = 'bottom', onSeen, onHideAll }: CoachMarkProps) {
+export function CoachMark({ show, targetRef, message, title, placement = 'bottom', onSeen, onHideAll, actionLabel, onAction }: CoachMarkProps) {
     const [pos, setPos] = useState<Position | null>(null);
     const [bubbleEl, setBubbleEl] = useState<HTMLDivElement | null>(null);
 
@@ -151,8 +156,13 @@ export function CoachMark({ show, targetRef, message, title, placement = 'bottom
                         )}
                         <p className="text-[12.5px] font-medium leading-snug">{message}</p>
                         <div className="flex items-center gap-3 text-[10.5px] mt-2">
+                            {actionLabel && onAction && (
+                                <button onClick={onAction} className="font-bold px-2.5 py-0.5 rounded bg-black/80 text-white hover:bg-black transition-colors">
+                                    {actionLabel}
+                                </button>
+                            )}
                             <button onClick={onSeen} className="font-semibold px-2 py-0.5 rounded bg-black/15 hover:bg-black/25 transition-colors">
-                                Got it
+                                {actionLabel ? 'Later' : 'Got it'}
                             </button>
                             {/* AD-236: session-only dismissal — tips return on next launch.
                                 Permanent dismissal lives in Settings → "Hide tips". */}

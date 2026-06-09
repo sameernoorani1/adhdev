@@ -1,8 +1,21 @@
 import type { FeedbackData, FeedbackRun } from './core';
 
 export const RUN_HEARTBEAT_STALE_MS = 90 * 1000;
-export const RUN_DISPATCH_STALE_MS = 20 * 1000;
-export const RUN_AGENT_CLAIM_STALE_MS = 60 * 60 * 1000;
+// AD-338: 'dispatching' is the "queued / sent" state behind the card's amber
+// "Sending" indicator. Hold it long enough that a multi-ticket Run keeps showing
+// queued while the agent works down the list, instead of vanishing after 20s and
+// leaving later tickets blank until they're claimed. A dead session is cleared
+// faster than this by AD-318 process-exit; this is just the no-agent backstop.
+export const RUN_DISPATCH_STALE_MS = 3 * 60 * 1000;
+// AD-341: a claimed run that goes silent must not haunt the board. This is the
+// LAST-RESORT backstop (layer 3): the instant close is the agent-release
+// callback (layer 1) and, for Run/batch work, terminal turn-end detection
+// (layer 2). An interactive agent (Claude) stays ALIVE between tickets, so
+// "process-exit" does NOT close a direct claim — this timeout is the real
+// fallback for an agent that claimed, finished, and never released/PATCHed.
+// AI comments + activity heartbeat the lease, so genuine long work keeps it
+// alive; 4 min is the dead-claim ceiling.
+export const RUN_AGENT_CLAIM_STALE_MS = 4 * 60 * 1000;
 
 export const ACTIVE_RUN_STATUSES = new Set<FeedbackRun['status']>([
     'dispatching',
@@ -128,6 +141,39 @@ export function markRunTerminal(
         else run.blocker = detail;
     }
     return true;
+}
+
+/**
+ * AD-341: close any open run lease that covers `ticketId` — by TICKET, not by
+ * runId. A run opened by the dispatcher carries a different runId than the
+ * agent's own execution, so closing by runId alone left the indicator stuck.
+ * Drops the ticket from each covering lease; closes a lease only once it has no
+ * live tickets left (multi-ticket / batch safe). Returns true if anything changed.
+ */
+export function closeRunsForTicket(
+    data: Pick<FeedbackData, 'activeRuns'>,
+    ticketId: string,
+    status: Extract<FeedbackRun['status'], 'done' | 'blocked' | 'interrupted' | 'stale'>,
+    nowIso: string,
+    detail?: string | null,
+): boolean {
+    if (!Array.isArray(data.activeRuns)) return false;
+    const id = String(ticketId || '').toUpperCase();
+    if (!id) return false;
+    let changed = false;
+    for (const run of data.activeRuns) {
+        if (!ACTIVE_RUN_STATUSES.has(run.status)) continue;
+        const ids = run.ticketIds || [];
+        if (!ids.some(t => String(t).toUpperCase() === id)) continue;
+        run.ticketIds = ids.filter(t => String(t).toUpperCase() !== id);
+        if (run.ticketIds.length === 0) {
+            markRunTerminal(data as FeedbackData, run.runId, status, nowIso, detail);
+        } else {
+            run.updatedAt = nowIso;
+        }
+        changed = true;
+    }
+    return changed;
 }
 
 export function heartbeatActiveRuns(data: FeedbackData, ticketIds: string[], nowIso: string, runId?: string | null): boolean {

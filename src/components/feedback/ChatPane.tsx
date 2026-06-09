@@ -38,11 +38,15 @@ interface ChatPaneProps {
     // can render a pulse indicator while triage is in flight, even when the
     // panel is closed.
     onProcessingChange?: (processing: boolean) => void;
+    // AD-336: Process needs the same no-agent guard Run has. The server already
+    // blocks the dispatch (409 pendingLaunch, off AD-318's process-liveness
+    // signal); this opens the terminal so the user can Launch, matching Run.
+    onRequireAgent?: () => void;
 }
 
 const POLL_MS = 3000;
 
-export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessageId, onScrollHandled, onProcessingChange }: ChatPaneProps) {
+export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessageId, onScrollHandled, onProcessingChange, onRequireAgent }: ChatPaneProps) {
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [composer, setComposer] = useState('');
     const [pendingImages, setPendingImages] = useState<{ url: string; filename: string }[]>([]);
@@ -250,6 +254,16 @@ export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessage
         try {
             const res = await fetch('/api/chat/process', { method: 'POST' });
             const data = await res.json();
+            // AD-336: no coding agent running (server returned 409 pendingLaunch,
+            // computed from AD-318's process-liveness signal). Match Run: open the
+            // terminal and guide the user to Launch, instead of silently dropping
+            // the triage prompt into a dead shell with no feedback.
+            if (data.pendingLaunch) {
+                onRequireAgent?.();
+                onToast?.(data.message || 'Start your coding agent, then Process again.', 6000);
+                stopProcessing();
+                return;
+            }
             onToast?.(data.message || (data.success ? 'Run started.' : 'No unaddressed messages.'), 4000);
             // No unaddressed messages → no triage will run; clear the flag now.
             if (!data.success) stopProcessing();

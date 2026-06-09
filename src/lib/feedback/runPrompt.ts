@@ -15,11 +15,27 @@ export function buildRunPrompt(ticketIds: string[], sizeNote: string = '', conte
         return `Read ADHDEV.md. Inspect only the relevant entries in .adhdev/board.json or use targeted search if the board file is large. Follow the ADHDev execution contract and work on all actionable tickets.${sizeNote}\nAdd this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Prompt ADHDev Guidance.`;
     }
 
+    // AD-338: claim FIRST. The board's running indicator only lights when you
+    // claim — so claim before reading/working, or the user stares at an idle card
+    // wondering if anything is happening. One quick POST per ticket, then work.
+    const claimFirst = ids.length === 1
+        ? `FIRST, before reading or doing anything else, claim it: \`POST http://localhost:3111/api/feedback/agent-claim\` with \`{ "ticketId": "${ids[0]}", "agent": "<your name>", "plan": "<one line>" }\`. This lights the running indicator on the board immediately. THEN read and work.`
+        : `FIRST, before reading or doing anything else, claim each ticket as you start it: \`POST http://localhost:3111/api/feedback/agent-claim\` with \`{ "ticketId": "AD-###", "agent": "<your name>", "plan": "<one line>" }\`. This lights each card's running indicator immediately. THEN read and work.`;
+
+    // AD-341: release LAST. The running indicator stays lit until you explicitly
+    // close it. A done/blocked PATCH closes it automatically; for any ticket you
+    // do NOT move to done (no-code, handshake, left for review), make one final
+    // agent-release call so the card stops animating the instant you're finished
+    // — don't leave it spinning for the fallback timeout to clean up.
+    const releaseLast = ids.length === 1
+        ? `LAST, when you are finished with ${ids[0]}: if you did not PATCH it to done/blocked, \`POST http://localhost:3111/api/feedback/agent-release\` with \`{ "ticketId": "${ids[0]}" }\` to stop the running indicator immediately.`
+        : `LAST, when you finish EACH ticket: if you did not PATCH it to done/blocked, \`POST http://localhost:3111/api/feedback/agent-release\` with \`{ "ticketId": "AD-###" }\` to stop that card's running indicator immediately.`;
+
     if (ids.length === 1) {
-        return `Work on ticket ${ids[0]}.\nRead ADHDEV.md and the full ${ids[0]} entry in .adhdev/board.json, including the hidden execution contract, all comments, all activity, and current execution state. Do not read the entire board file if it is large; resolve only the full entry for ${ids[0]}.${sizeNote}\nAdd this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Prompt ADHDev Guidance.`;
+        return `Work on ticket ${ids[0]}.\n${claimFirst}\nRead ADHDEV.md and the full ${ids[0]} entry in .adhdev/board.json, including the hidden execution contract, all comments, all activity, and current execution state. Do not read the entire board file if it is large; resolve only the full entry for ${ids[0]}.${sizeNote}\n${releaseLast}\nAdd this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Prompt ADHDev Guidance.`;
     }
 
-    return `Work on these tickets: ${ids.join(', ')}.\nRead ADHDEV.md and the full entry for each referenced ticket in .adhdev/board.json, including the hidden execution contract, all comments, all activity, and current execution state. Do not read the entire board file if it is large; resolve only the full entries for the referenced tickets.${sizeNote}\nAdd this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Prompt ADHDev Guidance.`;
+    return `Work on these tickets: ${ids.join(', ')}.\n${claimFirst}\nRead ADHDEV.md and the full entry for each referenced ticket in .adhdev/board.json, including the hidden execution contract, all comments, all activity, and current execution state. Do not read the entire board file if it is large; resolve only the full entries for the referenced tickets.${sizeNote}\n${releaseLast}\nAdd this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Prompt ADHDev Guidance.`;
 }
 
 export function buildBatchPlanningPrompt(mode: 'full' | 'incremental', ticketIds?: string[]): string {

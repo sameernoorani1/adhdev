@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+    closeRunsForTicket,
     createRunRecord,
     getActiveRunTicketIds,
     heartbeatActiveRuns,
@@ -9,6 +10,9 @@ import {
     markRunTerminal,
     sweepStaleRuns,
     upsertRun,
+    RUN_DISPATCH_STALE_MS,
+    RUN_HEARTBEAT_STALE_MS,
+    RUN_AGENT_CLAIM_STALE_MS,
 } from '@/lib/feedback/runs';
 import type { FeedbackData } from '@/lib/feedback/core';
 
@@ -163,20 +167,29 @@ describe('run lifecycle helpers', () => {
         });
     });
 
-    it('stales unconfirmed dispatches quickly', () => {
+    it('holds an unconfirmed dispatch as "Sending" through the queue window, then stales (AD-338)', () => {
+        // AD-338: a dispatched-but-unclaimed run must KEEP showing "Sending" while
+        // the agent works down a multi-ticket queue (not vanish after 20s), then
+        // self-expire if no claim ever confirms it. Times are relative to the
+        // dispatch window constant so this tracks any future tuning.
         const data = makeData();
+        const start = '2026-05-07T20:00:00.000Z';
         upsertRun(data, createRunRecord({
             runId: 'run-1',
             ticketIds: ['AD-269'],
             agent: 'Claude Code',
-            nowIso: '2026-05-07T20:00:00.000Z',
+            nowIso: start,
         }));
-        const run = data.activeRuns![0];
-        run.updatedAt = '2026-05-07T20:00:00.000Z';
-        run.lastHeartbeatAt = '2026-05-07T20:00:00.000Z';
+        const startMs = new Date(start).getTime();
+        const within = new Date(startMs + RUN_DISPATCH_STALE_MS - 1000).toISOString();
+        const past = new Date(startMs + RUN_DISPATCH_STALE_MS + 1000).toISOString();
 
-        expect(sweepStaleRuns(data, '2026-05-07T20:00:25.000Z')).toBe(true);
+        // Within the window: still 'dispatching' — the card keeps showing "Sending".
+        expect(sweepStaleRuns(data, within)).toBe(false);
+        expect(data.activeRuns?.[0].status).toBe('dispatching');
 
+        // Past the window: a never-claimed dispatch self-expires.
+        expect(sweepStaleRuns(data, past)).toBe(true);
         expect(data.activeRuns?.[0]).toMatchObject({
             status: 'stale',
             blocker: 'Recovered: prompt was sent but no active agent confirmed the run.',
@@ -184,24 +197,67 @@ describe('run lifecycle helpers', () => {
     });
 
     it('lets explicit direct-agent claims stay live longer than terminal heartbeat runs', () => {
+        // The claim window must outlast the ordinary heartbeat window, so a
+        // direct agent that goes briefly quiet isn't swept like a Run lease.
+        expect(RUN_AGENT_CLAIM_STALE_MS).toBeGreaterThan(RUN_HEARTBEAT_STALE_MS);
+
+        const baseMs = new Date('2026-05-07T20:00:00.000Z').getTime();
+        const at = (offsetMs: number) => new Date(baseMs + offsetMs).toISOString();
         const data = makeData();
         upsertRun(data, {
             ...createRunRecord({
                 runId: 'run-direct',
                 ticketIds: ['AD-221'],
                 agent: 'Codex',
-                nowIso: '2026-05-07T20:00:00.000Z',
+                nowIso: at(0),
                 source: 'agent-claim',
             }),
             status: 'running',
-            lastHeartbeatAt: '2026-05-07T20:00:00.000Z',
+            lastHeartbeatAt: at(0),
         });
 
-        expect(sweepStaleRuns(data, '2026-05-07T20:10:00.000Z')).toBe(false);
-        expect(sweepStaleRuns(data, '2026-05-07T21:01:00.000Z')).toBe(true);
+        // Past the heartbeat window but inside the claim window: still live.
+        expect(sweepStaleRuns(data, at(RUN_HEARTBEAT_STALE_MS + 60_000))).toBe(false);
+        // Past the claim window: swept stale.
+        expect(sweepStaleRuns(data, at(RUN_AGENT_CLAIM_STALE_MS + 60_000))).toBe(true);
         expect(data.activeRuns?.[0]).toMatchObject({
             status: 'stale',
             blocker: 'Recovered: direct agent claim exceeded the max live-run window without completion.',
         });
+    });
+});
+
+describe('closeRunsForTicket (AD-341)', () => {
+    const liveRun = (runId: string, ticketIds: string[]) => ({
+        ...createRunRecord({ runId, ticketIds, agent: 'Claude Code', nowIso: '2026-06-05T00:00:00.000Z', source: 'ui-run' }),
+        status: 'running' as const,
+    });
+
+    it('closes a single-ticket lease by ticket id (case-insensitive)', () => {
+        const data = makeData();
+        upsertRun(data, liveRun('run-1', ['AD-342']));
+        expect(closeRunsForTicket(data, 'ad-342', 'done', '2026-06-05T00:01:00.000Z')).toBe(true);
+        expect(data.activeRuns?.[0]).toMatchObject({ status: 'done', ticketIds: [] });
+    });
+
+    it('multi-ticket batch: drops only the named ticket, keeps the lease running', () => {
+        const data = makeData();
+        upsertRun(data, liveRun('run-batch', ['AD-1', 'AD-2', 'AD-3']));
+        expect(closeRunsForTicket(data, 'AD-2', 'done', '2026-06-05T00:01:00.000Z')).toBe(true);
+        expect(data.activeRuns?.[0].status).toBe('running');
+        expect(data.activeRuns?.[0].ticketIds).toEqual(['AD-1', 'AD-3']);
+    });
+
+    it('returns false when no active lease covers the ticket', () => {
+        const data = makeData();
+        upsertRun(data, liveRun('run-x', ['AD-9']));
+        expect(closeRunsForTicket(data, 'AD-404', 'done', '2026-06-05T00:01:00.000Z')).toBe(false);
+        expect(data.activeRuns?.[0].status).toBe('running');
+    });
+
+    it('ignores already-terminal leases', () => {
+        const data = makeData();
+        upsertRun(data, { ...liveRun('run-done', ['AD-5']), status: 'done' as const });
+        expect(closeRunsForTicket(data, 'AD-5', 'done', '2026-06-05T00:01:00.000Z')).toBe(false);
     });
 });

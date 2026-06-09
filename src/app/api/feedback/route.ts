@@ -6,7 +6,7 @@ import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
 import { validateAgentTransition } from '@/lib/feedback/transitions';
 import { recordOnboardingEvent } from '@/lib/feedback/onboardingEvents';
 import { getDiffFiles } from '@/lib/feedback/gitDiff';
-import { markRunTerminal } from '@/lib/feedback/runs';
+import { closeRunsForTicket, markRunTerminal } from '@/lib/feedback/runs';
 import { getMissingExecutionCommentError, hasSubstantiveAiCommentForExecution } from '@/lib/feedback/executionComments';
 
 const ALLOWED_PRIORITIES = new Set(['low', 'medium', 'high', 'critical']);
@@ -598,6 +598,15 @@ export async function PATCH(request: NextRequest) {
             } else if (updates.execution.status === 'blocked') {
                 markRunTerminal(data, runIdForExecution, 'blocked', now, updates.execution.blocker || 'Run blocked by agent.');
             }
+        }
+
+        // AD-341: close the live indicator by TICKET, not just runId. A run opened
+        // by the Run dispatcher carries a different runId than the agent's own
+        // execution, so closing only `runIdForExecution` left the dispatch lease
+        // stuck on "Sending" forever after the agent finished.
+        const TERMINAL_TICKET_STATUSES = new Set(['done', 'blocked', 'reviewed', 'deferred']);
+        if (updates.status && TERMINAL_TICKET_STATUSES.has(updates.status)) {
+            closeRunsForTicket(data, data.tickets[index].id, updates.status === 'blocked' ? 'blocked' : 'done', now);
         }
 
         writeFeedback(data, projectId);

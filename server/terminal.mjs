@@ -16,7 +16,19 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { shouldAutoCompleteOnClear } from './clearActiveRunRules.mjs';
-import { detectAgentFromTerminalTail, extractDirectWorkTicketIds } from './directWorkIntent.mjs';
+import { probeAgentLiveness, probeAgentBusy, isPidAlive } from './agentLiveness.mjs';
+import { extractFirstTicketRef } from './ticketRef.mjs';
+
+// AD-155: report the backend platform + Windows build to the client so xterm
+// can be configured for the right PTY backend (windowsPty for ConPTY). ConPTY
+// handles line-wrapping/reflow differently than a unix PTY, and xterm needs to
+// know the backend to reflow correctly on resize — the config-level root cause
+// the prior timing-nudge passes never addressed.
+const OS_PLATFORM = process.platform;
+const OS_BUILD = (() => {
+    const m = String(os.release() || '').match(/\.(\d+)$/);
+    return m ? Number(m[1]) : undefined;
+})();
 
 const PORT = parseInt(process.env.TERMINAL_PORT || '3112', 10);
 
@@ -322,12 +334,11 @@ const HEARTBEAT_INTERVAL_MS = 10 * 1000;
 // only fires for genuinely stuck/forgotten executions.
 const MAX_RUN_DURATION_MS = 60 * 60 * 1000;
 
-// AD-156 reopen #2: if no agent-detection marker has fired in this many ms,
-// the agent has exited and we should stop reporting it as active. Claude Code
-// repaints `bypass permissions on` while idle and `esc to interrupt` while
-// running, so a live agent refreshes `lastDetectedAt` constantly. 60s of
-// silence on those markers means the agent is gone — even if the prompt-regex
-// in detectAgentOutput missed because the exit chunk wasn't terminated by `>`.
+// AD-318: `lastDetectedAt` is now refreshed by the per-session liveness probe
+// (refreshAgentLiveness) every poll while the agent process is alive — not by
+// terminal-output markers. This staleness check is a belt-and-suspenders backstop
+// for the run-lease timer in scheduleActiveRunClear; the probe is the source of
+// truth for whether an agent is actually running.
 const AGENT_DETECTION_STALE_MS = 60 * 1000;
 
 function isAgentDetectionStale(session) {
@@ -336,14 +347,6 @@ function isAgentDetectionStale(session) {
     return last > 0 && (Date.now() - last) > AGENT_DETECTION_STALE_MS;
 }
 
-function expireStaleAgent(session, reason = 'detection_stale') {
-    if (!isAgentDetectionStale(session)) return false;
-    clearAgentActive(session);
-    if (session.activeRunTicketIds.length > 0) {
-        clearActiveRunTickets(session, reason);
-    }
-    return true;
-}
 
 function autoCompleteTickets(projectId, ticketIds, reason = 'auto_cleared') {
     if (!ticketIds?.length) return;
@@ -424,34 +427,58 @@ function scheduleActiveRunClear(session) {
     if (!session) return;
     if (session.clearActiveRunTimeout) clearTimeout(session.clearActiveRunTimeout);
     if (session.activeRunTicketIds.length > 0) {
-        session.clearActiveRunTimeout = setTimeout(() => {
-            // AD-221: 2 minutes of shell-quiet does NOT mean the agent is
-            // done. Claude in particular goes silent while it's thinking,
-            // between tool calls, or when the user has paused mid-turn —
-            // and the mascot was dropping after exactly that window.
-            //   * If the agent is still posting UI markers, treat the gap as
-            //     `agent_idle` (clears the active set + stops the heartbeat,
-            //     but does NOT auto-complete — execution.status stays
-            //     in_progress until the agent's own PATCH lands or
-            //     detection-stale fires).
-            //   * If detection has been quiet for >60s on top of the
-            //     2-minute shell-quiet window, the agent really has gone —
-            //     fall through as `detection_stale` and auto-complete.
-            //   * Last-resort fallback when we never observed an agent on
-            //     this session at all (legacy / unrecognized runner): keep
-            //     the old `timed_out` behavior so dead runs still self-heal.
-            const agentEverDetected = !!session.agentState?.lastDetectedAt;
-            if (isAgentDetectionStale(session)) {
-                clearActiveRunTickets(session, 'detection_stale');
-            } else if (agentEverDetected && session.agentState?.active) {
-                // AD-269: quiet agent work is still a live run. Keep the run
-                // lease heartbeat alive instead of clearing UI state after a
-                // shell-output gap.
-                scheduleActiveRunClear(session);
-            } else {
-                clearActiveRunTickets(session, 'timed_out');
-            }
-        }, ACTIVE_RUN_TTL_MS);
+        session.clearActiveRunTimeout = setTimeout(() => { void onActiveRunQuiet(session); }, ACTIVE_RUN_TTL_MS);
+    }
+}
+
+// AD-341: the run-clear decision when the shell has gone quiet for
+// ACTIVE_RUN_TTL_MS. This is the TURN-END fallback (layer 2 of Sameer's
+// defense-in-depth close; the explicit agent-release callback is layer 1).
+//
+// The old logic kept the run alive for as long as the agent PROCESS was alive
+// (AD-269 + AD-318). But an interactive agent like Claude Code stays alive the
+// whole session — it finishes a ticket and sits at its prompt, still alive — so
+// the run NEVER closed on its own. "Process alive" is the wrong stop signal.
+//
+// The right signal is TURN-END: the shell is quiet AND the agent has no tool /
+// command running under it (no live descendant pids). Then it's idle at its
+// prompt and the run can close even though the process lives on. A long silent
+// build/test keeps a descendant alive → we re-arm instead of false-closing
+// (the AD-221 failure mode). probeAgentBusy fails safe to "busy".
+async function onActiveRunQuiet(session) {
+    if (!session?.shell || session.activeRunTicketIds.length === 0) return;
+
+    // Agent's process has been gone >60s → it really exited. Auto-complete.
+    if (isAgentDetectionStale(session)) {
+        clearActiveRunTickets(session, 'detection_stale');
+        return;
+    }
+
+    const agentEverDetected = !!session.agentState?.lastDetectedAt;
+    if (!agentEverDetected || !session.agentState?.active) {
+        // Never observed an agent on this session (legacy / unrecognized
+        // runner): keep the old self-healing behavior for dead runs.
+        clearActiveRunTickets(session, 'timed_out');
+        return;
+    }
+
+    // Agent process is alive. Mid-turn (running a tool) or idle at its prompt?
+    let busy = true;
+    try {
+        busy = await probeAgentBusy(session.agentState.pid);
+    } catch {
+        busy = true; // fail safe: never false-close on a probe glitch
+    }
+    // The session may have been torn down while we awaited the probe.
+    if (!sessions.get(session.projectId) || !session.shell || session.activeRunTicketIds.length === 0) return;
+
+    if (busy) {
+        scheduleActiveRunClear(session); // still working — re-arm the turn-end check
+    } else {
+        // Quiet + no tool running = the agent finished its turn (idle at prompt).
+        // Close even though the process is alive. 'turn_end' auto-completes the
+        // execution (drops the mascot) but, unlike a crash, posts no warning.
+        clearActiveRunTickets(session, 'turn_end');
     }
 }
 
@@ -473,6 +500,29 @@ function setActiveRunTickets(session, ticketIds = [], runId = null) {
     } else {
         stopHeartbeat(session);
     }
+}
+
+// AD-341 (direct-terminal start): a ticket reference in the live terminal IS the
+// user starting work on it. Whether you type "AD-344" or describe it, the agent
+// resolves it and echoes the id in its output — so scanning the output stream
+// catches both your explicit reference AND a description the agent maps to a
+// ticket. This is the ONLY signal available at the START of direct work: the
+// agent does the work before it ever writes to the board (and often skips
+// agent-claim on trivial tickets), so without this the card never animates.
+//
+// Scoped to stay compatible with AD-318 (which removed agent-NAME text sniffing):
+//   - Gated on an AD-318 process-CONFIRMED agent, so a bare "AD-12" typed into a
+//     plain shell with no agent can't light anything.
+//   - Only binds when NO run is already active — never hijacks a Run-button
+//     dispatch or an in-flight batch.
+//   - Self-healing: the board's done-guard (AD-341) won't animate a closed
+//     ticket, and turn-end / release / done-PATCH clears a stray bind.
+function maybeBindReferencedTicket(session, data) {
+    if (!session?.agentState?.active) return;          // only with a real live agent
+    if (session.activeRunTicketIds.length > 0) return; // a run is already lit
+    const ticketId = extractFirstTicketRef(data);
+    if (!ticketId) return;
+    setActiveRunTickets(session, [ticketId], null);
 }
 
 // AD-178: which clear-reasons are reliable enough to auto-complete the
@@ -518,10 +568,6 @@ function clearActiveRunTickets(session, reason = 'cleared') {
     }
 }
 
-function isActiveRunOldEnoughToClear(session) {
-    const startedMs = new Date(session?.activeRunStartedAt || session?.requestState?.startedAt || '').getTime();
-    return Number.isFinite(startedMs) && Date.now() - startedMs > 5000;
-}
 
 function setAgentActive(session, name) {
     if (!session || !name) return;
@@ -552,242 +598,57 @@ function clearAgentActive(session) {
     session.requestState.lastEvent = 'agent_exited';
 }
 
-function stripAnsi(text) {
-    return text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\x1b\][^]*(?:|\x1b\\)/g, '');
-}
 
-function restoreAgentFromTail(session) {
-    if (!session || session.agentState.active) return;
-    const agentName = detectAgentFromTerminalTail(session.outputTail || '');
-    if (agentName) setAgentActive(session, agentName);
-}
+// AD-318: agent liveness is derived from a real OS process probe
+// (server/agentLiveness.mjs), polled per session. Text/scrollback detection is
+// gone — an agent is "running" only while its process is alive under this shell.
+const AGENT_LIVENESS_POLL_MS = 3000;
+// Grace window after a launch hint before we stop waiting for the agent's
+// process to appear (npm shim -> node startup can take a couple seconds).
+const AGENT_LAUNCH_GRACE_MS = 12000;
 
-function detectAgentCommand(session, command) {
-    if (!session) return;
-    const normalized = command.trim().toLowerCase();
-    if (!normalized) return;
-
-    if (normalized === 'exit' || normalized === 'quit') {
-        clearAgentActive(session);
+async function refreshAgentLiveness(session) {
+    if (!session?.shell) return;
+    // Fast path: a known agent PID still alive => still running. process.kill(pid,0)
+    // only tests existence, so we skip the heavier full process enumeration.
+    if (session.agentState.active && session.agentState.pid && isPidAlive(session.agentState.pid)) {
+        session.agentState.lastDetectedAt = Date.now();
         return;
     }
-
-    if (normalized === 'claude' || normalized.startsWith('claude ') || normalized.includes('claude-code')) {
-        setAgentActive(session, 'Claude Code');
-        return;
+    let result;
+    try {
+        result = await probeAgentLiveness(session.shell.pid, session.agentMarker?.name || null);
+    } catch {
+        result = { active: false, name: null, pid: null };
     }
+    // The session may have been torn down while we awaited the OS probe.
+    if (!sessions.get(session.projectId) || !session.shell) return;
 
-    if (normalized === 'codex' || normalized.startsWith('codex ')) {
-        setAgentActive(session, 'Codex');
-        return;
-    }
-
-    if (normalized === 'aider' || normalized.startsWith('aider ')) {
-        setAgentActive(session, 'Aider');
-        return;
-    }
-
-    // AD-169: Gemini CLI launches via `gemini` (or `gemini-cli` on some
-    // installs). Reported via AD-169: the terminal label still said "Shell" after
-    // launching it — without input-side detection we relied on output-only,
-    // which doesn't always fire fast enough.
-    if (normalized === 'gemini' || normalized.startsWith('gemini ') || normalized.includes('gemini-cli')) {
-        setAgentActive(session, 'Gemini CLI');
-        return;
-    }
-
-    // Cursor's terminal agent (`cursor-agent`) and Continue (`continue` /
-    // `cn`) are the other two AI CLIs we cover by request.
-    if (normalized === 'cursor-agent' || normalized.startsWith('cursor-agent ')) {
-        setAgentActive(session, 'Cursor Agent');
-        return;
-    }
-    if (normalized === 'continue' || normalized.startsWith('continue ')) {
-        setAgentActive(session, 'Continue');
-    }
-}
-
-function maybeStartDirectTerminalRun(session, text) {
-    if (!session?.agentState?.active) return;
-    if (session.activeRunTicketIds.length > 0) return;
-    const ticketIds = extractDirectWorkTicketIds(text);
-    if (ticketIds.length === 0) return;
-    const runId = `direct-${Date.now().toString(36)}-${ticketIds.join('-').toLowerCase()}`;
-    setActiveRunTickets(session, ticketIds, runId);
-    confirmActiveRunTickets(session);
-}
-
-function detectAgentOutput(session, data) {
-    if (!session) return;
-    const cleanChunk = stripAnsi(data);
-    const chunk = cleanChunk.toLowerCase();
-    session.outputTail = (session.outputTail + cleanChunk).slice(-4000);
-    const normalized = session.outputTail.toLowerCase();
-    if (!chunk.trim() && !normalized.trim()) return;
-
-    const activeAgentName = session.agentState.active ? session.agentState.name : null;
-    const seenForAgent = (agentName, matcher) => matcher(chunk) || (activeAgentName === agentName && matcher(normalized));
-    const seenWhenIdle = matcher => matcher(chunk) || (!activeAgentName && matcher(normalized));
-    const seenCodex = text => (
-        text.includes('openai codex') ||
-        text.includes('codex (v') ||
-        text.includes('permissions: yolo mode') ||
-        text.includes('approving:') ||
-        text.includes('codex cli') ||
-        text.includes('codex v') ||
-        text.includes('full auto mode') ||
-        text.includes('ctrl+e to explain')
-    );
-    const seenClaude = text => (
-        text.includes('esc to interrupt') ||
-        text.includes('summarize code changes after completion') ||
-        text.includes('press ctrl-c again to quit') ||
-        text.includes('claude code v') ||
-        text.includes('bypass permissions on') ||
-        text.includes('shift+tab to cycle')
-    );
-
-    if (seenForAgent('Codex', seenCodex) || seenWhenIdle(seenCodex)) {
-        setAgentActive(session, 'Codex');
-        return;
-    }
-
-    // AD-144 reopen #2: detection markers must be *distinctive* — bare words
-    // like "codex" or "aider" triggered false agent switches whenever Claude's
-    // output mentioned them (e.g. a conversation about agent mascots
-    // flipped the session to Codex because the reply referenced Codex as a
-    // robot). Keep only phrases that a foreign agent would not print casually.
-    // AD-221: match against the rolling 4 KB tail (`normalized`), not just
-    // the current chunk. Two reasons: (a) PTY writes can split a marker
-    // across two chunks (`bypass permis`/`sions on`) — neither half matches
-    // `chunk.includes` even though the phrase is on screen; (b) during long
-    // quiet tool calls the TUI emits sparse spinner ticks without re-printing
-    // the marker phrase, but the previous repaint is still in the tail —
-    // that's "the agent is alive, just busy", not "the agent is gone".
-    if (
-        normalized.includes('esc to interrupt') ||
-        normalized.includes('summarize code changes after completion') ||
-        normalized.includes('press ctrl-c again to quit') ||
-        normalized.includes('claude code v') ||
-        // AD-156 / AD-139 reopen: Claude Code's input prompt repaints
-        // `>> bypass permissions on (shift+tab to cycle)` every frame while
-        // it's idle/listening. Without this marker, detection missed in
-        // user sessions — so Run reported "Sent to Coding Agent" while
-        // the prompt actually landed in bare cmd.exe.
-        normalized.includes('bypass permissions on') ||
-        normalized.includes('shift+tab to cycle')
-    ) {
-        if (seenForAgent('Claude Code', seenClaude) || seenWhenIdle(seenClaude)) {
-            setAgentActive(session, 'Claude Code');
-            return;
+    if (result.active && result.name) {
+        setAgentActive(session, result.name);
+        session.agentState.pid = result.pid;
+    } else {
+        if (session.agentState.active) clearAgentActive(session);
+        session.agentState.pid = null;
+        // Stop expecting an agent whose process never came up after the launch.
+        if (session.agentMarker && Date.now() - session.agentMarker.launchedAt > AGENT_LAUNCH_GRACE_MS) {
+            session.agentMarker = null;
         }
     }
-
-    if (
-        normalized.includes('approving:') ||
-        normalized.includes('codex cli') ||
-        normalized.includes('codex v') ||
-        normalized.includes('full auto mode') ||
-        normalized.includes('ctrl+e to explain')
-    ) {
-        if (seenForAgent('Codex', seenCodex) || seenWhenIdle(seenCodex)) {
-            setAgentActive(session, 'Codex');
-            return;
-        }
-    }
-
-    const seenAider = text => (
-        text.includes('aider v') ||
-        (text.includes('model:') && text.includes('aider'))
-    );
-    if (seenForAgent('Aider', seenAider) || seenWhenIdle(seenAider)) {
-        setAgentActive(session, 'Aider');
-        return;
-    }
-
-    // AD-169: Gemini CLI distinctive output markers. Gemini's TUI shows a
-    // "GEMINI.md" hint on launch and a "/directory" workspace footer; the
-    // privacy/auth screens print "google ai" lines. Keep markers narrow so
-    // foreign agents don't false-trigger (see AD-144 reopen #2).
-    const seenGemini = text => (
-        text.includes('gemini cli') ||
-        text.includes('gemini.md file') ||
-        text.includes('workspace (/directory)') ||
-        (text.includes('google ai') && text.includes('gemini'))
-    );
-    if (seenForAgent('Gemini CLI', seenGemini) || seenWhenIdle(seenGemini)) {
-        setAgentActive(session, 'Gemini CLI');
-        return;
-    }
-
-    const seenCursor = text => (
-        text.includes('cursor agent') ||
-        text.includes('cursor-agent v')
-    );
-    if (seenForAgent('Cursor Agent', seenCursor) || seenWhenIdle(seenCursor)) {
-        setAgentActive(session, 'Cursor Agent');
-        return;
-    }
-
-    // AD-221: removed the aggressive in-stream `expireStaleAgent('detection_stale')`
-    // that previously fired here. It was the load-bearing cause of mascots
-    // dropping mid-run: any non-marker chunk arriving 60s+ after the last
-    // marker hit would trigger auto-complete, even while the agent was still
-    // genuinely working (long tool call, spinner-only output). The
-    // timer-fired path in `scheduleActiveRunClear` (which requires BOTH
-    // 2-min shell-quiet AND fingerprint-stale) handles this correctly.
-
-    // Shell prompt detection — only check the LATEST chunk (not accumulated tail)
-    // to avoid false positives from agent output that contains > or $ characters.
-    // Also skip if agent was detected recently (5s cooldown).
-    const PROMPT_COOLDOWN_MS = 5000;
-    const timeSinceAgentDetected = Date.now() - (session.agentState.lastDetectedAt || 0);
-    if (session.agentState.active && timeSinceAgentDetected > PROMPT_COOLDOWN_MS) {
-        const recentOutput = cleanChunk;
-        // Windows cmd.exe: "C:\path\to\dir>"
-        const isWindowsPrompt = /(?:^|\n)\s*[A-Z]:\\[^\r\n>]*>\s*$/m.test(recentOutput);
-        // PowerShell: "PS C:\path>"
-        const isPSPrompt = /(?:^|\n)\s*PS\s+[A-Z]:\\[^\r\n>]*>\s*$/m.test(recentOutput);
-        // Unix: "user@host:~/path$ " or "$ " at line start
-        const isUnixPrompt = /(?:^|\n)\s*(?:\w+@[\w.-]+[:#~][^\r\n]*|)\$\s*$/m.test(recentOutput);
-        if (isWindowsPrompt || isPSPrompt || isUnixPrompt) {
-            clearAgentActive(session);
-            // AD-269: shell-prompt detection is heuristic and has repeatedly
-            // fired mid-run. Do not clear the persisted active Run; completion
-            // PATCH, explicit interrupt, reliable stale recovery, or the max
-            // runtime watchdog owns that transition.
-        }
-    }
-
-    // AD-053 reopen #2: `esc to interrupt` and the ctrl+c variants are *busy*
-    // indicators that Claude Code prints on every loading frame — they used to
-    // live in this idle-detection list, which meant the accumulated `normalized`
-    // tail held the phrase for the lifetime of the session and cleared
-    // activeRunTicketIds on every subsequent chunk. The spinner/shimmer/Running
-    // badge vanished within seconds of Run. Only genuinely idle phrases stay.
-    if (
-        session.activeRunTicketIds.length > 0 &&
-        (
-            chunk.includes('waiting for your input') ||
-            chunk.includes('awaiting your input') ||
-            (
-                (chunk.includes('bypass permissions on') || chunk.includes('shift+tab to cycle')) &&
-                !chunk.includes('esc to interrupt') &&
-                isActiveRunOldEnoughToClear(session)
-            )
-        )
-    ) {
-        clearActiveRunTickets(session, 'agent_idle');
-    }
 }
+
+
+
+
+
 
 function inspectTerminalInput(session, data) {
     if (!session) return data;
-    if (data === '') {
+    // AD-149: an empty input frame is the client's explicit interrupt (Ctrl+C /
+    // Esc) signal. Clear any active run / agent state — a deliberate user action,
+    // not a text heuristic.
+    if (data === '') {
         if (session.activeRunTicketIds.length > 0) {
-            // AD-149 follow-up: mark affected tickets as blocked BEFORE
-            // clearing the server active set so the client indicator clears
-            // within one poll instead of riding the fallback freshness window.
             markTicketsInterrupted(session.projectId, session.activeRunTicketIds);
             clearActiveRunTickets(session, 'interrupted');
         } else {
@@ -795,37 +656,11 @@ function inspectTerminalInput(session, data) {
         }
         return data;
     }
-
-    if (data === '') {
-        markTicketsInterrupted(session.projectId, session.activeRunTicketIds);
-        clearActiveRunTickets(session, 'interrupted');
-        session.agentInputBuffer = '';
-        return data;
-    }
-
-    // Bracketed-paste payloads are opaque terminal data. Do not accumulate
-    // them into the agent-command detector; pasted text can contain arbitrary
-    // ticket IDs and newlines, but it is still just user input.
-    if (data.startsWith('\x1b[200~')) {
-        const pasted = data
-            .replace(/^\x1b\[200~/, '')
-            .replace(/\x1b\[201~$/, '');
-        maybeStartDirectTerminalRun(session, pasted);
-        return data;
-    }
-
-    session.agentInputBuffer = (session.agentInputBuffer || '') + data;
-    const buf = session.agentInputBuffer;
-    const newlineIndex = buf.search(/[\r\n]/);
-    if (newlineIndex === -1) return data;
-
-    const command = buf.slice(0, newlineIndex);
-    session.agentInputBuffer = buf.slice(newlineIndex + 1);
-    maybeStartDirectTerminalRun(session, command);
-    detectAgentCommand(session, command);
-    // Raw terminal input is opaque user data. Ticket context is injected only
-    // via the explicit run paths, never by heuristically rewriting typed or
-    // pasted terminal content.
+    // AD-318: typed and pasted terminal text is opaque user data. Agent identity
+    // and ticket context come from the launch marker + process liveness + the
+    // explicit Run paths — never from sniffing what was typed. (Typed text is
+    // what made "hi claude" in a bare shell falsely report an agent, and what
+    // auto-started bogus runs off mentioned ticket numbers — AD-269.)
     return data;
 }
 
@@ -853,7 +688,10 @@ function createSessionState(projectId) {
         activeRunStartedAt: null,
         clearActiveRunTimeout: null,
         historyWriteTimeout: null,
-        agentState: { active: false, name: null, lastDetectedAt: 0 },
+        agentState: { active: false, name: null, pid: null, lastDetectedAt: 0 },
+        // AD-318: launch hint (identity) + per-session liveness probe handle.
+        agentMarker: null,
+        livenessTimer: null,
         requestState: { status: 'idle', startedAt: null, updatedAt: null, lastEvent: null },
     };
 }
@@ -919,10 +757,14 @@ function getOrCreateSession(projectId) {
         // survives terminal-server / `npx adhdev` restarts.
         scheduleHistoryWrite(session);
 
-        // AD-141 take 3: agent detection + run-clear scheduling are both
-        // scoped to this session. Two projects each have their own agent
-        // state, their own active run tickets, and their own clients.
-        detectAgentOutput(session, data);
+        // AD-341: light direct-terminal work when a ticket id is referenced in
+        // the stream while a process-confirmed agent is live (see the function
+        // for why this is AD-318-compatible).
+        maybeBindReferencedTicket(session, data);
+
+        // AD-318: agent detection no longer reads terminal output — liveness is
+        // the per-session refreshAgentLiveness OS probe. We still warm the
+        // run-clear timer on output so an active run's lease doesn't expire mid-work.
         if (session.activeRunTicketIds.length > 0) {
             scheduleActiveRunClear(session);
         }
@@ -941,6 +783,8 @@ function getOrCreateSession(projectId) {
         }
         clearActiveRunTickets(session, 'shell_exited');
         clearAgentActive(session);
+        if (session.livenessTimer) { clearInterval(session.livenessTimer); session.livenessTimer = null; }
+        session.agentMarker = null;
         // AD-144: flush any pending history write before dropping the session,
         // so the scrollback up to the shell's final frame is preserved for the
         // next `npx adhdev` launch.
@@ -952,6 +796,11 @@ function getOrCreateSession(projectId) {
         sessions.delete(id);
     });
 
+    // AD-318: start the per-session agent-liveness probe loop. Replaces all
+    // terminal-text detection — agentState now tracks a real process.
+    if (!session.livenessTimer) {
+        session.livenessTimer = setInterval(() => { void refreshAgentLiveness(session); }, AGENT_LIVENESS_POLL_MS);
+    }
     sessions.set(id, session);
     return session;
 }
@@ -960,9 +809,8 @@ function snapshotSessionStatus(session) {
     // AD-221: status reads must not clear active runs. The browser polls this
     // endpoint every 2s, so using it as a detection-stale sweeper recreated the
     // premature mascot-stop bug while agents were busy in long quiet turns.
-    if (session) {
-        restoreAgentFromTail(session);
-    }
+    // AD-318: /status just reads the process-probe-derived agentState; it no
+    // longer re-detects from scrollback (the AD-292 false-positive seed).
     if (!session) {
         return {
             connected: false,
@@ -1324,7 +1172,7 @@ wss.on('connection', (ws, req) => {
         try { ws.send(JSON.stringify({ type: 'output', data: replay })); } catch {}
     }
 
-    try { ws.send(JSON.stringify({ type: 'ready', pid: s.pid, shell: SHELL, projectId })); } catch {}
+    try { ws.send(JSON.stringify({ type: 'ready', pid: s.pid, shell: SHELL, projectId, platform: OS_PLATFORM, osBuild: OS_BUILD })); } catch {}
 
     ws.on('message', (msg) => {
         const activeSession = getSession(ws.projectId);
@@ -1336,7 +1184,10 @@ wss.on('connection', (ws, req) => {
                 activeSession.shell.write(transformedInput);
             } else if (parsed.type === 'agent-hint') {
                 if (typeof parsed.agentId === 'string' && parsed.agentId.trim()) {
-                    setAgentActive(activeSession, parsed.agentId.trim());
+                    // AD-318: the launch hint is the agent-OWNED identity signal. It
+                    // does NOT flip state — it records which agent to expect so the
+                    // process probe can disambiguate. Liveness is the probe alone.
+                    activeSession.agentMarker = { name: parsed.agentId.trim(), launchedAt: Date.now() };
                 }
             } else if (parsed.type === 'resize') {
                 activeSession.shell.resize(parsed.cols || 120, parsed.rows || 30);
@@ -1354,7 +1205,7 @@ wss.on('connection', (ws, req) => {
                 try {
                     ws.send(JSON.stringify({ type: 'clear' }));
                     if (replay) ws.send(JSON.stringify({ type: 'output', data: replay }));
-                    ws.send(JSON.stringify({ type: 'ready', pid: newSession.shell.pid, shell: SHELL, projectId: newProjectId }));
+                    ws.send(JSON.stringify({ type: 'ready', pid: newSession.shell.pid, shell: SHELL, projectId: newProjectId, platform: OS_PLATFORM, osBuild: OS_BUILD }));
                 } catch {}
                 console.log(`Client switched terminal to project ${newProjectId}`);
             }
@@ -1381,6 +1232,7 @@ function flushAllHistoryOnExit() {
         // AD-149 permanent fix: stop the heartbeat loops on shutdown so no
         // dangling intervals keep the process alive past the exit call.
         try { stopHeartbeat(session); } catch {}
+        if (session.livenessTimer) { clearInterval(session.livenessTimer); session.livenessTimer = null; }
     }
 }
 

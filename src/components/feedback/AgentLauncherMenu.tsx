@@ -13,6 +13,10 @@ interface AgentLauncherMenuProps {
     wsRef: { current: WebSocket | null };
     connected: boolean;
     projectId: string | null | undefined;
+    // AD-335: bump this counter to fling the menu open from outside (the
+    // board's "connect your agent" coachmark uses it so the user lands on the
+    // agent picker and chooses, instead of being auto-pointed at one agent).
+    openSignal?: number;
 }
 
 const LAST_VARIANT_KEY = 'adhdev-launcher-last-variant';
@@ -76,7 +80,7 @@ function writeKnownInstalled(agentId: string) {
     } catch { /* ignore */ }
 }
 
-export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncherMenuProps) {
+export function AgentLauncherMenu({ wsRef, connected, projectId, openSignal }: AgentLauncherMenuProps) {
     const [open, setOpen] = useState(false);
     const [probe, setProbe] = useState<ProbeMap>({});
     const [probeLoading, setProbeLoading] = useState(false);
@@ -117,6 +121,11 @@ export function AgentLauncherMenu({ wsRef, connected, projectId }: AgentLauncher
         }
         finally { setProbeLoading(false); }
     }, []);
+
+    // AD-335: open the menu when the board flings the signal (coachmark click).
+    useEffect(() => {
+        if (openSignal && openSignal > 0) setOpen(true);
+    }, [openSignal]);
 
     // Lazy-fetch on first open.
     useEffect(() => {

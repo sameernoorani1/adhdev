@@ -31,19 +31,22 @@ export function isTicketExecutionActive(
     // signal.
     activeExecutionIds?: Iterable<string> | null,
 ): boolean {
+    // AD-341: the done/reviewed guard must run FIRST — before the
+    // activeExecutionIds membership check. The terminal's captureTicketIds can
+    // still list a ticket the agent just PATCHed to `done` (the terminal clears
+    // its own active set lazily, on turn-end / timeout — it doesn't know about
+    // the board-side done PATCH). Without this ordering, a finished Run kept
+    // animating "Running" off that stale terminal list until the terminal
+    // cleared it ~2 min later. A done/reviewed ticket is never running, period.
+    // (AD-232: same guard also covers the AD-284 write race that leaves
+    // execution.status stuck as 'in_progress' after the status flip.)
+    if (ticket.status === 'done' || ticket.status === 'reviewed') return false;
     if (activeExecutionIds) {
         const id = String(ticket.id || '').toUpperCase();
         for (const activeId of activeExecutionIds) {
             if (String(activeId || '').toUpperCase() === id) return true;
         }
     }
-    // AD-232: a done/reviewed ticket can never be 'in progress' by definition.
-    // When the AD-284 write race leaves `execution.status` stuck as
-    // 'in_progress' after `ticket.status` has flipped to a terminal state,
-    // the running pill would stay lit until the 45 s freshness window
-    // expired. Gate on ticket.status so the visible state self-heals on the
-    // next render instead of waiting for the heartbeat-stale clock.
-    if (ticket.status === 'done' || ticket.status === 'reviewed') return false;
     if (ticket.execution?.status !== 'in_progress') return false;
     const updatedAtRaw = ticket.execution?.updatedAt;
     if (!updatedAtRaw) return false;

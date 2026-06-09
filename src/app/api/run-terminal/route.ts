@@ -3,7 +3,8 @@ import { readFeedback, writeFeedback, withFeedbackLock, resolveTicketById } from
 import { terminalAuthHeaders } from '@/lib/feedback/sessionToken';
 import { getCurrentGitSha } from '@/lib/feedback/gitDiff';
 import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
-import { createRunRecord, markRunFailed, markRunSubmitted, upsertRun } from '@/lib/feedback/runs';
+import { createRunRecord, markRunFailed, upsertRun } from '@/lib/feedback/runs';
+import { markRunSent } from '@/lib/feedback/runLifecycle';
 
 /**
  * POST /api/run-terminal
@@ -126,7 +127,9 @@ export async function POST(request: NextRequest) {
             }
             await withFeedbackLock(projectId, () => {
                 const data = readFeedback(projectId);
-                markRunSubmitted(data, runId, new Date().toISOString());
+                // AD-269: prompt sent ≠ running. Keep the lease 'dispatching'
+                // until the agent claims; it self-expires if no claim arrives.
+                markRunSent(data, runId, new Date().toISOString());
                 writeFeedback(data, projectId);
             });
         } catch (err) {

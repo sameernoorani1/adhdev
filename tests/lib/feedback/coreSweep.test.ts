@@ -61,11 +61,13 @@ describe('sweepStaleExecutions', () => {
                 runId: 'run-direct',
                 ticketIds: ['AD-221'],
                 agent: 'Codex',
-                nowIso: '2026-05-18T19:00:00.000Z',
+                // Heartbeated ~1 min before "now" — comfortably inside any
+                // active-run window, so the run is unambiguously still live.
+                nowIso: '2026-05-18T19:09:00.000Z',
                 source: 'agent-claim',
             });
             run.status = 'running';
-            run.lastHeartbeatAt = '2026-05-18T19:00:00.000Z';
+            run.lastHeartbeatAt = '2026-05-18T19:09:00.000Z';
             upsertRun(data, run);
 
             expect(sweepStaleExecutions(data)).toBe(false);

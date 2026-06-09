@@ -514,14 +514,32 @@ async function init() {
     console.log(`  ✓ Project "${project.name}" already registered (set as active)`);
   }
 
-  // Add to .gitignore
+  // Add to .gitignore. Privacy-by-default: .adhdev/ holds the user's board,
+  // brain-dump (chat.json), config, and uploaded artifacts — per-project local
+  // state that changes on every action and can contain private notes. Ignore
+  // the whole directory so a stray `git add .` never commits/leaks it. Create
+  // .gitignore if the project doesn't have one yet (previously this was skipped
+  // entirely when absent, and only `.adhdev/uploads/` was covered when present
+  // — board.json/chat.json/config.json were left exposed).
   const gitignorePath = join(projectRoot, '.gitignore');
+  const ignoreMarker = '# ADHDev board state';
+  const ignoreBlock = [
+    '# ADHDev board state — local per-project data (board, brain-dump, config,',
+    '# uploads). Changes on every action and may contain private notes; keep it',
+    '# out of git.',
+    '.adhdev/',
+  ].join('\n');
   if (existsSync(gitignorePath)) {
     const content = readFileSync(gitignorePath, 'utf-8');
-    if (!content.includes('.adhdev/uploads')) {
-      writeFileSync(gitignorePath, content.trimEnd() + '\n.adhdev/uploads/\n');
-      console.log('  ✓ Added .adhdev/uploads/ to .gitignore');
+    const alreadyIgnored = content.includes(ignoreMarker)
+      || /(^|\n)\.adhdev\/[ \t]*(\r?\n|$)/.test(content);
+    if (!alreadyIgnored) {
+      writeFileSync(gitignorePath, content.trimEnd() + '\n\n' + ignoreBlock + '\n');
+      console.log('  ✓ Added .adhdev/ (board state) to .gitignore');
     }
+  } else {
+    writeFileSync(gitignorePath, ignoreBlock + '\n');
+    console.log('  ✓ Created .gitignore with .adhdev/ (board state) ignored');
   }
 
   // Configure Claude Code hooks if .claude/ exists

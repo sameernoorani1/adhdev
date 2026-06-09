@@ -82,7 +82,7 @@ export function NewTicketModal({
         }
     }, [open]);
 
-    // Auto-upload dropped files when modal opens with them (VD-024)
+    // Auto-upload dropped files when modal opens with them
     useEffect(() => {
         if (!open || !droppedFiles || droppedFiles.length === 0) return;
         const uploadDropped = async () => {
@@ -107,15 +107,41 @@ export function NewTicketModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [open, droppedFiles]);
 
+    // AD-317: a closed modal nukes everything the user has typed in. Guard the
+    // four close paths (Escape, backdrop click, header ×, footer Cancel) with a
+    // confirm prompt whenever the form has unsaved content. `submitting` is the
+    // only path that bypasses the prompt — handleSubmit calls onClose itself
+    // after a successful POST, at which point there is nothing left to lose.
+    const isDirty = useCallback(() => {
+        return (
+            title.trim().length > 0 ||
+            description.trim().length > 0 ||
+            images.length > 0 ||
+            tags.length > 0 ||
+            missionId !== '' ||
+            wave !== '' ||
+            session !== ''
+        );
+    }, [title, description, images.length, tags.length, missionId, wave, session]);
+
+    const attemptClose = useCallback(() => {
+        if (submitting) { onClose(); return; }
+        if (!isDirty()) { onClose(); return; }
+        const ok = typeof window !== 'undefined'
+            ? window.confirm('Discard this ticket? Anything you have entered will be lost.')
+            : true;
+        if (ok) onClose();
+    }, [submitting, isDirty, onClose]);
+
     // Escape to close
     useEffect(() => {
         if (!open) return;
         const handleKeyDown = (e: KeyboardEvent) => {
-            if (e.key === 'Escape') onClose();
+            if (e.key === 'Escape') attemptClose();
         };
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [open, onClose]);
+    }, [open, attemptClose]);
 
     // Global paste handler — catches Ctrl+V regardless of focus
     const handleGlobalPaste = useCallback(async (e: ClipboardEvent) => {
@@ -163,7 +189,7 @@ export function NewTicketModal({
         return () => window.removeEventListener('paste', handleGlobalPaste);
     }, [handleGlobalPaste]);
 
-    // VD-072: Full-screen drag-drop on new ticket modal
+    // Full-screen drag-drop on new ticket modal
     const handleDragOver = useCallback((e: React.DragEvent) => {
         e.preventDefault();
         e.stopPropagation();
@@ -221,7 +247,7 @@ export function NewTicketModal({
 
     const handleSubmit = async () => {
         if (!title.trim()) return;
-        if (submitting) return; // Prevent double-submit (VD-055)
+        if (submitting) return; // Prevent double-submit
         setSubmitting(true);
 
         try {
@@ -265,9 +291,10 @@ export function NewTicketModal({
             onDrop={handleDrop}
         >
             {/* Backdrop */}
-            <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+            {/* AD-317: route the click through attemptClose so a stray backdrop tap doesn't silently throw away a half-written ticket. */}
+            <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={attemptClose} />
 
-            {/* Full-screen drag overlay (VD-072) */}
+            {/* Full-screen drag overlay */}
             {isDraggingOver && (
                 <div className="absolute inset-0 z-[65] bg-vd-accent-gold/10 border-4 border-dashed border-vd-accent-gold/50 flex items-center justify-center pointer-events-none">
                     <div className="bg-vd-bg-secondary/90 rounded-xl px-8 py-6 text-center shadow-xl">
@@ -299,12 +326,12 @@ export function NewTicketModal({
                             </p>
                         )}
                     </div>
-                    <button onClick={onClose} className="text-vd-text-tertiary hover:text-vd-text-primary text-xl">×</button>
+                    <button onClick={attemptClose} className="text-vd-text-tertiary hover:text-vd-text-primary text-xl">×</button>
                 </div>
 
                 {/* Body */}
                 <div className="p-5 space-y-4">
-                    {/* Ticket mode toggle (VD-170) — Normal vs Discussion (safety lock) */}
+                    {/* Ticket mode toggle — Normal vs Discussion (safety lock) */}
                     <div className="flex gap-2">
                         <button
                             onClick={() => setTicketType('normal')}
@@ -398,7 +425,7 @@ export function NewTicketModal({
                                 <option value="low">Low</option>
                             </select>
                         </div>
-                        {/* AI Addressable checkbox removed — batch selection replaced it (VD-155) */}
+                        {/* AI Addressable checkbox removed — batch selection replaced it */}
                         <div>
                             <label className="text-xs text-vd-text-tertiary uppercase tracking-wider">Mission</label>
                             <select
@@ -458,7 +485,7 @@ export function NewTicketModal({
                     <span className="text-[10px] text-vd-text-tertiary">Enter or Ctrl+Enter to create · Escape to close</span>
                     <div className="flex gap-3">
                         <button
-                            onClick={onClose}
+                            onClick={attemptClose}
                             className="px-4 py-2 text-sm text-vd-text-secondary hover:text-vd-text-primary rounded-lg transition-colors"
                         >
                             Cancel

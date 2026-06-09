@@ -11,11 +11,100 @@
 
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { shouldAutoCompleteOnClear } from './clearActiveRunRules.mjs';
+import { probeAgentLiveness, probeAgentBusy, isPidAlive } from './agentLiveness.mjs';
+import { extractFirstTicketRef } from './ticketRef.mjs';
+
+// AD-155: report the backend platform + Windows build to the client so xterm
+// can be configured for the right PTY backend (windowsPty for ConPTY). ConPTY
+// handles line-wrapping/reflow differently than a unix PTY, and xterm needs to
+// know the backend to reflow correctly on resize — the config-level root cause
+// the prior timing-nudge passes never addressed.
+const OS_PLATFORM = process.platform;
+const OS_BUILD = (() => {
+    const m = String(os.release() || '').match(/\.(\d+)$/);
+    return m ? Number(m[1]) : undefined;
+})();
 
 const PORT = parseInt(process.env.TERMINAL_PORT || '3112', 10);
+
+// AD-202/AD-203/AD-204: security perimeter for the terminal server.
+//   - CORS: replace wildcard with an explicit allowlist of the board origins.
+//   - Origin checks: every mutating HTTP endpoint + the WS upgrade reject
+//     anything that didn't come from the board.
+//   - Session token: random 32-byte hex token generated at boot and written to
+//     ~/.adhdev/session-token with mode 0o600. Required as the x-adhdev-token
+//     header on every HTTP endpoint and as ?token=<value> on WS connect.
+//     The Next.js process reads the same file and forwards the token on every
+//     server-to-server fetch.
+//
+// Bind the server to 127.0.0.1 (AD-201) — the gate alone is not enough; the
+// interface itself must not be reachable from the wider network.
+const ALLOWED_ORIGINS = new Set([
+    `http://localhost:3111`,
+    `http://127.0.0.1:3111`,
+]);
+const SESSION_TOKEN_PATH = path.join(os.homedir(), '.adhdev', 'session-token');
+
+function getOrCreateSessionToken() {
+    try {
+        const dir = path.dirname(SESSION_TOKEN_PATH);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        if (fs.existsSync(SESSION_TOKEN_PATH)) {
+            const existing = fs.readFileSync(SESSION_TOKEN_PATH, 'utf-8').trim();
+            if (/^[0-9a-f]{64}$/i.test(existing)) return existing;
+        }
+        const token = crypto.randomBytes(32).toString('hex');
+        // Write then chmod (chmod is a no-op on Windows but keeps Unix safe).
+        fs.writeFileSync(SESSION_TOKEN_PATH, token + '\n', { mode: 0o600 });
+        try { fs.chmodSync(SESSION_TOKEN_PATH, 0o600); } catch {}
+        return token;
+    } catch (err) {
+        console.error('Failed to read/create session token:', err.message);
+        // Fail closed: a random in-memory token. Next.js side won't know it,
+        // so all requests will 401 — which beats silently leaving the server
+        // unauthenticated.
+        return crypto.randomBytes(32).toString('hex');
+    }
+}
+const SESSION_TOKEN = getOrCreateSessionToken();
+
+function isAllowedOrigin(req) {
+    const origin = req.headers && req.headers.origin;
+    if (!origin) {
+        // Same-origin server-to-server fetches (Next.js -> terminal) don't
+        // send Origin. We allow these and rely on the token check + localhost
+        // bind as the gate. Browser cross-origin fetches always send Origin.
+        return true;
+    }
+    return ALLOWED_ORIGINS.has(origin);
+}
+
+function isTokenValid(req, urlObj) {
+    const headerToken = req.headers && req.headers['x-adhdev-token'];
+    if (typeof headerToken === 'string' && headerToken === SESSION_TOKEN) return true;
+    if (urlObj) {
+        const queryToken = urlObj.searchParams.get('token');
+        if (queryToken === SESSION_TOKEN) return true;
+    }
+    return false;
+}
+
+function applyCorsHeaders(req, res) {
+    const origin = req.headers && req.headers.origin;
+    if (origin && ALLOWED_ORIGINS.has(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Vary', 'Origin');
+    }
+    // No header at all when origin is not allowlisted -- the browser will
+    // refuse to read the response.
+    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-adhdev-token');
+}
 
 // Use cmd.exe on Windows (PowerShell breaks many things), bash on unix
 const SHELL = process.env.ADHDEV_SHELL
@@ -73,13 +162,11 @@ let uiContext = {
     groupedBy: 'none',
     showBatchPane: false,
     showActivityFeed: false,
-    showProgressPage: false,
 };
 
 const clients = new Set();
 const REGISTRY_PATH = path.join(os.homedir(), '.adhdev', 'registry.json');
-const BOARD_RELATIVE_PATH = path.join('.adhdev', 'board.json');
-const PROTOCOL_FILENAME = 'ADHDEV.md';
+const BOARD_API_URL = process.env.ADHDEV_BOARD_URL || 'http://localhost:3111';
 
 function normalizeProjectId(id) {
     return id && typeof id === 'string' ? id : DEFAULT_PROJECT_ID;
@@ -100,24 +187,6 @@ function getProjectRoot(projectId) {
     } catch {}
 
     return process.env.ADHDEV_CWD || process.cwd();
-}
-
-function getBoardPath(projectId) {
-    return path.join(getProjectRoot(projectId), BOARD_RELATIVE_PATH);
-}
-
-// AD-146: read the user's preferred display name from the project config.
-// AD-200: fallback is now the neutral 'You' (was 'Sameer' historically).
-function getUserDisplayName(projectId) {
-    try {
-        const configPath = path.join(getProjectRoot(projectId), '.adhdev', 'config.json');
-        if (!fs.existsSync(configPath)) return 'You';
-        const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-        const name = typeof parsed?.userDisplayName === 'string' ? parsed.userDisplayName.trim() : '';
-        return name || 'You';
-    } catch {
-        return 'You';
-    }
 }
 
 // AD-144: per-project terminal history persistence.
@@ -163,137 +232,64 @@ function clearHistoryBuffer(projectId) {
     } catch {}
 }
 
-function readBoard(projectId) {
-    try {
-        const boardPath = getBoardPath(projectId);
-        if (!fs.existsSync(boardPath)) return null;
-        return JSON.parse(fs.readFileSync(boardPath, 'utf-8'));
-    } catch {
-        return null;
-    }
+// AD-301: the Next.js API at BOARD_API_URL takes ~5s to come up while this
+// terminal server starts immediately, so the first batch of POSTs from
+// `recoverStaleInProgressTickets` (and any heartbeat racing the boot)
+// reliably fails with ECONNREFUSED. The original error path dumped the
+// full undici stack with an AggregateError tree for each retry — looked
+// alarming on a clean startup and drowned the actually-useful boot log.
+// We now suppress ECONNREFUSED during a brief startup grace period (the
+// expected boot race) and downgrade the post-grace failure to a one-line
+// warning without the stack tree.
+const POST_STARTUP_GRACE_MS = 15_000;
+const POST_RETRY_LOG_THROTTLE_MS = 30_000;
+const postStartedAt = Date.now();
+let lastPostRetryLogAt = 0;
+
+function isConnectionRefused(err) {
+    if (!err) return false;
+    if (err.code === 'ECONNREFUSED') return true;
+    if (err.cause && isConnectionRefused(err.cause)) return true;
+    if (Array.isArray(err.errors)) return err.errors.some(isConnectionRefused);
+    return false;
 }
 
-// AD-175: write-temp-then-rename so a kill mid-flush leaves the existing
-// board.json intact instead of a half-written file. The rename is atomic on
-// POSIX, and on Windows fs.renameSync replaces the destination atomically as
-// long as both paths are on the same filesystem (we always write the tmp
-// file alongside the target, so they are).
-function writeBoard(data, projectId) {
-    const target = getBoardPath(projectId);
-    const tmp = `${target}.tmp-${process.pid}-${Date.now().toString(36)}`;
-    try {
-        fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
-        fs.renameSync(tmp, target);
-    } catch {
-        try { fs.unlinkSync(tmp); } catch {}
-    }
-}
-
-function extractReferencedTicketIds(command, boardData) {
-    const matches = command.match(/\b[A-Z]{2,6}-\d+\b/gi) || [];
-    const ids = Array.from(new Set(matches.map(match => match.toUpperCase())));
-    if (!boardData?.tickets?.length) return ids;
-    const validIds = new Set(boardData.tickets.map(ticket => String(ticket.id || '').toUpperCase()));
-    return ids.filter(id => validIds.has(id));
-}
-
-function resolveTicketIdsFromUiContext(command, boardData) {
-    const lower = command.toLowerCase();
-    const selectedIds = Array.isArray(uiContext.selectedTicketIds) ? uiContext.selectedTicketIds : [];
-
-    if ((/\b(these|selected)\b/.test(lower) || lower.includes('current selection')) && selectedIds.length > 0) {
-        return selectedIds.map(id => String(id).toUpperCase());
-    }
-
-    if ((/\bthis ticket\b/.test(lower) || /\bcurrent ticket\b/.test(lower)) && uiContext.selectedTicketId) {
-        return [String(uiContext.selectedTicketId).toUpperCase()];
-    }
-
-    if ((/\bthis mission\b/.test(lower) || /\bcurrent mission\b/.test(lower)) && uiContext.missionFilter && boardData?.tickets?.length) {
-        return boardData.tickets
-            .filter(ticket => String(ticket.missionId || '') === String(uiContext.missionFilter))
-            .map(ticket => String(ticket.id).toUpperCase());
-    }
-
-    return [];
-}
-
-function alreadyIncludesAdhdevContract(command) {
-    const lower = command.toLowerCase();
-    return (
-        lower.includes('adhdev.md') ||
-        lower.includes('.adhdev/board.json') ||
-        lower.includes('execution contract') ||
-        lower.includes('workflow rules')
-    );
-}
-
-function buildInjectedExecutionContract(ticketIds, boardData, projectId) {
-    const tickets = (boardData?.tickets || []).filter(ticket => ticketIds.includes(String(ticket.id || '').toUpperCase()));
-    const userName = getUserDisplayName(projectId);
-    const lines = [
-        '[ADHDEV AUTO-CONTEXT]',
-        // AD-146: tell the agent the user's name up front so every comment
-        // addresses them by name instead of as "human" / "user".
-        `User: ${userName}. Address them as "${userName}" in comments, terminal output, and summaries — never as "human", "user", or "reporter".`,
-        `Treat this as declared ADHDev work for ticket${ticketIds.length === 1 ? '' : 's'} ${ticketIds.join(', ')}.`,
-        `Read ${PROTOCOL_FILENAME} and the full referenced ticket entries in ${BOARD_RELATIVE_PATH} before acting.`,
-        'Execution contract:',
-        '- Read the hidden ticket execution contract first.',
-        '- Read the full ticket entry before acting.',
-        '- Read all comments and activity on the ticket before acting.',
-        '- Add or update an AI plan comment before implementation.',
-        '- Keep ticket status and execution state accurately updated while working.',
-        `- Reply in comments to any @mentions from ${userName} on these tickets.`,
-        '- After work, add an AI completion comment with summary, files touched, and verification.',
-        '- If blocked or interrupted, add/update comments and leave the ticket in an accurate non-done state.',
-        '- Add this acknowledgement to the ADHDev Ack Block in the ticket and terminal summary both: ✅ ACK: Embedded Contract Read.',
-    ];
-
-    if (tickets.length > 0) {
-        lines.push('Ticket scope:');
-        for (const ticket of tickets) {
-            const metadata = [
-                ticket.status ? `status: ${ticket.status}` : null,
-                ticket.priority ? `priority: ${ticket.priority}` : null,
-                ticket.wave ? `wave: ${ticket.wave}` : null,
-                ticket.session ? `session: ${ticket.session}` : null,
-                ticket.contractVersion ? `contract: v${ticket.contractVersion}` : null,
-            ].filter(Boolean).join(', ');
-            lines.push(`- ${ticket.id}: ${ticket.title}${metadata ? ` (${metadata})` : ''}`);
-            if (ticket.description) {
-                lines.push(`  Description: ${String(ticket.description).trim()}`);
-            }
-            if (Array.isArray(ticket.comments) && ticket.comments.length > 0) {
-                lines.push('  Comments:');
-                for (const comment of ticket.comments) {
-                    lines.push(`  - [${comment.author} | ${comment.authorType} | ${comment.createdAt}] ${String(comment.content || '').trim()}`);
-                }
-            } else {
-                lines.push('  Comments: none');
-            }
-            if (Array.isArray(ticket.activity) && ticket.activity.length > 0) {
-                lines.push('  Activity:');
-                for (const activity of ticket.activity) {
-                    const fromTo = activity.from || activity.to ? ` (${activity.from || ''}${activity.to ? ` -> ${activity.to}` : ''})` : '';
-                    lines.push(`  - [${activity.by} | ${activity.byType} | ${activity.at}] ${activity.action}${fromTo}`);
-                }
-            } else {
-                lines.push('  Activity: none');
-            }
+function postTerminalRunState(projectId, payload) {
+    fetch(`${BOARD_API_URL}/api/runs/heartbeat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId, ...payload }),
+    }).catch(err => {
+        const refused = isConnectionRefused(err);
+        const withinGrace = Date.now() - postStartedAt < POST_STARTUP_GRACE_MS;
+        if (refused && withinGrace) return;
+        if (refused) {
+            const now = Date.now();
+            if (now - lastPostRetryLogAt < POST_RETRY_LOG_THROTTLE_MS) return;
+            lastPostRetryLogAt = now;
+            console.warn(`[terminal] board API unreachable at ${BOARD_API_URL} (will keep retrying silently).`);
+            return;
         }
-    }
+        console.error('[terminal] terminal run-state API update failed:', err?.message || err);
+    });
+}
 
-    const contextBits = [];
-    if (uiContext.view) contextBits.push(`view: ${uiContext.view}`);
-    if (uiContext.missionFilter) contextBits.push(`mission: ${uiContext.missionFilter}`);
-    if (uiContext.stackBy) contextBits.push(`stacked by: ${uiContext.stackBy}`);
-    if (uiContext.groupedBy && uiContext.groupedBy !== 'none') contextBits.push(`grouped by: ${uiContext.groupedBy}`);
-    if (contextBits.length > 0) {
-        lines.push(`UI context: ${contextBits.join(', ')}`);
-    }
+function heartbeatActiveRuns(projectId, ticketIds, runId) {
+    if (!ticketIds?.length) return;
+    postTerminalRunState(projectId, {
+        action: 'heartbeat',
+        ticketIds,
+        runId: runId || undefined,
+    });
+}
 
-    return `\n\n${lines.join('\n')}`;
+function markActiveRunsTerminal(projectId, ticketIds, reason) {
+    if (!ticketIds?.length) return;
+    postTerminalRunState(projectId, {
+        action: 'clear-active-runs',
+        ticketIds,
+        reason,
+    });
 }
 
 // AD-149 follow-up: when the user presses Esc or Ctrl+C in the terminal the
@@ -305,36 +301,10 @@ function buildInjectedExecutionContract(ticketIds, boardData, projectId) {
 // on the next fetch — the indicator clears within a poll.
 function markTicketsInterrupted(projectId, ticketIds) {
     if (!ticketIds?.length) return;
-    const boardData = readBoard(projectId);
-    if (!boardData?.tickets?.length) return;
-
-    const ids = new Set(ticketIds.map(id => String(id).toUpperCase()));
-    const now = new Date().toISOString();
-    let changed = false;
-
-    for (const ticket of boardData.tickets) {
-        if (!ids.has(String(ticket.id || '').toUpperCase())) continue;
-        if (ticket.execution?.status !== 'in_progress') continue;
-
-        ticket.execution = {
-            ...ticket.execution,
-            status: 'blocked',
-            updatedAt: now,
-            blocker: ticket.execution.blocker || 'Interrupted by user (Esc / Ctrl+C).',
-        };
-
-        if (!Array.isArray(ticket.activity)) ticket.activity = [];
-        ticket.activity.push({
-            action: 'execution_interrupted',
-            by: ticket.execution.actor || 'Coding Agent',
-            byType: 'ai',
-            at: now,
-        });
-        ticket.updatedAt = now;
-        changed = true;
-    }
-
-    if (changed) writeBoard(boardData, projectId);
+    postTerminalRunState(projectId, {
+        action: 'interrupt-tickets',
+        ticketIds,
+    });
 }
 
 // AD-149 permanent fix — the heartbeat architecture.
@@ -357,12 +327,18 @@ function markTicketsInterrupted(projectId, ticketIds) {
 //    abort — has a richer semantic).
 const HEARTBEAT_INTERVAL_MS = 10 * 1000;
 
-// AD-156 reopen #2: if no agent-detection marker has fired in this many ms,
-// the agent has exited and we should stop reporting it as active. Claude Code
-// repaints `bypass permissions on` while idle and `esc to interrupt` while
-// running, so a live agent refreshes `lastDetectedAt` constantly. 60s of
-// silence on those markers means the agent is gone — even if the prompt-regex
-// in detectAgentOutput missed because the exit chunk wasn't terminated by `>`.
+// AD-221: hard ceiling on a single in_progress run. If the agent's natural
+// completion signal (PATCH to done/blocked, shell exit, both timers
+// agreeing) never lands, the heartbeat-based mascot would haunt forever.
+// 60 min is well above any realistic single-ticket run; the watchdog
+// only fires for genuinely stuck/forgotten executions.
+const MAX_RUN_DURATION_MS = 60 * 60 * 1000;
+
+// AD-318: `lastDetectedAt` is now refreshed by the per-session liveness probe
+// (refreshAgentLiveness) every poll while the agent process is alive — not by
+// terminal-output markers. This staleness check is a belt-and-suspenders backstop
+// for the run-lease timer in scheduleActiveRunClear; the probe is the source of
+// truth for whether an agent is actually running.
 const AGENT_DETECTION_STALE_MS = 60 * 1000;
 
 function isAgentDetectionStale(session) {
@@ -371,90 +347,14 @@ function isAgentDetectionStale(session) {
     return last > 0 && (Date.now() - last) > AGENT_DETECTION_STALE_MS;
 }
 
-function expireStaleAgent(session, reason = 'detection_stale') {
-    if (!isAgentDetectionStale(session)) return false;
-    clearAgentActive(session);
-    if (session.activeRunTicketIds.length > 0) {
-        clearActiveRunTickets(session, reason);
-    }
-    return true;
-}
-
-function bumpExecutionForActiveTickets(projectId, ticketIds) {
-    if (!ticketIds?.length) return;
-    const boardData = readBoard(projectId);
-    if (!boardData?.tickets?.length) return;
-
-    const ids = new Set(ticketIds.map(id => String(id).toUpperCase()));
-    const now = new Date().toISOString();
-    let changed = false;
-
-    for (const ticket of boardData.tickets) {
-        if (!ids.has(String(ticket.id || '').toUpperCase())) continue;
-        const prior = ticket.execution || {};
-        // If the agent has explicitly completed or blocked this run, the
-        // heartbeat does NOT resurrect the indicator. It only keeps alive
-        // what was already alive.
-        if (prior.status === 'done' || prior.status === 'blocked') continue;
-
-        ticket.execution = {
-            ...prior,
-            runId: prior.runId || `exec-${Date.now().toString(36)}`,
-            actorType: prior.actorType || 'ai',
-            status: 'in_progress',
-            startedAt: prior.startedAt || now,
-            updatedAt: now,
-            completedAt: null,
-            plan: prior.plan || '',
-            summary: prior.summary || '',
-            filesTouched: Array.isArray(prior.filesTouched) ? prior.filesTouched : [],
-            verification: Array.isArray(prior.verification) ? prior.verification : [],
-            blocker: null,
-            actor: prior.actor || 'Coding Agent',
-        };
-        ticket.updatedAt = now;
-        changed = true;
-    }
-
-    if (changed) writeBoard(boardData, projectId);
-}
 
 function autoCompleteTickets(projectId, ticketIds, reason = 'auto_cleared') {
     if (!ticketIds?.length) return;
-    const boardData = readBoard(projectId);
-    if (!boardData?.tickets?.length) return;
-
-    const ids = new Set(ticketIds.map(id => String(id).toUpperCase()));
-    const now = new Date().toISOString();
-    let changed = false;
-
-    for (const ticket of boardData.tickets) {
-        if (!ids.has(String(ticket.id || '').toUpperCase())) continue;
-        const prior = ticket.execution || {};
-        // Respect explicit agent completion — don't overwrite a proper done/
-        // blocked record that was PATCHed via the feedback API.
-        if (prior.status !== 'in_progress') continue;
-
-        ticket.execution = {
-            ...prior,
-            status: 'done',
-            result: reason,
-            completedAt: now,
-            updatedAt: now,
-        };
-        if (!Array.isArray(ticket.activity)) ticket.activity = [];
-        ticket.activity.push({
-            action: 'execution_completed',
-            by: prior.actor || 'Coding Agent',
-            byType: 'ai',
-            at: now,
-            reason,
-        });
-        ticket.updatedAt = now;
-        changed = true;
-    }
-
-    if (changed) writeBoard(boardData, projectId);
+    postTerminalRunState(projectId, {
+        action: 'auto-complete-tickets',
+        ticketIds,
+        reason,
+    });
 }
 
 function startHeartbeat(session) {
@@ -466,14 +366,46 @@ function startHeartbeat(session) {
             stopHeartbeat(session);
             return;
         }
-        try { bumpExecutionForActiveTickets(session.projectId, ids); } catch {}
+        // AD-221: max-runtime watchdog. If any active execution has been
+        // in_progress longer than MAX_RUN_DURATION_MS, the agent has
+        // either crashed silently or was forgotten — the timer-based
+        // signals never fired. Clear with `max_runtime_exceeded` so the
+        // mascot drops instead of haunting the board indefinitely.
+        try {
+            if (anyActiveRunExceededMaxDuration(session.projectId, ids, session.activeRunId)) {
+                clearActiveRunTickets(session, 'max_runtime_exceeded');
+                return;
+            }
+        } catch {}
+        if (session.agentState?.active) {
+            confirmActiveRunTickets(session);
+        }
     }, HEARTBEAT_INTERVAL_MS);
+}
+
+function anyActiveRunExceededMaxDuration(projectId, ticketIds, runId = null) {
+    if (!ticketIds?.length) return false;
+    const session = getSession(projectId);
+    if (!session || (runId && session.activeRunId !== runId)) return false;
+    const startedMs = new Date(session.activeRunStartedAt || session.requestState?.startedAt || '').getTime();
+    return Number.isFinite(startedMs) && Date.now() - startedMs > MAX_RUN_DURATION_MS;
 }
 
 function stopHeartbeat(session) {
     if (!session?.heartbeatInterval) return;
     clearInterval(session.heartbeatInterval);
     session.heartbeatInterval = null;
+}
+
+function confirmActiveRunTickets(session) {
+    if (!session?.activeRunTicketIds?.length) return;
+    session.requestState.status = 'running';
+    session.requestState.updatedAt = new Date().toISOString();
+    session.requestState.lastEvent = 'agent_confirmed';
+    // AD-307/AD-221: keep heartbeats in memory. The browser polls /status for
+    // captureTicketIds and renders running state directly; persisting every
+    // tick to board.json caused multi-minute feedback-lock queues while a run
+    // animation was active.
 }
 
 // Server-startup recovery: any ticket left with execution.status='in_progress'
@@ -485,137 +417,112 @@ function recoverStaleInProgressTickets() {
         const registry = JSON.parse(fs.readFileSync(REGISTRY_PATH, 'utf-8'));
         const projects = Array.isArray(registry.projects) ? registry.projects : [];
         for (const project of projects) {
-            try {
-                const boardPath = path.join(project.path, BOARD_RELATIVE_PATH);
-                if (!fs.existsSync(boardPath)) continue;
-                const boardData = JSON.parse(fs.readFileSync(boardPath, 'utf-8'));
-                if (!boardData?.tickets?.length) continue;
-                const now = new Date().toISOString();
-                let changed = false;
-                for (const ticket of boardData.tickets) {
-                    if (ticket.execution?.status === 'in_progress') {
-                        ticket.execution = {
-                            ...ticket.execution,
-                            status: 'blocked',
-                            updatedAt: now,
-                            blocker: ticket.execution.blocker || 'Terminal server restarted while run was in progress.',
-                        };
-                        ticket.updatedAt = now;
-                        changed = true;
-                    }
-                }
-                if (changed) {
-                    fs.writeFileSync(boardPath, JSON.stringify(boardData, null, 2) + '\n', 'utf-8');
-                    console.log(`Recovered stale in_progress executions for project ${project.id || project.path}`);
-                }
-            } catch {}
+            if (!project?.id) continue;
+            postTerminalRunState(project.id, { action: 'recover-stale' });
         }
     } catch {}
-}
-
-function markDeclaredRun(projectId, ticketIds, actorName) {
-    const boardData = readBoard(projectId);
-    if (!boardData?.tickets?.length) return;
-
-    const now = new Date().toISOString();
-    const nowMs = Date.now();
-    // AD-159: window for de-duping declarations. A user pressing Enter twice
-    // (often a "did that work?" retry) used to land two Claiming-ticket
-    // comments + two pairs of activity entries on the same ticket within
-    // seconds. 30s is long enough to absorb retries without suppressing a
-    // legitimate re-declaration after a real conversation.
-    const DECLARATION_DEDUP_MS = 30 * 1000;
-    const actor = actorName || 'Coding Agent';
-    let changed = false;
-
-    for (const ticket of boardData.tickets) {
-        if (!ticketIds.includes(String(ticket.id || '').toUpperCase())) continue;
-
-        // AD-159: skip if this actor already declared a terminal run on this
-        // ticket within the dedup window. Keeps the comment trail clean and
-        // avoids the misleading "started working ... started working ..."
-        // double-entry seen on AD-158.
-        const recentDeclaration = (ticket.activity || []).some(entry => {
-            if (entry.action !== 'terminal_run_declared') return false;
-            if (entry.by !== actor) return false;
-            const ts = new Date(entry.at || 0).getTime();
-            return Number.isFinite(ts) && (nowMs - ts) < DECLARATION_DEDUP_MS;
-        });
-        if (recentDeclaration) continue;
-
-        if (!Array.isArray(ticket.comments)) ticket.comments = [];
-        ticket.comments.push({
-            id: `c-${Date.now().toString(36)}-${ticket.id}`,
-            author: actorName || 'Coding Agent',
-            authorType: 'ai',
-            content: `**Claiming ticket.** Terminal-referenced ADHDev work was declared for ${ticket.id}. I will inspect the ticket, follow the ADHDev contract, and post a completion update here.`,
-            images: [],
-            createdAt: now,
-        });
-
-        ticket.execution = {
-            runId: ticket.execution?.runId || `run-${Date.now().toString(36)}-${ticket.id}`,
-            actor: actorName || ticket.execution?.actor || 'Coding Agent',
-            actorType: 'ai',
-            status: 'in_progress',
-            startedAt: ticket.execution?.startedAt || now,
-            updatedAt: now,
-            completedAt: null,
-            plan: ticket.execution?.plan || '',
-            summary: ticket.execution?.summary || '',
-            filesTouched: Array.isArray(ticket.execution?.filesTouched) ? ticket.execution.filesTouched : [],
-            verification: Array.isArray(ticket.execution?.verification) ? ticket.execution.verification : [],
-            result: ticket.execution?.result,
-            blocker: null,
-            batchId: ticket.execution?.batchId,
-        };
-
-        if (!Array.isArray(ticket.activity)) ticket.activity = [];
-        ticket.activity.push({
-            action: 'terminal_run_declared',
-            by: actorName || 'Coding Agent',
-            byType: 'ai',
-            at: now,
-        });
-        ticket.activity.push({
-            action: 'execution_started',
-            by: actorName || 'Coding Agent',
-            byType: 'ai',
-            at: now,
-        });
-        ticket.updatedAt = now;
-        changed = true;
-    }
-
-    if (changed) writeBoard(boardData, projectId);
 }
 
 function scheduleActiveRunClear(session) {
     if (!session) return;
     if (session.clearActiveRunTimeout) clearTimeout(session.clearActiveRunTimeout);
     if (session.activeRunTicketIds.length > 0) {
-        session.clearActiveRunTimeout = setTimeout(() => {
-            clearActiveRunTickets(session, 'timed_out');
-        }, ACTIVE_RUN_TTL_MS);
+        session.clearActiveRunTimeout = setTimeout(() => { void onActiveRunQuiet(session); }, ACTIVE_RUN_TTL_MS);
     }
 }
 
-function setActiveRunTickets(session, ticketIds = []) {
+// AD-341: the run-clear decision when the shell has gone quiet for
+// ACTIVE_RUN_TTL_MS. This is the TURN-END fallback (layer 2 of Sameer's
+// defense-in-depth close; the explicit agent-release callback is layer 1).
+//
+// The old logic kept the run alive for as long as the agent PROCESS was alive
+// (AD-269 + AD-318). But an interactive agent like Claude Code stays alive the
+// whole session — it finishes a ticket and sits at its prompt, still alive — so
+// the run NEVER closed on its own. "Process alive" is the wrong stop signal.
+//
+// The right signal is TURN-END: the shell is quiet AND the agent has no tool /
+// command running under it (no live descendant pids). Then it's idle at its
+// prompt and the run can close even though the process lives on. A long silent
+// build/test keeps a descendant alive → we re-arm instead of false-closing
+// (the AD-221 failure mode). probeAgentBusy fails safe to "busy".
+async function onActiveRunQuiet(session) {
+    if (!session?.shell || session.activeRunTicketIds.length === 0) return;
+
+    // Agent's process has been gone >60s → it really exited. Auto-complete.
+    if (isAgentDetectionStale(session)) {
+        clearActiveRunTickets(session, 'detection_stale');
+        return;
+    }
+
+    const agentEverDetected = !!session.agentState?.lastDetectedAt;
+    if (!agentEverDetected || !session.agentState?.active) {
+        // Never observed an agent on this session (legacy / unrecognized
+        // runner): keep the old self-healing behavior for dead runs.
+        clearActiveRunTickets(session, 'timed_out');
+        return;
+    }
+
+    // Agent process is alive. Mid-turn (running a tool) or idle at its prompt?
+    let busy = true;
+    try {
+        busy = await probeAgentBusy(session.agentState.pid);
+    } catch {
+        busy = true; // fail safe: never false-close on a probe glitch
+    }
+    // The session may have been torn down while we awaited the probe.
+    if (!sessions.get(session.projectId) || !session.shell || session.activeRunTicketIds.length === 0) return;
+
+    if (busy) {
+        scheduleActiveRunClear(session); // still working — re-arm the turn-end check
+    } else {
+        // Quiet + no tool running = the agent finished its turn (idle at prompt).
+        // Close even though the process is alive. 'turn_end' auto-completes the
+        // execution (drops the mascot) but, unlike a crash, posts no warning.
+        clearActiveRunTickets(session, 'turn_end');
+    }
+}
+
+function setActiveRunTickets(session, ticketIds = [], runId = null) {
     if (!session) return;
     session.activeRunTicketIds = Array.from(new Set(ticketIds.filter(Boolean)));
-    session.requestState.status = session.activeRunTicketIds.length > 0 ? 'running' : 'idle';
-    session.requestState.startedAt = session.activeRunTicketIds.length > 0 ? new Date().toISOString() : null;
+    session.activeRunId = runId || null;
+    session.activeRunStartedAt = session.activeRunTicketIds.length > 0 ? new Date().toISOString() : null;
+    session.requestState.status = session.activeRunTicketIds.length > 0 ? 'dispatching' : 'idle';
+    session.requestState.startedAt = session.activeRunStartedAt;
     session.requestState.updatedAt = new Date().toISOString();
     session.requestState.lastEvent = session.activeRunTicketIds.length > 0 ? 'request_started' : 'request_cleared';
     scheduleActiveRunClear(session);
-    // AD-149 permanent fix: heartbeat kicks in the moment a run starts and
-    // keeps execution.updatedAt fresh every 10 s until the set clears.
+    // Dispatching is only "prompt sent". Promote to confirmed running once
+    // an agent is detected on this terminal session.
     if (session.activeRunTicketIds.length > 0) {
-        bumpExecutionForActiveTickets(session.projectId, session.activeRunTicketIds);
+        if (session.agentState?.active) confirmActiveRunTickets(session);
         startHeartbeat(session);
     } else {
         stopHeartbeat(session);
     }
+}
+
+// AD-341 (direct-terminal start): a ticket reference in the live terminal IS the
+// user starting work on it. Whether you type "AD-344" or describe it, the agent
+// resolves it and echoes the id in its output — so scanning the output stream
+// catches both your explicit reference AND a description the agent maps to a
+// ticket. This is the ONLY signal available at the START of direct work: the
+// agent does the work before it ever writes to the board (and often skips
+// agent-claim on trivial tickets), so without this the card never animates.
+//
+// Scoped to stay compatible with AD-318 (which removed agent-NAME text sniffing):
+//   - Gated on an AD-318 process-CONFIRMED agent, so a bare "AD-12" typed into a
+//     plain shell with no agent can't light anything.
+//   - Only binds when NO run is already active — never hijacks a Run-button
+//     dispatch or an in-flight batch.
+//   - Self-healing: the board's done-guard (AD-341) won't animate a closed
+//     ticket, and turn-end / release / done-PATCH clears a stray bind.
+function maybeBindReferencedTicket(session, data) {
+    if (!session?.agentState?.active) return;          // only with a real live agent
+    if (session.activeRunTicketIds.length > 0) return; // a run is already lit
+    const ticketId = extractFirstTicketRef(data);
+    if (!ticketId) return;
+    setActiveRunTickets(session, [ticketId], null);
 }
 
 // AD-178: which clear-reasons are reliable enough to auto-complete the
@@ -625,19 +532,11 @@ function setActiveRunTickets(session, ticketIds = []) {
 //     exited (see AD-156 reopen #2).
 //   - timed_out: ACTIVE_RUN_TTL_MS (2 min) of no shell output at all — strong
 //     signal the run is dead.
-// Heuristic triggers (`shell_prompt`, `agent_idle`) used to auto-complete too,
-// but in practice they fired mid-run: a chunk happened to end with
-// a shell-prompt-shaped string, or the busy markers paused briefly between
-// tickets — and the FE running pill dropped on tickets the agent hadn't
-// finished posting comments/PATCH for. Now those reasons just clear the active
-// set + stop the heartbeat; execution.status stays `in_progress` until the
-// agent's own PATCH lands. The reliable reasons keep auto-completing as a
-// crashed-agent safety net.
-const AUTO_COMPLETE_ON_CLEAR_REASONS = new Set([
-    'shell_exited',
-    'detection_stale',
-    'timed_out',
-]);
+//   - max_runtime_exceeded: AD-221 60-min watchdog inside the heartbeat
+//     for runs that never naturally complete (silent crash, forgotten run).
+// AD-216: AUTO_COMPLETE_ON_CLEAR_REASONS + shouldAutoCompleteOnClear live in
+// `./clearActiveRunRules.mjs` so the rules can be unit-tested without booting
+// the WS server. Single source of truth for what counts as "agent is gone".
 
 function clearActiveRunTickets(session, reason = 'cleared') {
     if (!session) return;
@@ -651,6 +550,7 @@ function clearActiveRunTickets(session, reason = 'cleared') {
     }
     session.requestState.status = reason === 'interrupted' ? 'interrupted' : 'idle';
     session.requestState.startedAt = null;
+    session.activeRunStartedAt = null;
     session.requestState.updatedAt = new Date().toISOString();
     session.requestState.lastEvent = reason;
     // AD-149 permanent fix: close out the heartbeat. Skip auto-complete for
@@ -659,18 +559,22 @@ function clearActiveRunTickets(session, reason = 'cleared') {
     // AD-178 — they fire mid-run). 'cleared' (the default) is also skipped
     // because callers that pass no reason haven't asserted the agent is gone.
     stopHeartbeat(session);
-    if (
-        reason !== 'interrupted'
-        && priorIds.length > 0
-        && AUTO_COMPLETE_ON_CLEAR_REASONS.has(reason)
-    ) {
+    if (priorIds.length > 0 && reason !== 'cleared') {
+        try { markActiveRunsTerminal(session.projectId, priorIds, reason); } catch {}
+    }
+    session.activeRunId = null;
+    if (priorIds.length > 0 && shouldAutoCompleteOnClear(reason)) {
         try { autoCompleteTickets(session.projectId, priorIds, reason); } catch {}
     }
 }
 
+
 function setAgentActive(session, name) {
     if (!session || !name) return;
     const prior = session.agentState.name;
+    if (prior && prior !== name) {
+        session.outputTail = '';
+    }
     session.agentState.active = true;
     session.agentState.name = name;
     session.agentState.lastDetectedAt = Date.now();
@@ -680,10 +584,12 @@ function setAgentActive(session, name) {
         session.requestState.status = 'idle';
         session.requestState.lastEvent = 'agent_ready';
     }
+    confirmActiveRunTickets(session);
 }
 
 function clearAgentActive(session) {
     if (!session) return;
+    session.outputTail = '';
     session.agentState.active = false;
     session.agentState.name = null;
     session.requestState.status = 'idle';
@@ -692,175 +598,57 @@ function clearAgentActive(session) {
     session.requestState.lastEvent = 'agent_exited';
 }
 
-function stripAnsi(text) {
-    return text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\x1b\][^]*(?:|\x1b\\)/g, '');
-}
 
-function detectAgentCommand(session, command) {
-    if (!session) return;
-    const normalized = command.trim().toLowerCase();
-    if (!normalized) return;
+// AD-318: agent liveness is derived from a real OS process probe
+// (server/agentLiveness.mjs), polled per session. Text/scrollback detection is
+// gone — an agent is "running" only while its process is alive under this shell.
+const AGENT_LIVENESS_POLL_MS = 3000;
+// Grace window after a launch hint before we stop waiting for the agent's
+// process to appear (npm shim -> node startup can take a couple seconds).
+const AGENT_LAUNCH_GRACE_MS = 12000;
 
-    if (normalized === 'exit' || normalized === 'quit') {
-        clearAgentActive(session);
+async function refreshAgentLiveness(session) {
+    if (!session?.shell) return;
+    // Fast path: a known agent PID still alive => still running. process.kill(pid,0)
+    // only tests existence, so we skip the heavier full process enumeration.
+    if (session.agentState.active && session.agentState.pid && isPidAlive(session.agentState.pid)) {
+        session.agentState.lastDetectedAt = Date.now();
         return;
     }
-
-    if (normalized === 'claude' || normalized.startsWith('claude ') || normalized.includes('claude-code')) {
-        setAgentActive(session, 'Claude Code');
-        return;
+    let result;
+    try {
+        result = await probeAgentLiveness(session.shell.pid, session.agentMarker?.name || null);
+    } catch {
+        result = { active: false, name: null, pid: null };
     }
+    // The session may have been torn down while we awaited the OS probe.
+    if (!sessions.get(session.projectId) || !session.shell) return;
 
-    if (normalized === 'codex' || normalized.startsWith('codex ')) {
-        setAgentActive(session, 'Codex');
-        return;
-    }
-
-    if (normalized === 'aider' || normalized.startsWith('aider ')) {
-        setAgentActive(session, 'Aider');
-        return;
-    }
-
-    // AD-169: Gemini CLI launches via `gemini` (or `gemini-cli` on some
-    // installs). Reported via AD-169: the terminal label still said "Shell" after
-    // launching it — without input-side detection we relied on output-only,
-    // which doesn't always fire fast enough.
-    if (normalized === 'gemini' || normalized.startsWith('gemini ') || normalized.includes('gemini-cli')) {
-        setAgentActive(session, 'Gemini CLI');
-        return;
-    }
-
-    // Cursor's terminal agent (`cursor-agent`) and Continue (`continue` /
-    // `cn`) are the other two AI CLIs we cover by request.
-    if (normalized === 'cursor-agent' || normalized.startsWith('cursor-agent ')) {
-        setAgentActive(session, 'Cursor Agent');
-        return;
-    }
-    if (normalized === 'continue' || normalized.startsWith('continue ')) {
-        setAgentActive(session, 'Continue');
-    }
-}
-
-function detectAgentOutput(session, data) {
-    if (!session) return;
-    const cleanChunk = stripAnsi(data);
-    const chunk = cleanChunk.toLowerCase();
-    session.outputTail = (session.outputTail + cleanChunk).slice(-4000);
-    const normalized = session.outputTail.toLowerCase();
-    if (!chunk.trim() && !normalized.trim()) return;
-
-    // AD-144 reopen #2: detection markers must be *distinctive* — bare words
-    // like "codex" or "aider" triggered false agent switches whenever Claude's
-    // output mentioned them (e.g. a conversation about agent mascots
-    // flipped the session to Codex because the reply referenced Codex as a
-    // robot). Keep only phrases that a foreign agent would not print casually.
-    if (
-        chunk.includes('esc to interrupt') ||
-        chunk.includes('summarize code changes after completion') ||
-        chunk.includes('press ctrl-c again to quit') ||
-        chunk.includes('claude code v') ||
-        // AD-156 / AD-139 reopen: Claude Code's input prompt repaints
-        // `>> bypass permissions on (shift+tab to cycle)` every frame while
-        // it's idle/listening. Without this marker, detection missed in
-        // user sessions — so Run reported "Sent to Coding Agent" while
-        // the prompt actually landed in bare cmd.exe.
-        chunk.includes('bypass permissions on') ||
-        chunk.includes('shift+tab to cycle')
-    ) {
-        setAgentActive(session, 'Claude Code');
-        return;
-    }
-
-    if (
-        chunk.includes('approving:') ||
-        chunk.includes('codex cli') ||
-        chunk.includes('codex v') ||
-        chunk.includes('full auto mode') ||
-        chunk.includes('ctrl+e to explain')
-    ) {
-        setAgentActive(session, 'Codex');
-        return;
-    }
-
-    if (
-        chunk.includes('aider v') ||
-        (chunk.includes('model:') && chunk.includes('aider'))
-    ) {
-        setAgentActive(session, 'Aider');
-        return;
-    }
-
-    // AD-169: Gemini CLI distinctive output markers. Gemini's TUI shows a
-    // "GEMINI.md" hint on launch and a "/directory" workspace footer; the
-    // privacy/auth screens print "google ai" lines. Keep markers narrow so
-    // foreign agents don't false-trigger (see AD-144 reopen #2).
-    if (
-        chunk.includes('gemini cli') ||
-        chunk.includes('gemini.md file') ||
-        chunk.includes('workspace (/directory)') ||
-        (chunk.includes('google ai') && chunk.includes('gemini'))
-    ) {
-        setAgentActive(session, 'Gemini CLI');
-        return;
-    }
-
-    if (
-        chunk.includes('cursor agent') ||
-        chunk.includes('cursor-agent v')
-    ) {
-        setAgentActive(session, 'Cursor Agent');
-        return;
-    }
-
-    // AD-156 reopen #2: if the agent's detection markers have been silent for
-    // > AGENT_DETECTION_STALE_MS while output is still flowing, the agent has
-    // exited and the shell-prompt regex below missed it (e.g., the exit chunk
-    // didn't end with `>`). Clear here so Run can't lie afterwards.
-    if (expireStaleAgent(session, 'detection_stale')) return;
-
-    // Shell prompt detection — only check the LATEST chunk (not accumulated tail)
-    // to avoid false positives from agent output that contains > or $ characters.
-    // Also skip if agent was detected recently (5s cooldown).
-    const PROMPT_COOLDOWN_MS = 5000;
-    const timeSinceAgentDetected = Date.now() - (session.agentState.lastDetectedAt || 0);
-    if (session.agentState.active && timeSinceAgentDetected > PROMPT_COOLDOWN_MS) {
-        const recentOutput = cleanChunk;
-        // Windows cmd.exe: "C:\path\to\dir>"
-        const isWindowsPrompt = /(?:^|\n)\s*[A-Z]:\\[^\r\n>]*>\s*$/m.test(recentOutput);
-        // PowerShell: "PS C:\path>"
-        const isPSPrompt = /(?:^|\n)\s*PS\s+[A-Z]:\\[^\r\n>]*>\s*$/m.test(recentOutput);
-        // Unix: "user@host:~/path$ " or "$ " at line start
-        const isUnixPrompt = /(?:^|\n)\s*(?:\w+@[\w.-]+[:#~][^\r\n]*|)\$\s*$/m.test(recentOutput);
-        if (isWindowsPrompt || isPSPrompt || isUnixPrompt) {
-            clearAgentActive(session);
-            clearActiveRunTickets(session, 'shell_prompt');
+    if (result.active && result.name) {
+        setAgentActive(session, result.name);
+        session.agentState.pid = result.pid;
+    } else {
+        if (session.agentState.active) clearAgentActive(session);
+        session.agentState.pid = null;
+        // Stop expecting an agent whose process never came up after the launch.
+        if (session.agentMarker && Date.now() - session.agentMarker.launchedAt > AGENT_LAUNCH_GRACE_MS) {
+            session.agentMarker = null;
         }
     }
-
-    // AD-053 reopen #2: `esc to interrupt` and the ctrl+c variants are *busy*
-    // indicators that Claude Code prints on every loading frame — they used to
-    // live in this idle-detection list, which meant the accumulated `normalized`
-    // tail held the phrase for the lifetime of the session and cleared
-    // activeRunTicketIds on every subsequent chunk. The spinner/shimmer/Running
-    // badge vanished within seconds of Run. Only genuinely idle phrases stay.
-    if (
-        session.activeRunTicketIds.length > 0 &&
-        (
-            chunk.includes('waiting for your input') ||
-            chunk.includes('awaiting your input')
-        )
-    ) {
-        clearActiveRunTickets(session, 'agent_idle');
-    }
 }
+
+
+
+
+
 
 function inspectTerminalInput(session, data) {
     if (!session) return data;
-    if (data === '') {
+    // AD-149: an empty input frame is the client's explicit interrupt (Ctrl+C /
+    // Esc) signal. Clear any active run / agent state — a deliberate user action,
+    // not a text heuristic.
+    if (data === '') {
         if (session.activeRunTicketIds.length > 0) {
-            // AD-149 follow-up: mark affected tickets as blocked BEFORE
-            // clearing the server active set so the client indicator clears
-            // within one poll instead of riding the fallback freshness window.
             markTicketsInterrupted(session.projectId, session.activeRunTicketIds);
             clearActiveRunTickets(session, 'interrupted');
         } else {
@@ -868,67 +656,12 @@ function inspectTerminalInput(session, data) {
         }
         return data;
     }
-
-    if (data === '') {
-        markTicketsInterrupted(session.projectId, session.activeRunTicketIds);
-        clearActiveRunTickets(session, 'interrupted');
-        session.agentInputBuffer = '';
-        return data;
-    }
-
-    const wasAgentActive = session.agentState.active;
-    session.agentInputBuffer = (session.agentInputBuffer || '') + data;
-    const buf = session.agentInputBuffer;
-    const newlineIndex = buf.search(/[\r\n]/);
-    if (newlineIndex === -1) return data;
-
-    const command = buf.slice(0, newlineIndex);
-    session.agentInputBuffer = buf.slice(newlineIndex + 1);
-    detectAgentCommand(session, command);
-
-    if (!wasAgentActive || !command.trim()) {
-        return data;
-    }
-
-    const boardData = readBoard(session.projectId);
-    const explicitTicketIds = extractReferencedTicketIds(command, boardData);
-    const contextualTicketIds = explicitTicketIds.length === 0 ? resolveTicketIdsFromUiContext(command, boardData) : [];
-    const ticketIds = explicitTicketIds.length > 0 ? explicitTicketIds : contextualTicketIds;
-    if (ticketIds.length === 0) {
-        return data;
-    }
-
-    // AD-159: bare-reference guard. If the user typed nothing but ticket IDs
-    // (and trivial punctuation), they're almost certainly looking it up,
-    // referencing it, or testing — not declaring a run. Without this guard
-    // typing `AD-158` + Enter into the agent prompt dumps the full ADHDev
-    // contract block into Claude's input AND lights up the Running indicator
-    // on a card nobody is actually working. Imperative phrasing like
-    // `Fix AD-158` still trips the trigger because residualSignal is
-    // non-empty after stripping IDs and punctuation.
-    if (explicitTicketIds.length > 0) {
-        const residualSignal = command
-            .replace(/\b[A-Z]{2,6}-\d+\b/gi, '')
-            .replace(/[^a-zA-Z0-9]/g, '');
-        if (residualSignal.length === 0) {
-            return data;
-        }
-    }
-
-    setActiveRunTickets(session, ticketIds);
-    markDeclaredRun(session.projectId, ticketIds, session.agentState.name || 'Coding Agent');
-
-    if (alreadyIncludesAdhdevContract(command)) {
-        return data;
-    }
-
-    const injection = buildInjectedExecutionContract(ticketIds, boardData, session.projectId);
-    const chunkNewlineIndex = data.search(/[\r\n]/);
-    if (chunkNewlineIndex === -1) {
-        return `${data}${injection}`;
-    }
-
-    return `${data.slice(0, chunkNewlineIndex)}${injection}${data.slice(chunkNewlineIndex)}`;
+    // AD-318: typed and pasted terminal text is opaque user data. Agent identity
+    // and ticket context come from the launch marker + process liveness + the
+    // explicit Run paths — never from sniffing what was typed. (Typed text is
+    // what made "hi claude" in a bare shell falsely report an agent, and what
+    // auto-started bogus runs off mentioned ticket numbers — AD-269.)
+    return data;
 }
 
 function getSession(projectId) {
@@ -949,11 +682,16 @@ function createSessionState(projectId) {
         shellBuffer: seededBuffer,
         shellBufferLength: seededLength,
         agentInputBuffer: '',
-        outputTail: '',
+        outputTail: seededBuffer.join('').slice(-4000),
         activeRunTicketIds: [],
+        activeRunId: null,
+        activeRunStartedAt: null,
         clearActiveRunTimeout: null,
         historyWriteTimeout: null,
-        agentState: { active: false, name: null, lastDetectedAt: 0 },
+        agentState: { active: false, name: null, pid: null, lastDetectedAt: 0 },
+        // AD-318: launch hint (identity) + per-session liveness probe handle.
+        agentMarker: null,
+        livenessTimer: null,
         requestState: { status: 'idle', startedAt: null, updatedAt: null, lastEvent: null },
     };
 }
@@ -1019,10 +757,14 @@ function getOrCreateSession(projectId) {
         // survives terminal-server / `npx adhdev` restarts.
         scheduleHistoryWrite(session);
 
-        // AD-141 take 3: agent detection + run-clear scheduling are both
-        // scoped to this session. Two projects each have their own agent
-        // state, their own active run tickets, and their own clients.
-        detectAgentOutput(session, data);
+        // AD-341: light direct-terminal work when a ticket id is referenced in
+        // the stream while a process-confirmed agent is live (see the function
+        // for why this is AD-318-compatible).
+        maybeBindReferencedTicket(session, data);
+
+        // AD-318: agent detection no longer reads terminal output — liveness is
+        // the per-session refreshAgentLiveness OS probe. We still warm the
+        // run-clear timer on output so an active run's lease doesn't expire mid-work.
         if (session.activeRunTicketIds.length > 0) {
             scheduleActiveRunClear(session);
         }
@@ -1041,6 +783,8 @@ function getOrCreateSession(projectId) {
         }
         clearActiveRunTickets(session, 'shell_exited');
         clearAgentActive(session);
+        if (session.livenessTimer) { clearInterval(session.livenessTimer); session.livenessTimer = null; }
+        session.agentMarker = null;
         // AD-144: flush any pending history write before dropping the session,
         // so the scrollback up to the shell's final frame is preserved for the
         // next `npx adhdev` launch.
@@ -1052,15 +796,21 @@ function getOrCreateSession(projectId) {
         sessions.delete(id);
     });
 
+    // AD-318: start the per-session agent-liveness probe loop. Replaces all
+    // terminal-text detection — agentState now tracks a real process.
+    if (!session.livenessTimer) {
+        session.livenessTimer = setInterval(() => { void refreshAgentLiveness(session); }, AGENT_LIVENESS_POLL_MS);
+    }
     sessions.set(id, session);
     return session;
 }
 
 function snapshotSessionStatus(session) {
-    // AD-156 reopen #2: also check on the read path so /status (which Run's
-    // agentReady gate consults) reports an honest agentActive even when no
-    // output has flowed since the agent exited.
-    if (session) expireStaleAgent(session, 'detection_stale');
+    // AD-221: status reads must not clear active runs. The browser polls this
+    // endpoint every 2s, so using it as a detection-stale sweeper recreated the
+    // premature mascot-stop bug while agents were busy in long quiet turns.
+    // AD-318: /status just reads the process-probe-derived agentState; it no
+    // longer re-detects from scrollback (the AD-292 false-positive seed).
     if (!session) {
         return {
             connected: false,
@@ -1100,10 +850,25 @@ function snapshotSessionStatus(session) {
     };
 }
 
+// AD-203: gate every mutating endpoint on Origin + token. Returns true if the
+// request is authorised; false (and writes a 403) if it is not. Read-only /status
+// is allowed without the gate so the OnboardingWizard etc. can poll.
+function requireGate(req, res, urlObj) {
+    if (!isAllowedOrigin(req)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Origin not allowed' }));
+        return false;
+    }
+    if (!isTokenValid(req, urlObj)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing or invalid x-adhdev-token' }));
+        return false;
+    }
+    return true;
+}
+
 const httpServer = createServer((req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    applyCorsHeaders(req, res);
 
     if (req.method === 'OPTIONS') {
         res.writeHead(200);
@@ -1125,6 +890,7 @@ const httpServer = createServer((req, res) => {
     }
 
     if (req.method === 'POST' && req.url === '/ui-context') {
+        if (!requireGate(req, res, new URL(req.url, `http://localhost:${PORT}`))) return;
         let body = '';
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
@@ -1146,6 +912,7 @@ const httpServer = createServer((req, res) => {
     }
 
     if (req.method === 'POST' && req.url === '/stop-run') {
+        if (!requireGate(req, res, new URL(req.url, `http://localhost:${PORT}`))) return;
         let body = '';
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
@@ -1163,11 +930,12 @@ const httpServer = createServer((req, res) => {
     }
 
     if (req.method === 'POST' && req.url === '/execute') {
+        if (!requireGate(req, res, new URL(req.url, `http://localhost:${PORT}`))) return;
         let body = '';
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
             try {
-                const { command, ticketId, ticketIds, batchId, projectId: rawProjectId } = JSON.parse(body);
+                const { command, ticketId, ticketIds, batchId, projectId: rawProjectId, runId, submitMode } = JSON.parse(body);
                 if (!command) {
                     res.writeHead(400);
                     res.end(JSON.stringify({ error: 'Command required' }));
@@ -1187,17 +955,92 @@ const httpServer = createServer((req, res) => {
                         : batchId
                             ? [batchId]
                             : [];
-                setActiveRunTickets(session, normalizedTicketIds);
+                const shellSubmit = submitMode === 'shell';
+                if (!shellSubmit) {
+                    setActiveRunTickets(session, normalizedTicketIds, typeof runId === 'string' ? runId : null);
+                }
 
-                // AD-184: previously this was two separate writes
-                // (command, then '\r'). On Windows ConPTY the trailing '\r'
-                // could race with the running app's input handler and the
-                // command would land "typed but not entered". Combine into
-                // a single write so the prompt and its enter ship together.
-                const commandWithEnter = (command.endsWith('\r') || command.endsWith('\n'))
-                    ? command
-                    : command + '\r';
-                session.shell.write(commandWithEnter);
+                if (shellSubmit) {
+                    const stripped = command.replace(/[\r\n]+$/, '');
+                    session.shell.write(stripped + '\r');
+                    console.log(`Terminal shell command submitted for project ${projectId}`);
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ success: true, message: 'Shell command submitted', projectId }));
+                    return;
+                }
+
+                // AD-184 → AD-140 (round 2): the 80ms-gap fix from round 1
+                // was insufficient — reports kept coming in of the failure
+                // mode where the prompt sits in Claude Code's input box but
+                // Enter never fires. Five real causes (most → least common):
+                //
+                //   1. Claude's startup permissions dialog ("bypass permissions
+                //      on / shift+tab to cycle") is still up; until dismissed,
+                //      Claude is not listening to prompt input. A bare CR that
+                //      arrives while it's up dismisses the dialog instead of
+                //      submitting our prompt.
+                //   2. Multi-line edit mode swallows the Enter — embedded \n in
+                //      our prompt puts Claude in multi-line mode, where a bare
+                //      CR is treated as "add a line" not "submit."
+                //   3. Slow-machine race — the prior 80ms wasn't always enough.
+                //   4. Windows ConPTY can split a single write into multiple
+                //      reads; the trailing CR may land in a different cycle.
+                //   5. Some Windows console apps expect CRLF, not just CR.
+                //
+                // Round-2 fix — defense-in-depth:
+                //   (a) Wrap the prompt in bracketed-paste mode markers
+                //       (ESC [ 200 ~ ... ESC [ 201 ~). Modern TUIs treat
+                //       everything between those markers as a single paste,
+                //       NOT as multi-line edit, so the in-buffer \n's are no
+                //       longer ambiguous. Closes #2.
+                //   (b) Delay Enter until the receiving REPL has had time to
+                //       drain the bracketed-paste payload. Short fixed delays
+                //       race on Windows/Codex/Claude when the prompt is large:
+                //       the text visibly lands, but the submit keystroke is
+                //       swallowed before the TUI exits paste handling.
+                //   (c) Send Enter more than once. If Enter #1 lands while
+                //       Claude's startup dialog is still up, it dismisses the
+                //       dialog; the delayed follow-ups submit the prompt.
+                //       Closes #1. Stray-second-Enter at a bash/cmd prompt
+                //       just produces one blank line — cheap.
+                //
+                // Bracketed paste is the load-bearing fix; the timing changes
+                // are belt-and-suspenders.
+                //
+                // AD-243: BPM tells the receiver "this is a paste," not
+                //   "replace existing input." If the user (or a prior failed
+                //   Run) left half-typed text in Claude Code's prompt buffer,
+                //   the new BPM paste gets *appended* to that stale text and
+                //   submitted as one merged prompt — silent prompt poisoning.
+                //   Fix: prepend Ctrl+U (\x15, the universal readline kill-
+                //   line) to wipe whatever's in the input box before pasting.
+                //   Empty buffer → no-op; non-empty → cleared. Honored by
+                //   Ink-based TUIs (Claude Code) and bash/zsh alike.
+                const stripped = command.replace(/[\r\n]+$/, '');
+                const BPM_OPEN = '\x1b[200~';
+                const BPM_CLOSE = '\x1b[201~';
+                const CTRL_U = '\x15';
+                // AD-140 reopen: the double-Enter path still left rare runs
+                // sitting in the agent prompt after a long paste. Scale the
+                // initial submit window up for large prompts and keep two
+                // delayed follow-up submits so a startup dialog, paste drain,
+                // or ConPTY split cannot consume the only Enter.
+                const firstSubmitDelay = Math.max(900, Math.min(3000, 650 + Math.ceil(stripped.length / 6)));
+                const secondSubmitDelay = firstSubmitDelay + 600;
+                const thirdSubmitDelay = firstSubmitDelay + 1800;
+                session.shell.write(CTRL_U);
+                setTimeout(() => {
+                    try { session.shell.write(BPM_OPEN + stripped + BPM_CLOSE); } catch {}
+                }, 50);
+                setTimeout(() => {
+                    try { session.shell.write('\r'); } catch { /* shell torn down between writes */ }
+                }, firstSubmitDelay);
+                setTimeout(() => {
+                    try { session.shell.write('\r'); } catch { /* same */ }
+                }, secondSubmitDelay);
+                setTimeout(() => {
+                    try { session.shell.write('\r'); } catch { /* same */ }
+                }, thirdSubmitDelay);
 
                 const identifier = batchId || ticketId || normalizedTicketIds.join(', ') || 'unknown';
                 console.log(`Terminal execution started for project ${projectId}, ${batchId ? 'batch' : 'ticket'} ${identifier}`);
@@ -1215,6 +1058,7 @@ const httpServer = createServer((req, res) => {
     // AD-144: explicit history wipe — called by Reset Session so a deliberate
     // reset actually starts with an empty scrollback on next launch.
     if (req.method === 'POST' && req.url && req.url.startsWith('/reset-history')) {
+        if (!requireGate(req, res, new URL(req.url, `http://localhost:${PORT}`))) return;
         let body = '';
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
@@ -1241,14 +1085,55 @@ const httpServer = createServer((req, res) => {
         return;
     }
 
+    // Explicit UI reset: kill the project's current shell and wipe its
+    // persisted scrollback. Typing `exit` into the PTY is not reliable when a
+    // TUI owns the prompt, so expose a gated server-side reset path.
+    if (req.method === 'POST' && req.url && req.url.startsWith('/reset-session')) {
+        if (!requireGate(req, res, new URL(req.url, `http://localhost:${PORT}`))) return;
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const { projectId: rawProjectId } = body ? JSON.parse(body) : {};
+                const projectId = normalizeProjectId(rawProjectId || currentProjectId);
+                const session = getSession(projectId);
+                if (session) {
+                    if (session.activeRunTicketIds.length > 0) {
+                        markTicketsInterrupted(projectId, session.activeRunTicketIds);
+                        clearActiveRunTickets(session, 'interrupted');
+                    }
+                    clearAgentActive(session);
+                    if (session.historyWriteTimeout) {
+                        clearTimeout(session.historyWriteTimeout);
+                        session.historyWriteTimeout = null;
+                    }
+                    session.shellBuffer = [];
+                    session.shellBufferLength = 0;
+                    try { session.shell?.kill(); } catch {}
+                }
+                clearHistoryBuffer(projectId);
+                res.writeHead(200);
+                res.end(JSON.stringify({ success: true, projectId }));
+            } catch {
+                res.writeHead(400);
+                res.end(JSON.stringify({ error: 'Invalid JSON' }));
+            }
+        });
+        return;
+    }
+
     res.writeHead(404);
     res.end('Not Found');
 });
 
 const wss = new WebSocketServer({ server: httpServer });
 
-httpServer.listen(PORT, () => {
-    console.log(`Terminal server running on http://localhost:${PORT} (WebSocket + HTTP)`);
+// AD-201: bind to 127.0.0.1 explicitly. The wider machine network must not be
+// able to reach this server -- combined with the Origin/token gate (AD-202/203/
+// 204) this is defense in depth.
+httpServer.listen(PORT, '127.0.0.1', () => {
+    console.log(`Terminal server running on http://127.0.0.1:${PORT} (WebSocket + HTTP)`);
+    console.log(`Session token: ${SESSION_TOKEN_PATH}`);
     // AD-149 permanent fix: any in_progress executions left over from a prior
     // crash / kill are now definitionally stale — the server owning them is
     // freshly restarted. Mark them as blocked so the indicator doesn't haunt.
@@ -1262,6 +1147,16 @@ wss.on('connection', (ws, req) => {
     // so caused cross-tab state bleed — the last-connected tab would reshape
     // the /execute + /status routing for every other tab.
     const url = new URL(req.url || '/', `http://localhost:${PORT}`);
+    // AD-203 + AD-204: gate the WS upgrade on Origin and token. Reject before
+    // we spin up any per-session state.
+    if (!isAllowedOrigin(req)) {
+        try { ws.close(1008, 'Origin not allowed'); } catch {}
+        return;
+    }
+    if (!isTokenValid(req, url)) {
+        try { ws.close(1008, 'Missing or invalid token'); } catch {}
+        return;
+    }
     const projectId = normalizeProjectId(url.searchParams.get('project'));
     ws.projectId = projectId;
     if (!currentProjectId) currentProjectId = projectId;
@@ -1277,7 +1172,7 @@ wss.on('connection', (ws, req) => {
         try { ws.send(JSON.stringify({ type: 'output', data: replay })); } catch {}
     }
 
-    try { ws.send(JSON.stringify({ type: 'ready', pid: s.pid, shell: SHELL, projectId })); } catch {}
+    try { ws.send(JSON.stringify({ type: 'ready', pid: s.pid, shell: SHELL, projectId, platform: OS_PLATFORM, osBuild: OS_BUILD })); } catch {}
 
     ws.on('message', (msg) => {
         const activeSession = getSession(ws.projectId);
@@ -1287,6 +1182,13 @@ wss.on('connection', (ws, req) => {
             if (parsed.type === 'input') {
                 const transformedInput = inspectTerminalInput(activeSession, parsed.data || '');
                 activeSession.shell.write(transformedInput);
+            } else if (parsed.type === 'agent-hint') {
+                if (typeof parsed.agentId === 'string' && parsed.agentId.trim()) {
+                    // AD-318: the launch hint is the agent-OWNED identity signal. It
+                    // does NOT flip state — it records which agent to expect so the
+                    // process probe can disambiguate. Liveness is the probe alone.
+                    activeSession.agentMarker = { name: parsed.agentId.trim(), launchedAt: Date.now() };
+                }
             } else if (parsed.type === 'resize') {
                 activeSession.shell.resize(parsed.cols || 120, parsed.rows || 30);
             } else if (parsed.type === 'switch-project') {
@@ -1303,7 +1205,7 @@ wss.on('connection', (ws, req) => {
                 try {
                     ws.send(JSON.stringify({ type: 'clear' }));
                     if (replay) ws.send(JSON.stringify({ type: 'output', data: replay }));
-                    ws.send(JSON.stringify({ type: 'ready', pid: newSession.shell.pid, shell: SHELL, projectId: newProjectId }));
+                    ws.send(JSON.stringify({ type: 'ready', pid: newSession.shell.pid, shell: SHELL, projectId: newProjectId, platform: OS_PLATFORM, osBuild: OS_BUILD }));
                 } catch {}
                 console.log(`Client switched terminal to project ${newProjectId}`);
             }
@@ -1330,6 +1232,7 @@ function flushAllHistoryOnExit() {
         // AD-149 permanent fix: stop the heartbeat loops on shutdown so no
         // dangling intervals keep the process alive past the exit call.
         try { stopHeartbeat(session); } catch {}
+        if (session.livenessTimer) { clearInterval(session.livenessTimer); session.livenessTimer = null; }
     }
 }
 

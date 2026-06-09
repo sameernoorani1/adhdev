@@ -59,6 +59,7 @@ export async function PATCH(request: NextRequest) {
         fs.writeFileSync(p, JSON.stringify(next, null, 2) + '\n');
         return NextResponse.json({ onboardingState: nextState });
     } catch (err) {
+        console.error('[ADHDev] PATCH /api/onboarding error:', err);
         return NextResponse.json({ error: String(err) }, { status: 500 });
     }
 }

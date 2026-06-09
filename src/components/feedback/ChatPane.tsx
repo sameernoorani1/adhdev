@@ -38,11 +38,15 @@ interface ChatPaneProps {
     // can render a pulse indicator while triage is in flight, even when the
     // panel is closed.
     onProcessingChange?: (processing: boolean) => void;
+    // AD-336: Process needs the same no-agent guard Run has. The server already
+    // blocks the dispatch (409 pendingLaunch, off AD-318's process-liveness
+    // signal); this opens the terminal so the user can Launch, matching Run.
+    onRequireAgent?: () => void;
 }
 
 const POLL_MS = 3000;
 
-export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessageId, onScrollHandled, onProcessingChange }: ChatPaneProps) {
+export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessageId, onScrollHandled, onProcessingChange, onRequireAgent }: ChatPaneProps) {
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [composer, setComposer] = useState('');
     const [pendingImages, setPendingImages] = useState<{ url: string; filename: string }[]>([]);
@@ -78,6 +82,17 @@ export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessage
         const t = setInterval(load, POLL_MS);
         return () => clearInterval(t);
     }, [open, load]);
+
+    // AD-294: focus the composer textarea when the pane opens so paste/type
+    // works without an extra click. Defer one frame so the slide-in transition
+    // has mounted the textarea and the panel is on-screen — focusing while the
+    // pane is still translated off-screen has caused mobile Safari to scroll
+    // the parent unexpectedly.
+    useEffect(() => {
+        if (!open) return;
+        const t = setTimeout(() => textareaRef.current?.focus(), 60);
+        return () => clearTimeout(t);
+    }, [open]);
 
     // Scroll to bottom on new messages.
     useEffect(() => {
@@ -151,17 +166,30 @@ export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessage
     const handleComposerPaste = useCallback(async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
         const items = e.clipboardData?.items;
         if (!items) return;
+        // AD-246 reopen: detect image-typed items in two passes. First pass
+        // checks for *any* `image/*` item — if present, we MUST preventDefault
+        // even if file extraction later fails, otherwise the text/HTML
+        // fallback (e.g. an `<img>` tag from a Windows screenshot tool) leaks
+        // into the textarea. Original handler only preventDefault'd when
+        // `files.length > 0`, which left a hole on screenshot paths where the
+        // clipboard had an image entry but `getAsFile()` returned null.
+        let hasImageItem = false;
         const files: File[] = [];
         for (let i = 0; i < items.length; i++) {
             if (items[i].type.startsWith('image/')) {
+                hasImageItem = true;
                 const f = items[i].getAsFile();
                 if (f) files.push(f);
             }
         }
-        if (files.length === 0) return;
+        if (!hasImageItem) return; // text-only paste — let the textarea handle it natively
         e.preventDefault();
-        await ingestFiles(files);
-    }, [ingestFiles]);
+        if (files.length > 0) {
+            await ingestFiles(files);
+        } else {
+            onToast?.('Could not read the pasted image — try drag-drop or save the file first.', 3000);
+        }
+    }, [ingestFiles, onToast]);
 
     const handleDrop = async (e: React.DragEvent) => {
         e.preventDefault();
@@ -226,6 +254,16 @@ export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessage
         try {
             const res = await fetch('/api/chat/process', { method: 'POST' });
             const data = await res.json();
+            // AD-336: no coding agent running (server returned 409 pendingLaunch,
+            // computed from AD-318's process-liveness signal). Match Run: open the
+            // terminal and guide the user to Launch, instead of silently dropping
+            // the triage prompt into a dead shell with no feedback.
+            if (data.pendingLaunch) {
+                onRequireAgent?.();
+                onToast?.(data.message || 'Start your coding agent, then Process again.', 6000);
+                stopProcessing();
+                return;
+            }
             onToast?.(data.message || (data.success ? 'Run started.' : 'No unaddressed messages.'), 4000);
             // No unaddressed messages → no triage will run; clear the flag now.
             if (!data.success) stopProcessing();
@@ -284,11 +322,19 @@ export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessage
 
     return (
         <>
-            {/* AD-188: backdrop for click-outside dismiss + dim/blur */}
+            {/* AD-188: backdrop for click-outside dismiss + dim/blur.
+                AD-321: bumped opacity from black/40 + blur-sm to black/70 +
+                blur-md. The lighter backdrop was leaving the terminal pane's
+                Launch button (and the rest of the topbar) visibly bleeding
+                through, which the user read as "the terminal Launch button
+                shows on the Brain Dump" — a layering artifact, not an actual
+                button in this panel. The darker backdrop makes the Brain Dump
+                read as the active surface without changing the terminal pane's
+                layout. */}
             <div
                 onClick={onClose}
                 aria-hidden="true"
-                className={`fixed inset-0 z-30 bg-black/40 backdrop-blur-sm transition-opacity duration-200 ${
+                className={`fixed inset-0 z-30 bg-black/70 backdrop-blur-md transition-opacity duration-200 ${
                     open ? 'opacity-100' : 'opacity-0 pointer-events-none'
                 }`}
             />
@@ -327,7 +373,7 @@ export function ChatPane({ open, onClose, onToast, onOpenTicket, scrollToMessage
                     className="px-3 py-1 text-[11px] font-medium rounded border border-vd-accent-gold/40 text-vd-accent-gold hover:bg-vd-accent-gold/10 disabled:opacity-40 disabled:cursor-not-allowed"
                     title={unaddressedCount === 0 ? 'Nothing to process' : 'Send unaddressed messages to the coding agent'}
                 >
-                    {processing ? '… Running' : '▶ Run Chat'}
+                    {processing ? '… Processing' : '▶ Process'}
                 </button>
             </div>
 
@@ -690,6 +736,14 @@ function ChatMessageBubble({
                     {isAi ? 'AI' : message.author}
                 </span>
                 <span className="text-[10px] text-vd-text-tertiary">{tsLabel}</span>
+                <button
+                    type="button"
+                    onClick={() => navigator.clipboard?.writeText(message.id).catch(() => {})}
+                    className="text-[9px] font-mono text-vd-text-tertiary hover:text-vd-accent-gold"
+                    title="Copy Brain Dump reference id"
+                >
+                    {message.id}
+                </button>
                 {statusBadge}
             </div>
             {/* AD-187: replies (isAi mid-thread) get more prominent text +

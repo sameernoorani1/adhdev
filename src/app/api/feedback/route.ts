@@ -1,10 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { allocateTicketId, readFeedback, resolveTicketById, writeFeedback, checkAdmin, getDefaultAgentRules } from '@/lib/feedback/core';
+import { allocateTicketId, readFeedback, resolveTicketById, writeFeedback, withFeedbackLock, checkAdmin, getDefaultAgentRules, sweepStaleExecutions, shouldSweepNow } from '@/lib/feedback/core';
 import { normalizeRelations, diffRelations, applyInverse } from '@/lib/feedback/relations';
 import { getDefaultExecutionContract, readUserDisplayName, DEFAULT_USER_DISPLAY_NAME } from '@/lib/feedback/protocol';
 import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
 import { validateAgentTransition } from '@/lib/feedback/transitions';
 import { recordOnboardingEvent } from '@/lib/feedback/onboardingEvents';
+import { getDiffFiles } from '@/lib/feedback/gitDiff';
+import { closeRunsForTicket, markRunTerminal } from '@/lib/feedback/runs';
+import { getMissingExecutionCommentError, hasSubstantiveAiCommentForExecution } from '@/lib/feedback/executionComments';
 
 const ALLOWED_PRIORITIES = new Set(['low', 'medium', 'high', 'critical']);
 const ALLOWED_TICKET_TYPES = new Set(['normal', 'discussion', 'issue', 'idea', 'onboarding']);
@@ -31,6 +34,12 @@ const AI_ALLOWED_UPDATE_FIELDS = new Set([
     // AD-186: AI sets this on tickets spawned from Brain Dump triage; also
     // used to backfill historical chat-spawned tickets.
     'sourceMessageId',
+    // AD-199 follow-up: low-risk organizational metadata. Reported via
+    // AD-199 — AI agents should be able to tag waves + sessions on tickets
+    // they create as part of mission planning so the table view stays
+    // organised. These are pure labels — they don't affect transitions or
+    // execution gating.
+    'wave', 'session',
 ]);
 
 function getProjectId(request: NextRequest): string | null {
@@ -176,6 +185,20 @@ export async function GET(request: NextRequest) {
 
     try {
         const projectId = getProjectId(request);
+        // AD-232: sweep stuck execution.status='in_progress' records before
+        // serving the board. Catches the case where the terminal server
+        // hasn't been restarted (its boot-time recoverStaleInProgressTickets
+        // is the only other sweep path) but the data has drifted out of
+        // sync. Rate-limited to once per 30s per project so the cost is
+        // negligible. Behind the lock so it can't race a concurrent PATCH.
+        if (shouldSweepNow(projectId)) {
+            await withFeedbackLock(projectId, () => {
+                const swept = readFeedback(projectId);
+                if (sweepStaleExecutions(swept)) {
+                    writeFeedback(swept, projectId);
+                }
+            });
+        }
         const data = readFeedback(projectId);
         // AD-138: first board view after init — write-once.
         recordOnboardingEvent('firstBoardViewAt', projectId);
@@ -198,7 +221,9 @@ export async function POST(request: NextRequest) {
 
     try {
         const body = await request.json();
-        const data = readFeedback(getProjectId(request));
+        const projectId = getProjectId(request);
+        return await withFeedbackLock(projectId, async () => {
+        const data = readFeedback(projectId);
         const validationError = validateTicketFields(data, body);
         if (validationError) {
             return NextResponse.json({ error: validationError }, { status: 400 });
@@ -209,8 +234,14 @@ export async function POST(request: NextRequest) {
         const now = new Date().toISOString();
         const title = body.title || 'Untitled';
         const description = body.description || '';
-        const reporter = body.reporter || resolveDisplayName(getProjectId(request)).toLowerCase();
-        const createdByType = body.reporterType || body.createdByType || body.authorType || (reporter === 'system' ? 'system' : 'human');
+        const reporter = body.reporter || resolveDisplayName(projectId).toLowerCase();
+        const sourceMessageId = typeof body.sourceMessageId === 'string' && body.sourceMessageId.trim()
+            ? body.sourceMessageId.trim()
+            : undefined;
+        const createdByType = body.reporterType
+            || body.createdByType
+            || body.authorType
+            || (sourceMessageId ? 'ai' : reporter === 'system' ? 'system' : 'human');
         const tags = normalizeTags(body.tags);
         if ((createdByType === 'ai' || createdByType === 'system' || reporter === 'system') && !tags.includes('ai')) {
             tags.unshift('ai');
@@ -233,10 +264,9 @@ export async function POST(request: NextRequest) {
             ticketType: body.ticketType || 'normal',
             aiAddressable: body.aiAddressable !== false,
             reporter,
+            createdByType,
             // AD-186: chat-spawned tickets carry the source message id back.
-            sourceMessageId: typeof body.sourceMessageId === 'string' && body.sourceMessageId.trim()
-                ? body.sourceMessageId.trim()
-                : undefined,
+            sourceMessageId,
             images: body.images || [],
             tags,
             reopenCount: 0,
@@ -269,7 +299,7 @@ export async function POST(request: NextRequest) {
 
         // AD-138: first non-onboarding ticket the human actually authored.
         if (ticket.ticketType !== 'onboarding' && createdByType !== 'system' && createdByType !== 'ai') {
-            recordOnboardingEvent('firstUserTicketAt', getProjectId(request));
+            recordOnboardingEvent('firstUserTicketAt', projectId);
         }
 
         // AD-135: onboarding ticket AD-2 ("Create your first real ticket") auto-resolves
@@ -293,14 +323,28 @@ export async function POST(request: NextRequest) {
             }
         }
 
-        writeFeedback(data, getProjectId(request));
+        writeFeedback(data, projectId);
 
         return NextResponse.json(ticket, { status: 201 });
-    } catch {
+        });
+    } catch (err) {
+        console.error('[ADHDev] POST /api/feedback error:', err);
         return NextResponse.json({ error: 'Failed to create ticket' }, { status: 500 });
     }
 }
 
+// AD-208 SECURITY: `actorType` is trusted from the request body on every PATCH.
+// In the local single-user model that ADHDev ships in today, this is fine —
+// only code on the local machine (the board UI, the agent terminal, the CLI)
+// can reach this endpoint, and the same trust boundary already applies to
+// every other field in the body. The `actorType` value drives transition gating
+// (AI cannot move a ticket to `reviewed`/`observe`/`deferred`; humans can move
+// to anything). If a future hosted/team/multi-user deployment is ever shipped,
+// this becomes the central auth boundary and must be replaced with a
+// server-derived identity (signed session, OAuth subject, etc.) BEFORE that
+// deployment is exposed beyond a single trusted user. See AD-208 / MS-007 for
+// the audit context.
+//
 // PATCH — update ticket fields OR column config
 export async function PATCH(request: NextRequest) {
     const auth = await checkAdmin();
@@ -309,6 +353,7 @@ export async function PATCH(request: NextRequest) {
     try {
         const body = await request.json();
         const projectId = getProjectId(request);
+        return await withFeedbackLock(projectId, async () => {
         const data = readFeedback(projectId);
 
         // Update batches array
@@ -382,6 +427,31 @@ export async function PATCH(request: NextRequest) {
                 updatedAt: now,
             }
             : ticket.execution;
+        const runIdForExecution = updates.execution?.runId || ticket.execution?.runId;
+        const matchingRun = runIdForExecution
+            ? data.activeRuns?.find(run => run.runId === runIdForExecution)
+            : null;
+        if (mergedExecution && matchingRun?.startedRef && !(mergedExecution as { startedRef?: string }).startedRef) {
+            (mergedExecution as { startedRef?: string }).startedRef = matchingRun.startedRef;
+        }
+
+        // AD-240: ground-truth filesTouched via `git diff` when an AI flips
+        // the ticket to done. If the project is in a git repo and we
+        // captured a baseline at run-start (execution.startedRef), the
+        // diff list overrides whatever the agent self-reported. Otherwise
+        // we keep the self-report and label the source so the UI can be
+        // honest about provenance.
+        if (mergedExecution && actorType === 'ai' && updates.status === 'done') {
+            const project = getProjectById(projectId) || getActiveProject();
+            const startedRef = (mergedExecution as { startedRef?: string }).startedRef;
+            const diff = project ? getDiffFiles(project.path, startedRef) : null;
+            if (diff !== null) {
+                (mergedExecution as { filesTouched: string[] }).filesTouched = diff;
+                (mergedExecution as { filesTouchedSource?: string }).filesTouchedSource = 'git-diff';
+            } else {
+                (mergedExecution as { filesTouchedSource?: string }).filesTouchedSource = 'agent';
+            }
+        }
         const syntheticComments: typeof ticket.comments = [];
         const nextComments = [...(ticket.comments || [])];
 
@@ -400,6 +470,17 @@ export async function PATCH(request: NextRequest) {
             const completionComment = buildAiCompletionComment(actor, mergedExecution);
             nextComments.push(completionComment);
             syntheticComments.push(completionComment);
+        }
+
+        if (
+            actorType === 'ai' &&
+            updates.execution?.status === 'done' &&
+            !hasSubstantiveAiCommentForExecution(nextComments, actor, mergedExecution?.startedAt)
+        ) {
+            return NextResponse.json(
+                { error: getMissingExecutionCommentError(ticket.id) },
+                { status: 403 },
+            );
         }
 
         // ── Agent transition enforcement ────────────────────────
@@ -430,7 +511,7 @@ export async function PATCH(request: NextRequest) {
             // AD-138: first ticket to reach done. Skip onboarding tickets —
             // the funnel is about user-authored work, not the guided loop.
             if (ticket.ticketType !== 'onboarding') {
-                recordOnboardingEvent('firstDoneAt', getProjectId(request));
+                recordOnboardingEvent('firstDoneAt', projectId);
             }
         }
         if (mergedExecution) {
@@ -511,10 +592,29 @@ export async function PATCH(request: NextRequest) {
             for (const r of removed) touchInverse(r, 'remove');
         }
 
+        if (runIdForExecution && updates.execution) {
+            if (updates.status === 'done' || updates.execution.status === 'done') {
+                markRunTerminal(data, runIdForExecution, 'done', now);
+            } else if (updates.execution.status === 'blocked') {
+                markRunTerminal(data, runIdForExecution, 'blocked', now, updates.execution.blocker || 'Run blocked by agent.');
+            }
+        }
+
+        // AD-341: close the live indicator by TICKET, not just runId. A run opened
+        // by the Run dispatcher carries a different runId than the agent's own
+        // execution, so closing only `runIdForExecution` left the dispatch lease
+        // stuck on "Sending" forever after the agent finished.
+        const TERMINAL_TICKET_STATUSES = new Set(['done', 'blocked', 'reviewed', 'deferred']);
+        if (updates.status && TERMINAL_TICKET_STATUSES.has(updates.status)) {
+            closeRunsForTicket(data, data.tickets[index].id, updates.status === 'blocked' ? 'blocked' : 'done', now);
+        }
+
         writeFeedback(data, projectId);
 
         return NextResponse.json(data.tickets[index]);
-    } catch {
+        });
+    } catch (err) {
+        console.error('[ADHDev] PATCH /api/feedback error:', err);
         return NextResponse.json({ error: 'Failed to update' }, { status: 500 });
     }
 }
@@ -531,17 +631,20 @@ export async function DELETE(request: NextRequest) {
         }
 
         const projectId = getProjectId(request);
-        const data = readFeedback(projectId);
-        const resolved = resolveTicketById(data, id);
-        if (!resolved.ok) {
-            return NextResponse.json({ error: resolved.error }, { status: resolved.status });
-        }
+        return await withFeedbackLock(projectId, async () => {
+            const data = readFeedback(projectId);
+            const resolved = resolveTicketById(data, id);
+            if (!resolved.ok) {
+                return NextResponse.json({ error: resolved.error }, { status: resolved.status });
+            }
 
-        data.tickets.splice(resolved.index!, 1);
-        writeFeedback(data, projectId);
+            data.tickets.splice(resolved.index!, 1);
+            writeFeedback(data, projectId);
 
-        return NextResponse.json({ deleted: id });
-    } catch {
+            return NextResponse.json({ deleted: id });
+        });
+    } catch (err) {
+        console.error('[ADHDev] DELETE /api/feedback error:', err);
         return NextResponse.json({ error: 'Failed to delete' }, { status: 500 });
     }
 }

@@ -38,9 +38,22 @@ function getFileIcon(filename: string): string {
     return '📎';
 }
 
+// AD-314: per-file placeholder shown in the thumbnail strip while an upload
+// is in flight. `previewUrl` is an object URL we synthesize from the source
+// File so the user sees the picture immediately on paste/drop, with a spinner
+// overlaid until /api/feedback/upload returns the real URL. Falls back to a
+// generic file chip when the source is not an image.
+interface PendingUpload {
+    key: string;
+    name: string;
+    previewUrl: string | null;
+    isImage: boolean;
+}
+
 export function ImageDropZone({ images, onImagesChange, onImageClick, maxImages = 10 }: ImageDropZoneProps) {
     const [isDragOver, setIsDragOver] = useState(false);
     const [uploading, setUploading] = useState(false);
+    const [pending, setPending] = useState<PendingUpload[]>([]);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const uploadFile = useCallback(async (file: File): Promise<UploadedFile | null> => {
@@ -76,13 +89,39 @@ export function ImageDropZone({ images, onImagesChange, onImageClick, maxImages 
         const toUpload = fileArray.slice(0, remaining);
         if (toUpload.length === 0) return;
 
+        // AD-314: register each file as a pending placeholder before kicking
+        // off the upload so the user gets immediate visual feedback (thumbnail
+        // with spinner overlay) instead of an empty gap until the network call
+        // returns. Object URLs are revoked on settle to avoid leaks.
+        const pendingForUpload: PendingUpload[] = toUpload.map(file => {
+            const isImage = file.type.startsWith('image/');
+            const previewUrl = isImage ? URL.createObjectURL(file) : null;
+            return {
+                key: `${file.name}-${file.size}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                name: file.name,
+                previewUrl,
+                isImage,
+            };
+        });
+        setPending(prev => [...prev, ...pendingForUpload]);
         setUploading(true);
-        const results = await Promise.all(toUpload.map(uploadFile));
-        const uploaded = results.filter((r): r is UploadedFile => r !== null);
-        if (uploaded.length > 0) {
-            onImagesChange([...images, ...uploaded]);
+        try {
+            const results = await Promise.all(toUpload.map(uploadFile));
+            const uploaded = results.filter((r): r is UploadedFile => r !== null);
+            if (uploaded.length > 0) {
+                onImagesChange([...images, ...uploaded]);
+            }
+        } finally {
+            setPending(prev => {
+                const removedKeys = new Set(pendingForUpload.map(p => p.key));
+                // Revoke object URLs whose pending entries we are dropping.
+                for (const p of pendingForUpload) {
+                    if (p.previewUrl) URL.revokeObjectURL(p.previewUrl);
+                }
+                return prev.filter(p => !removedKeys.has(p.key));
+            });
+            setUploading(false);
         }
-        setUploading(false);
     }, [images, maxImages, onImagesChange, uploadFile]);
 
     const handleDrop = useCallback((e: DragEvent) => {
@@ -114,8 +153,8 @@ export function ImageDropZone({ images, onImagesChange, onImageClick, maxImages 
 
     return (
         <div onPaste={handlePaste}>
-            {/* Thumbnails / file list — ABOVE drop zone (VD-023) */}
-            {images.length > 0 && (
+            {/* Thumbnails / file list — ABOVE drop zone */}
+            {(images.length > 0 || pending.length > 0) && (
                 <div className="flex flex-wrap gap-3 mb-2">
                     {images.map((file, i) => {
                         const isImg = file.isImage !== false && !!file.filename.match(/\.(png|jpg|jpeg|gif|webp|svg|bmp|ico|avif|tiff?)$/i);
@@ -123,9 +162,10 @@ export function ImageDropZone({ images, onImagesChange, onImageClick, maxImages 
                             /* Image thumbnail with caption */
                             <div key={i} className="space-y-1">
                                 <div
-                                    className="relative group w-16 h-16 rounded-md overflow-hidden border border-vd-border cursor-pointer"
+                                    className="relative group w-16 h-16 rounded-md overflow-hidden border border-vd-border cursor-pointer bg-vd-bg-secondary"
                                     onClick={() => onImageClick?.(file.url)}
                                 >
+                                    {/* AD-314: bg-vd-bg-secondary on the wrapper so an empty <img> tag (before the network image decodes) shows a neutral panel color instead of a black box. */}
                                     {/* eslint-disable-next-line @next/next/no-img-element */}
                                     <img src={file.url} alt={file.filename} className="w-full h-full object-cover" />
                                     <button
@@ -175,6 +215,30 @@ export function ImageDropZone({ images, onImagesChange, onImageClick, maxImages 
                             </div>
                         );
                     })}
+                    {/* AD-314: per-file upload placeholders. Each shows the local
+                        object-URL preview (or a generic file icon for non-images)
+                        with a spinner overlay until the server upload returns. */}
+                    {pending.map(p => (
+                        <div key={p.key} className="space-y-1">
+                            <div
+                                className="relative w-16 h-16 rounded-md overflow-hidden border border-vd-border bg-vd-bg-secondary"
+                                title={`Uploading ${p.name}`}
+                            >
+                                {p.isImage && p.previewUrl ? (
+                                    /* eslint-disable-next-line @next/next/no-img-element */
+                                    <img src={p.previewUrl} alt={p.name} className="w-full h-full object-cover opacity-60" />
+                                ) : (
+                                    <div className="w-full h-full flex items-center justify-center text-2xl text-vd-text-tertiary">
+                                        {getFileIcon(p.name)}
+                                    </div>
+                                )}
+                                <div className="absolute inset-0 flex items-center justify-center bg-black/30">
+                                    <span className="inline-block w-4 h-4 border-2 border-vd-accent-gold/40 border-t-vd-accent-gold rounded-full animate-spin" aria-hidden="true" />
+                                </div>
+                            </div>
+                            <p className="w-16 text-[9px] text-vd-text-tertiary truncate">Uploading…</p>
+                        </div>
+                    ))}
                 </div>
             )}
 

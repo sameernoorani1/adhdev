@@ -29,8 +29,24 @@ export function isTicketExecutionActive(
     // Kept in the signature so existing callers compile without changes. The
     // value is ignored — the live poll is no longer part of the authoritative
     // signal.
-    _activeExecutionIds?: Iterable<string> | null,
+    activeExecutionIds?: Iterable<string> | null,
 ): boolean {
+    // AD-341: the done/reviewed guard must run FIRST — before the
+    // activeExecutionIds membership check. The terminal's captureTicketIds can
+    // still list a ticket the agent just PATCHed to `done` (the terminal clears
+    // its own active set lazily, on turn-end / timeout — it doesn't know about
+    // the board-side done PATCH). Without this ordering, a finished Run kept
+    // animating "Running" off that stale terminal list until the terminal
+    // cleared it ~2 min later. A done/reviewed ticket is never running, period.
+    // (AD-232: same guard also covers the AD-284 write race that leaves
+    // execution.status stuck as 'in_progress' after the status flip.)
+    if (ticket.status === 'done' || ticket.status === 'reviewed') return false;
+    if (activeExecutionIds) {
+        const id = String(ticket.id || '').toUpperCase();
+        for (const activeId of activeExecutionIds) {
+            if (String(activeId || '').toUpperCase() === id) return true;
+        }
+    }
     if (ticket.execution?.status !== 'in_progress') return false;
     const updatedAtRaw = ticket.execution?.updatedAt;
     if (!updatedAtRaw) return false;
@@ -52,5 +68,12 @@ export function isTicketExecutionActive(
 // tickets after a hard server crash get cleaned by `recoverStaleInProgressTickets`
 // at next startup.
 export function isTicketExecutionInProgress(ticket: TicketExecutionShape): boolean {
+    // AD-232: same defensive gate as isTicketExecutionActive — a ticket whose
+    // work status is done/reviewed cannot legitimately have a still-running
+    // execution. The AD-284 cross-process write race intermittently leaves
+    // execution.status stuck as 'in_progress' after the status flip; without
+    // this guard the mascot would animate on a closed ticket until the next
+    // server-side sweep (~30 s) or page reload.
+    if (ticket.status === 'done' || ticket.status === 'reviewed') return false;
     return ticket.execution?.status === 'in_progress';
 }

@@ -84,8 +84,8 @@ export function initProjectDir(projectPath: string, prefix: string = 'AD') {
                 backlog: { label: 'Backlog', aiInstruction: 'Review, comment with analysis, suggest priority.' },
                 todo: { label: 'To Do', aiInstruction: 'Fix the issue (or post plan for discussions).' },
                 reopen: { label: 'Reopen', aiInstruction: 'PRIORITY FIX. Previous attempt failed. Read all comments.' },
-                done: { label: 'Done', aiInstruction: 'Do nothing. Awaiting human review.' },
-                reviewed: { label: 'Reviewed', aiInstruction: 'Do nothing. Never touch.' },
+                done: { label: 'For Review', aiInstruction: 'Do nothing. Awaiting human review.' },
+                reviewed: { label: 'Closed', aiInstruction: 'Do nothing. Never touch.' },
                 observe: { label: 'Observe', aiInstruction: 'Do nothing. Monitoring.' },
                 deferred: { label: 'Deferred', aiInstruction: 'Do nothing. Postponed.' },
             },
@@ -102,7 +102,7 @@ export function initProjectDir(projectPath: string, prefix: string = 'AD') {
         fs.writeFileSync(configPath, JSON.stringify({ prefix, agents: ['Claude Code'] }, null, 2) + '\n');
     }
 
-    ensureAdhdevProtocol(projectPath, prefix);
+    ensureAdhdevProtocol(projectPath, prefix, { writeClaudeMdRef: true });
 
     // Ensure uploads dir
     const uploadsDir = path.join(adhdevDir, 'uploads');

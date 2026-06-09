@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { useDroppable } from '@dnd-kit/core';
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { TicketCard, Ticket } from './TicketCard';
+import type { ReadTicketCursors } from '@/lib/feedback/readState';
 
 interface ColumnConfig {
     label: string;
@@ -20,11 +21,12 @@ interface KanbanColumnProps {
     onToggleAi: (id: string, value: boolean) => void;
     onAddTicket?: (status: string) => void;
     isDragDisabled?: boolean;
-    readTickets?: Set<string>;
+    readTicketCursors?: ReadTicketCursors;
     selectedIds?: Set<string>;
     onToggleSelect?: (id: string) => void;
     onSelectColumn?: (status: string) => void;
     activeExecutionIds?: Set<string>;
+    activeRunStatusByTicket?: Map<string, 'dispatching' | 'running' | 'finishing'>;
     stackBy?: 'status' | 'priority' | 'wave' | 'session';
     groupedBy?: 'none' | 'status' | 'priority' | 'wave' | 'session';
 }
@@ -39,11 +41,12 @@ export function KanbanColumn({
     onToggleAi,
     onAddTicket,
     isDragDisabled,
-    readTickets,
+    readTicketCursors,
     selectedIds,
     onToggleSelect,
     onSelectColumn,
     activeExecutionIds,
+    activeRunStatusByTicket,
     stackBy = 'status',
     groupedBy = 'none',
 }: KanbanColumnProps) {
@@ -181,8 +184,9 @@ export function KanbanColumn({
                                     isSelected={selectedIds?.has(ticket.id) ?? false}
                                     onToggleSelect={onToggleSelect}
                                     isDragDisabled={isDragDisabled}
-                                    readTickets={readTickets}
+                                    readTicketCursors={readTicketCursors}
                                     activeExecutionIds={activeExecutionIds}
+                                    activeRunStatus={activeRunStatusByTicket?.get(String(ticket.id).toUpperCase())}
                                     hiddenFields={hiddenFields}
                                 />
                             ))}

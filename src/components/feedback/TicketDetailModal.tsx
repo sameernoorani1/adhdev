@@ -1,6 +1,8 @@
 'use client';
 
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 import { Ticket } from './TicketCard';
 import { CommentTimeline } from './CommentTimeline';
 import { ImageDropZone, UploadedFile } from './ImageDropZone';
@@ -9,6 +11,7 @@ import { type Relation, type RelationKind, RELATION_KINDS, RELATION_LABEL } from
 import { compressImage } from '@/lib/feedback/imageCompress';
 import { buildRunPrompt } from '@/lib/feedback/runPrompt';
 import { isTicketExecutionActive } from '@/lib/feedback/executionState';
+import type { TicketExecution } from '@/lib/feedback/core';
 import { CoachMark } from './CoachMark';
 import {
     buildComparisonRows,
@@ -20,6 +23,14 @@ import {
 // Build the "copy for AI" prompt text from ticket(s)
 function buildPrompt(tickets: Ticket[]): string {
     return buildRunPrompt(tickets.map(t => t.id));
+}
+
+function getCreatorLabel(ticket: Ticket & { sourceMessageId?: string; createdByType?: 'human' | 'ai' | 'system' }): string {
+    if (ticket.sourceMessageId) return `AI for ${ticket.reporter || 'you'}`;
+    const createdActivity = ticket.activity?.find(entry => entry.action === 'created');
+    const createdByType = ticket.createdByType || createdActivity?.byType;
+    if (createdByType === 'ai' || createdByType === 'system' || ticket.tags?.includes('ai')) return 'AI';
+    return ticket.reporter;
 }
 
 // Run | Copy split button
@@ -36,7 +47,7 @@ function RunButton({
     const [terminalStatus, setTerminalStatus] = useState<{
         connected: boolean;
         agentActive: boolean;
-        requestStatus: 'idle' | 'running' | 'interrupted';
+        requestStatus: 'idle' | 'dispatching' | 'running' | 'interrupted';
     } | null>(null);
     const [feedback, setFeedback] = useState<{ type: 'success' | 'warning' | 'error'; message: string } | null>(null);
     const [copyFeedback, setCopyFeedback] = useState(false);
@@ -52,7 +63,7 @@ function RunButton({
                 .then(d => setTerminalStatus({
                     connected: !!d.connected,
                     agentActive: !!d.agentActive,
-                    requestStatus: d.requestStatus === 'running' || d.requestStatus === 'interrupted' ? d.requestStatus : 'idle',
+                    requestStatus: d.requestStatus === 'running' || d.requestStatus === 'dispatching' || d.requestStatus === 'interrupted' ? d.requestStatus : 'idle',
                 }))
                 .catch(() => setTerminalStatus({ connected: false, agentActive: false, requestStatus: 'idle' }));
         };
@@ -175,8 +186,8 @@ const STATUS_LABELS: Record<string, string> = {
     backlog: 'Backlog',
     todo: 'To Do',
     reopen: 'Reopen',
-    done: 'Done',
-    reviewed: 'Reviewed',
+    done: 'For Review',
+    reviewed: 'Closed',
     observe: 'Observe',
     deferred: 'Deferred',
 };
@@ -194,10 +205,10 @@ const STATUS_BADGE_COLORS: Record<string, string> = {
 // Next-state transitions: primary = forward (→), non-primary = backward (←)
 const NEXT_STATES: Record<string, { label: string; target: string; primary?: boolean; direction: 'forward' | 'back' }[]> = {
     backlog: [{ label: 'Todo', target: 'todo', primary: true, direction: 'forward' }],
-    todo: [{ label: 'Done', target: 'done', primary: true, direction: 'forward' }],
-    reopen: [{ label: 'Done', target: 'done', primary: true, direction: 'forward' }],
+    todo: [{ label: 'For Review', target: 'done', primary: true, direction: 'forward' }],
+    reopen: [{ label: 'For Review', target: 'done', primary: true, direction: 'forward' }],
     done: [
-        { label: 'Reviewed', target: 'reviewed', primary: true, direction: 'forward' },
+        { label: 'Closed', target: 'reviewed', primary: true, direction: 'forward' },
         { label: 'Reopen', target: 'reopen', direction: 'back' },
     ],
     reviewed: [
@@ -261,47 +272,62 @@ interface TicketDetailModalProps {
     onCoachMarkSeen?: (key: string) => void;
     onHideAllTips?: () => void;
     // AD-180 follow-up: full ticket list for the Linked panel's title-search.
-    allTickets?: Pick<Ticket, 'id' | 'title' | 'status'>[];
+    // AD-251: also exposes priority + ticketType so the rendered row can
+    // surface them next to status without a second lookup.
+    allTickets?: Pick<Ticket, 'id' | 'title' | 'status' | 'priority' | 'ticketType'>[];
     // Open a sub-task quick-create with this ticket pre-filled as parent.
     onCreateSubtask?: (parentTicketId: string) => void;
     // AD-186: open the Brain Dump panel and scroll to a chat message id.
     onOpenChatMessage?: (messageId: string) => void;
+    // AD-251: switch the modal to a different ticket when the user clicks a
+    // linked row in the Linked Tickets panel. The parent (FeedbackBoard)
+    // resolves the id and sets selectedTicket; we just hand it the id.
+    onSelectTicket?: (ticketId: string) => void;
 }
 
-/** VD-190: Description block with "See more" truncation for long descriptions */
+/** Description block with "See more" truncation for long descriptions */
 const DESC_MAX_LINES = 12;
+// AD-323: render the description as markdown so **bold**, lists, code spans and
+// links land formatted instead of as raw asterisks. Pipeline copied from
+// NotepadPane.tsx (AD-206): marked → DOMPurify → dangerouslySetInnerHTML.
+// DOMPurify strips <script>, on* handlers and javascript: URLs, so a ticket
+// description copied from anywhere is safe to render via innerHTML.
+function renderDescriptionHtml(md: string): string {
+    const raw = marked.parse(md, { async: false }) as string;
+    return DOMPurify.sanitize(raw, { USE_PROFILES: { html: true } });
+}
+
 function DescriptionBlock({ description }: { description: string }) {
     const [expanded, setExpanded] = useState(false);
     const lines = description.split('\n');
     const needsTruncation = lines.length > DESC_MAX_LINES || description.length > 600;
+    const visibleSource = needsTruncation && !expanded
+        ? lines.slice(0, DESC_MAX_LINES).join('\n') + (lines.length > DESC_MAX_LINES ? '\n…' : '')
+        : description;
+    const html = useMemo(() => renderDescriptionHtml(visibleSource), [visibleSource]);
 
     return (
         <div>
             <h4 className="text-xs text-vd-text-tertiary uppercase tracking-wider mb-1">Description</h4>
-            {needsTruncation && !expanded ? (
-                <>
-                    <p className="text-sm text-vd-text-secondary whitespace-pre-wrap">
-                        {lines.slice(0, DESC_MAX_LINES).join('\n')}{lines.length > DESC_MAX_LINES ? '…' : ''}
-                    </p>
-                    <button
-                        onClick={() => setExpanded(true)}
-                        className="text-xs text-vd-accent-gold hover:text-vd-accent-gold-light mt-1 font-medium"
-                    >
-                        See more ({lines.length - DESC_MAX_LINES > 0 ? `${lines.length - DESC_MAX_LINES} more lines` : 'full text'})
-                    </button>
-                </>
-            ) : (
-                <>
-                    <p className="text-sm text-vd-text-secondary whitespace-pre-wrap">{description}</p>
-                    {needsTruncation && (
-                        <button
-                            onClick={() => setExpanded(false)}
-                            className="text-xs text-vd-accent-gold hover:text-vd-accent-gold-light mt-1 font-medium"
-                        >
-                            See less
-                        </button>
-                    )}
-                </>
+            <div
+                className="text-sm text-vd-text-secondary adhdev-markdown"
+                dangerouslySetInnerHTML={{ __html: html }}
+            />
+            {needsTruncation && !expanded && (
+                <button
+                    onClick={() => setExpanded(true)}
+                    className="text-xs text-vd-accent-gold hover:text-vd-accent-gold-light mt-1 font-medium"
+                >
+                    See more ({lines.length - DESC_MAX_LINES > 0 ? `${lines.length - DESC_MAX_LINES} more lines` : 'full text'})
+                </button>
+            )}
+            {needsTruncation && expanded && (
+                <button
+                    onClick={() => setExpanded(false)}
+                    className="text-xs text-vd-accent-gold hover:text-vd-accent-gold-light mt-1 font-medium"
+                >
+                    See less
+                </button>
             )}
         </div>
     );
@@ -351,6 +377,7 @@ export function TicketDetailModal({
     allTickets = [],
     onCreateSubtask,
     onOpenChatMessage,
+    onSelectTicket,
 }: TicketDetailModalProps) {
     const [commentText, setCommentText] = useState('');
     const [commentImages, setCommentImages] = useState<UploadedFile[]>([]);
@@ -359,6 +386,10 @@ export function TicketDetailModal({
     const [toast, setToast] = useState<string | null>(null);
     const [isDraggingOver, setIsDraggingOver] = useState(false);
     const dragLeaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // AD-322: ref to the modal's root element so the paste handler can scope
+    // itself to the ticket-modal subtree (instead of listening on `document`,
+    // which leaked Brain Dump pastes into the ticket comment composer).
+    const modalRootRef = useRef<HTMLDivElement | null>(null);
     const [showAllStatuses, setShowAllStatuses] = useState(false);
     const [showMentionPopup, setShowMentionPopup] = useState(false);
     const commentTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -379,7 +410,7 @@ export function TicketDetailModal({
     const [editMissionId, setEditMissionId] = useState('');
     const [editWave, setEditWave] = useState('');
     const [editSession, setEditSession] = useState('');
-    // VD-191: Track images during edit mode (add/remove)
+    // Track images during edit mode (add/remove)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const [editImages, setEditImages] = useState<any[]>([]);
 
@@ -448,8 +479,8 @@ export function TicketDetailModal({
         return undefined;
     }, [desktopViewport, effectiveInset, activePlacement, terminalVisible]);
 
-    // Upload file helper for drag-drop and paste (VD-024)
-    // VD-191: Routes to editImages when in edit mode, commentImages otherwise
+    // Upload file helper for drag-drop and paste
+    // Routes to editImages when in edit mode, commentImages otherwise
     const uploadAndAdd = useCallback(async (files: File[]) => {
         if (files.length === 0) return;
         showToast(`Uploading ${files.length} file${files.length > 1 ? 's' : ''}...`);
@@ -486,7 +517,7 @@ export function TicketDetailModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isEditing]);
 
-    // Full-screen drag-drop handler (VD-024: drop anywhere adds to comment images)
+    // Full-screen drag-drop handler (drop anywhere adds to comment images)
     const handleModalDragOver = useCallback((e: React.DragEvent) => {
         e.preventDefault();
         e.stopPropagation();
@@ -496,7 +527,7 @@ export function TicketDetailModal({
 
     const handleModalDragLeave = useCallback((e: React.DragEvent) => {
         e.stopPropagation();
-        // VD-072 fix: timer-based dismiss — if no dragover fires within 150ms, the drag truly left
+        // fix: timer-based dismiss — if no dragover fires within 150ms, the drag truly left
         if (dragLeaveTimer.current) clearTimeout(dragLeaveTimer.current);
         dragLeaveTimer.current = setTimeout(() => setIsDraggingOver(false), 150);
     }, []);
@@ -511,11 +542,30 @@ export function TicketDetailModal({
         }
     }, [uploadAndAdd]);
 
-    // Global paste handler — paste images anywhere in modal adds to comment images (VD-023 + VD-024)
+    // Modal-scoped paste handler — paste images anywhere INSIDE the ticket
+    // modal adds to the comment images.
+    //
+    // AD-322: previously this was attached to `document` and fired for ANY
+    // Ctrl+V on the page. When the Brain Dump pane was open alongside an
+    // open ticket detail (a common combo — triage one, dump another), a paste
+    // intended for the chat composer ALSO got swallowed by the ticket modal,
+    // duplicating the screenshot into both surfaces.
+    //
+    // Fix: bind the listener to the modal's root element instead of document.
+    // The modal occupies the viewport (z-50 fixed inset-0), so pastes that
+    // target the ticket area still fire normally — but the Brain Dump panel
+    // sits at a higher z-index and its textarea pastes never bubble here.
+    // ChatPane's own paste handler is already textarea-scoped (AD-186 reopen),
+    // and NewTicketModal's global paste only mounts when its `open` is true
+    // (not when only the detail modal is open), so the user's "don't break
+    // ticket comment / board-paste / brain-dump-paste" constraints all hold.
     useEffect(() => {
         if (!open) return;
-        const handlePaste = (e: ClipboardEvent) => {
-            const items = e.clipboardData?.items;
+        const root = modalRootRef.current;
+        if (!root) return;
+        const handlePaste = (e: Event) => {
+            const ev = e as ClipboardEvent;
+            const items = ev.clipboardData?.items;
             if (!items) return;
             const files: File[] = [];
             for (let i = 0; i < items.length; i++) {
@@ -525,12 +575,12 @@ export function TicketDetailModal({
                 }
             }
             if (files.length > 0) {
-                e.preventDefault();
+                ev.preventDefault();
                 uploadAndAdd(files);
             }
         };
-        document.addEventListener('paste', handlePaste);
-        return () => document.removeEventListener('paste', handlePaste);
+        root.addEventListener('paste', handlePaste);
+        return () => root.removeEventListener('paste', handlePaste);
     }, [open, uploadAndAdd]);
 
     // Escape to close
@@ -650,13 +700,13 @@ export function TicketDetailModal({
         setEditMissionId(ticket.missionId || '');
         setEditWave(ticket.wave || '');
         setEditSession(ticket.session || '');
-        // VD-191: Initialize edit images from ticket
+        // Initialize edit images from ticket
         setEditImages([...ticket.images]);
         setIsEditing(true);
     };
 
     const handleSaveEdit = () => {
-        // VD-191: Save images along with title/description
+        // Save images along with title/description
         onUpdate(ticket.id, {
             title: editTitle,
             description: editDescription,
@@ -688,7 +738,7 @@ export function TicketDetailModal({
 
     const handleSubmitComment = async () => {
         if (!commentText.trim() && commentImages.length === 0) return;
-        if (submittingComment) return; // Prevent double-submit (VD-055)
+        if (submittingComment) return; // Prevent double-submit
         const pendingText = commentText;
         const pendingImages = commentImages;
         setSubmittingComment(true);
@@ -717,6 +767,7 @@ export function TicketDetailModal({
     return (
         <>
             <div
+                ref={modalRootRef}
                 className="fixed inset-0 z-50 flex items-end md:items-center justify-center"
                 style={modalViewportStyle}
                 onDragOver={handleModalDragOver}
@@ -726,7 +777,7 @@ export function TicketDetailModal({
                 {/* Backdrop */}
                 <div className={`absolute inset-0 bg-black/60 ${terminalVisible && desktopViewport ? '' : 'backdrop-blur-sm'}`} onClick={onClose} />
 
-                {/* Full-screen drag overlay (VD-024) */}
+                {/* Full-screen drag overlay */}
                 {isDraggingOver && (
                     <div className="absolute inset-0 z-[65] bg-vd-accent-gold/10 border-4 border-dashed border-vd-accent-gold/50 flex items-center justify-center pointer-events-none">
                         <div className="bg-vd-bg-secondary/90 rounded-xl px-8 py-6 text-center shadow-xl">
@@ -737,7 +788,7 @@ export function TicketDetailModal({
                     </div>
                 )}
 
-                {/* Toast (VD-023: near comment area for visibility) */}
+                {/* Toast (near comment area for visibility) */}
                 {toast && (
                     <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-[70] px-4 py-2 rounded-lg bg-vd-accent-gold/90 text-vd-bg-primary text-xs font-medium shadow-lg animate-in fade-in slide-in-from-bottom-2 duration-200">
                         {toast}
@@ -769,7 +820,7 @@ export function TicketDetailModal({
                                         ↻ Reopened {ticket.reopenCount}×
                                     </span>
                                 )}
-                                {/* Discussion/Normal toggle (VD-170) */}
+                                {/* Discussion/Normal toggle */}
                                 <button
                                     onClick={() => {
                                         const isDiscussion = ticket.ticketType === 'idea' || ticket.ticketType === 'discussion';
@@ -1188,11 +1239,12 @@ export function TicketDetailModal({
                             onUpdate={onUpdate}
                             allTickets={allTickets}
                             onCreateSubtask={onCreateSubtask}
+                            onSelectTicket={onSelectTicket}
                         />
 
 
                         {/* Ticket images / attachments */}
-                        {/* VD-191: In edit mode, show editImages with remove buttons + drop zone */}
+                        {/* In edit mode, show editImages with remove buttons + drop zone */}
                         {isEditing ? (
                             <div>
                                 <h4 className="text-xs text-vd-text-tertiary uppercase tracking-wider mb-2">Attachments</h4>
@@ -1311,7 +1363,7 @@ export function TicketDetailModal({
                                 <span>Session: <span className="text-vd-text-secondary">{ticket.session}</span></span>
                             )}
                             <span>
-                                Reporter: <span className="text-vd-text-secondary">{ticket.reporter}</span>
+                                Creator: <span className="text-vd-text-secondary">{getCreatorLabel(ticket as Ticket & { sourceMessageId?: string; createdByType?: 'human' | 'ai' | 'system' })}</span>
                                 {/* AD-186: chat-spawned tickets show "via chat" as a hyperlink that opens Brain Dump at the source message. */}
                                 {(ticket as Ticket & { sourceMessageId?: string }).sourceMessageId && onOpenChatMessage && (
                                     <>
@@ -1321,7 +1373,7 @@ export function TicketDetailModal({
                                             onClick={() => onOpenChatMessage((ticket as Ticket & { sourceMessageId?: string }).sourceMessageId!)}
                                             className="text-vd-accent-gold hover:underline"
                                             title="Open in Brain Dump"
-                                        >via chat</button>
+                                        >via Brain Dump {(ticket as Ticket & { sourceMessageId?: string }).sourceMessageId}</button>
                                     </>
                                 )}
                             </span>
@@ -1350,6 +1402,48 @@ export function TicketDetailModal({
                                 Delete
                             </button>
                         </div>
+
+                        {/* AD-347: verified change set. The pitch is "the AI says
+                            done but isn't — verify it." filesTouched is ground-truthed
+                            against `git diff` at done-time (in a git repo), so surface
+                            the file list with a provenance badge instead of leaving the
+                            receipt as prose only. */}
+                        {(() => {
+                            const exec = ticket.execution as TicketExecution | undefined;
+                            if (!exec || !Array.isArray(exec.filesTouched) || exec.filesTouched.length === 0) return null;
+                            return (
+                                <div className="rounded-md border border-vd-border bg-vd-bg-primary/40 p-3">
+                                    <div className="flex items-center justify-between gap-2 mb-2">
+                                        <h4 className="text-xs text-vd-text-tertiary uppercase tracking-wider">
+                                            Changed files ({exec.filesTouched.length})
+                                        </h4>
+                                        {exec.filesTouchedSource === 'git-diff' ? (
+                                            <span
+                                                className="inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2 py-0.5 text-[10px] font-medium text-green-400"
+                                                title="Verified: this file list was ground-truthed against `git diff` between the run baseline and HEAD, not taken on the agent's word."
+                                            >
+                                                <span className="h-1.5 w-1.5 rounded-full bg-green-400" />
+                                                verified against git diff
+                                            </span>
+                                        ) : (
+                                            <span
+                                                className="inline-flex items-center gap-1 rounded-full bg-vd-bg-tertiary px-2 py-0.5 text-[10px] font-medium text-vd-text-tertiary"
+                                                title="Agent-reported — not ground-truthed (the project isn't a git repo, or no run baseline was captured)."
+                                            >
+                                                agent-reported
+                                            </span>
+                                        )}
+                                    </div>
+                                    <ul className="space-y-0.5">
+                                        {exec.filesTouched.map((file: string, i: number) => (
+                                            <li key={`${file}-${i}`} className="font-mono text-[11px] text-vd-text-secondary truncate" title={file}>
+                                                {file}
+                                            </li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            );
+                        })()}
 
                         {/* Divider */}
                         <hr className="border-vd-border" />
@@ -1519,16 +1613,38 @@ export function TicketDetailModal({
 // `+ New sub-task` shortcut that creates a fresh ticket with this ticket
 // pre-filled as parent. Bidirectional bookkeeping happens server-side in
 // the PATCH handler.
+// AD-251: status pill colors mirror the kanban-column accents so a glance
+// at the linked panel reads the same as a glance at the board. Kept inline
+// (no shared map) to avoid a circular import on FeedbackBoard's column
+// config — the values are stable across the AI-allowed status set.
+const LINKED_STATUS_STYLE: Record<string, string> = {
+    backlog: 'bg-rose-500/15 text-rose-300 border-rose-400/25',
+    todo: 'bg-amber-500/15 text-amber-300 border-amber-400/25',
+    reopen: 'bg-purple-500/15 text-purple-300 border-purple-400/25',
+    done: 'bg-emerald-500/15 text-emerald-300 border-emerald-400/25',
+    reviewed: 'bg-sky-500/15 text-sky-300 border-sky-400/25',
+    observe: 'bg-cyan-500/15 text-cyan-300 border-cyan-400/25',
+    deferred: 'bg-slate-500/15 text-slate-300 border-slate-400/25',
+};
+const LINKED_PRIORITY_STYLE: Record<string, string> = {
+    low: 'text-slate-400',
+    medium: 'text-amber-400',
+    high: 'text-orange-400',
+    critical: 'text-red-400',
+};
+
 function LinkedTicketsPanel({
     ticket,
     onUpdate,
     allTickets = [],
     onCreateSubtask,
+    onSelectTicket,
 }: {
     ticket: Ticket;
     onUpdate: (id: string, updates: Partial<Ticket>) => void;
-    allTickets?: Pick<Ticket, 'id' | 'title' | 'status'>[];
+    allTickets?: Pick<Ticket, 'id' | 'title' | 'status' | 'priority' | 'ticketType'>[];
     onCreateSubtask?: (parentTicketId: string) => void;
+    onSelectTicket?: (ticketId: string) => void;
 }) {
     const [addKind, setAddKind] = useState<RelationKind>('subtask');
     const [searchTerm, setSearchTerm] = useState('');
@@ -1590,39 +1706,70 @@ function LinkedTicketsPanel({
             <h4 className="text-xs text-vd-text-tertiary uppercase tracking-wider mb-2">Linked Tickets</h4>
 
             {hasAny && (
-                <div className="space-y-2 mb-2">
+                // AD-251: list view (one row per linked ticket) instead of
+                // the prior chip view. Each row leads with a status pill so
+                // the reader can see at a glance which links are still open
+                // vs already shipped, and the whole row is clickable to
+                // switch the modal to that ticket. The chip view kept
+                // truncating titles and made it impossible to gauge whether
+                // a parent / sub-task was still in flight.
+                <div className="space-y-3 mb-2">
                     {RELATION_KINDS.filter(k => grouped[k].length > 0).map(kind => (
-                        // AD-193: relation kind label was too dim to read; bumped
-                        // size, weight, and accent color so the kind ("Sub-task
-                        // of", "Parent", "Blocks", etc.) is unmissable next to
-                        // the linked ticket chips.
-                        <div key={kind} className="flex flex-wrap items-center gap-1.5">
-                            <span className="text-[11px] font-semibold text-vd-accent-gold/80 uppercase tracking-wider min-w-[80px]">
+                        <div key={kind}>
+                            <div className="text-[10px] font-semibold text-vd-accent-gold/80 uppercase tracking-wider mb-1">
                                 {RELATION_LABEL[kind]}
-                            </span>
-                            {grouped[kind].map(rel => {
-                                const linkedTicket = ticketById.get(rel.ticketId.toUpperCase());
-                                return (
-                                    <span
-                                        key={`${rel.kind}:${rel.ticketId}`}
-                                        className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded bg-vd-bg-tertiary border border-vd-border text-vd-text-secondary max-w-full"
-                                        title={linkedTicket?.title || rel.ticketId}
-                                    >
-                                        <span className="font-mono shrink-0">{rel.ticketId}</span>
-                                        {linkedTicket?.title && (
-                                            <span className="truncate text-vd-text-tertiary max-w-[200px]">— {linkedTicket.title}</span>
-                                        )}
-                                        <button
-                                            type="button"
-                                            onClick={() => handleRemove(rel)}
-                                            className="text-vd-text-tertiary hover:text-red-400 leading-none shrink-0"
-                                            title="Remove link"
+                            </div>
+                            <ul className="space-y-1">
+                                {grouped[kind].map(rel => {
+                                    const linkedTicket = ticketById.get(rel.ticketId.toUpperCase());
+                                    const status = linkedTicket?.status || 'unknown';
+                                    const priority = linkedTicket?.priority;
+                                    const statusClass = LINKED_STATUS_STYLE[status] || 'bg-vd-bg-tertiary text-vd-text-tertiary border-vd-border';
+                                    const priorityClass = priority ? LINKED_PRIORITY_STYLE[priority] : '';
+                                    const isClickable = !!onSelectTicket && !!linkedTicket;
+                                    return (
+                                        <li
+                                            key={`${rel.kind}:${rel.ticketId}`}
+                                            className={
+                                                'group/linked flex items-center gap-2 px-2 py-1.5 rounded border border-vd-border bg-vd-bg-tertiary/50 ' +
+                                                (isClickable ? 'cursor-pointer hover:bg-vd-bg-tertiary hover:border-vd-accent-gold/40' : '')
+                                            }
+                                            onClick={() => { if (isClickable) onSelectTicket!(rel.ticketId.toUpperCase()); }}
+                                            role={isClickable ? 'button' : undefined}
+                                            tabIndex={isClickable ? 0 : undefined}
+                                            onKeyDown={e => {
+                                                if (!isClickable) return;
+                                                if (e.key === 'Enter' || e.key === ' ') {
+                                                    e.preventDefault();
+                                                    onSelectTicket!(rel.ticketId.toUpperCase());
+                                                }
+                                            }}
+                                            title={linkedTicket ? `Open ${rel.ticketId}` : `Linked ticket ${rel.ticketId} not loaded`}
                                         >
-                                            ×
-                                        </button>
-                                    </span>
-                                );
-                            })}
+                                            <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide shrink-0 ${statusClass}`}>
+                                                {status}
+                                            </span>
+                                            <span className="font-mono text-[11px] text-vd-text-secondary shrink-0">{rel.ticketId}</span>
+                                            <span className="text-[12px] text-vd-text-primary flex-1 truncate">
+                                                {linkedTicket?.title || <span className="italic text-vd-text-tertiary">(not loaded)</span>}
+                                            </span>
+                                            {priority && (
+                                                <span className={`text-[10px] font-semibold uppercase tracking-wide shrink-0 ${priorityClass}`} title="Priority">
+                                                    {priority}
+                                                </span>
+                                            )}
+                                            <button
+                                                type="button"
+                                                onClick={e => { e.stopPropagation(); handleRemove(rel); }}
+                                                className="text-vd-text-tertiary hover:text-red-400 leading-none shrink-0 opacity-0 group-hover/linked:opacity-100 transition-opacity"
+                                                title="Remove link"
+                                            >
+                                                ×
+                                            </button>
+                                        </li>
+                                    );
+                                })}
+                            </ul>
                         </div>
                     ))}
                 </div>

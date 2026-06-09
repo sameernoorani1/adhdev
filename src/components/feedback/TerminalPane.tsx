@@ -1,6 +1,8 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { getSessionToken, fetchWithAdhdevToken, invalidateSessionToken } from '@/lib/api/sessionToken';
+import { AgentLauncherMenu } from './AgentLauncherMenu';
 
 const WS_URL = 'ws://localhost:3112';
 const SIZE_KEY = 'adhdev-terminal-size';
@@ -134,6 +136,9 @@ interface TerminalPaneProps {
     onToggleFullscreen?: () => void;
     sidebarPad?: string;
     order?: number;
+    // AD-335: bumped to fling the agent-launcher menu open (from the board's
+    // "connect your agent" coachmark) so the user lands on the agent picker.
+    launcherOpenSignal?: number;
     // AD-144 reopen: stay mounted across pane toggles so xterm's 10k-line
     // scrollback doesn't evaporate every time the user closes and reopens the
     // pane. When hidden, the outer container uses display:none; the xterm
@@ -142,7 +147,7 @@ interface TerminalPaneProps {
     hidden?: boolean;
 }
 
-export function TerminalPane({ onClose, placement, onPlacementChange, activeProjectId, activeProjectName, isFullscreen, onToggleFullscreen, sidebarPad, order, hidden = false }: TerminalPaneProps) {
+export function TerminalPane({ onClose, placement, onPlacementChange, activeProjectId, activeProjectName, isFullscreen, onToggleFullscreen, sidebarPad, order, launcherOpenSignal, hidden = false }: TerminalPaneProps) {
     const containerRef = useRef<HTMLDivElement>(null);
     const outerRef = useRef<HTMLDivElement>(null);
     // AD-150 v2: keep a handle on the xterm instance itself so the theme-change
@@ -155,11 +160,40 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
     // pane transitions from hidden → visible (cols/rows measured zero while
     // display:none, so xterm ends up tiny until we refit).
     const fitAddonRef = useRef<{ fit: () => void } | null>(null);
+    // AD-155 reopen #2: timestamp of the last incoming PTY chunk. The resize
+    // debounce reads this to defer the WS resize + Ctrl+L until the agent's
+    // output stream quiesces — mid-stream resizes are what produced the
+    // character-drop signature documented on this ticket.
+    const lastOutputAtRef = useRef<number>(0);
     const [connected, setConnected] = useState(false);
     const [isFocused, setIsFocused] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [showResetModal, setShowResetModal] = useState(false);
     const [showPlacementMenu, setShowPlacementMenu] = useState(false);
+    // AD-246: Claude Code's CLI condenses multi-line pastes into a tiny
+    // "[Pasted text #N +M lines]" placeholder, which made it look like Ctrl+V
+    // did nothing — so the user mashed Ctrl+V repeatedly and ended up with a
+    // pile of stacked pastes. This toast surfaces the result of the paste
+    // outside the xterm canvas so the feedback is unambiguous. Cleared via a
+    // timestamped tag check so a fresh paste during the fade doesn't get
+    // wiped by an earlier timeout.
+    // AD-246 reopen: the original toast told the user a paste landed but not
+    // *what* — so when xterm's select-to-copy grabbed stale terminal scrollback
+    // and that content paste-replays into the CLI, the mismatch was invisible
+    // until it had already been submitted. `preview` carries the first ~60
+    // chars of the pasted text so the user sees what's actually leaving the
+    // clipboard before they hit Enter.
+    const [recentPaste, setRecentPaste] = useState<{ lines: number; chars: number; tag: number; kind: 'ok' | 'empty'; preview?: string } | null>(null);
+    // AD-155 9th pass: after a placement (orientation) change, the agent's old
+    // hard-wrapped output stays in xterm's scrollback at its original col width
+    // — xterm.js does not reflow already-rendered cells, which is the structural
+    // limit the prior 8 passes documented. The Force redraw button in the
+    // header is the supported recovery, but users (Sameer) keep reporting they
+    // don't discover it. This briefly pulses the button after a real placement
+    // change so the recovery path becomes visible without auto-clearing the
+    // chat (auto-Ctrl+L was tried in passes 5-6 and explicitly removed in
+    // pass 8 because it wiped the visible conversation).
+    const [redrawHint, setRedrawHint] = useState(false);
     const [size, setSize] = useState(() => {
         if (typeof window === 'undefined') return 500;
         const saved = parseInt(localStorage.getItem(SIZE_KEY) || '', 10);
@@ -168,7 +202,6 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
     const sizeRef = useRef(size);
     const cleanupRef = useRef<(() => void) | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
-    const initCountRef = useRef(0); // Track reinit for reset
     const [startTime, setStartTime] = useState<Date | null>(null);
     const [sessionTime, setSessionTime] = useState('00:00');
 
@@ -245,28 +278,53 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
             await new Promise(r => setTimeout(r, 200));
         }
 
+        // AD-155 root cause: xterm was never told its PTY backend. On Windows
+        // ConPTY, line-wrapping/reflow on resize is handled differently from a
+        // unix PTY — without `windowsPty`, xterm mis-tracks wrapped lines, which
+        // is the "breaks the work instead of going to the new line" artifact the
+        // 10 prior *timing-nudge* passes could not fix. For a local-first tool the
+        // browser OS matches the server OS, so navigator gives the initial guess;
+        // the server's `ready` message corrects it authoritatively (and supplies
+        // the build number for ConPTY quirk handling). No effect on unix backends.
+        const isLikelyWindows = typeof navigator !== 'undefined'
+            && /^win/i.test(navigator.platform || '');
         const term = new Terminal({
             cursorBlink: true, fontSize: 13, scrollback: 10000,
+            cursorStyle: 'bar',
             fontFamily: '"Cascadia Code", "Fira Code", "Consolas", monospace',
             theme: computeXtermTheme(),
             allowProposedApi: true,
+            ...(isLikelyWindows ? { windowsPty: { backend: 'conpty' as const } } : {}),
         });
 
         const fitAddon = new FitAddon();
         term.loadAddon(fitAddon);
         fitAddonRef.current = fitAddon;
 
+        const sendBracketedPaste = (text: string) => {
+            const stripped = text.replace(/\x1b\[200~|\x1b\[201~/g, '');
+            if (!stripped) {
+                const tag = Date.now();
+                setRecentPaste({ lines: 0, chars: 0, tag, kind: 'empty' });
+                setTimeout(() => setRecentPaste(prev => (prev?.tag === tag ? null : prev)), 2500);
+                return;
+            }
+            if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+            wsRef.current.send(JSON.stringify({ type: 'input', data: '\x1b[200~' + stripped + '\x1b[201~' }));
+
+            const lines = stripped.split('\n').length;
+            const tag = Date.now();
+            const collapsed = stripped.replace(/\s+/g, ' ').trim();
+            const preview = collapsed.length > 60 ? collapsed.slice(0, 60) + '...' : collapsed;
+            setRecentPaste({ lines, chars: stripped.length, tag, kind: 'ok', preview });
+            setTimeout(() => setRecentPaste(prev => (prev?.tag === tag ? null : prev)), 4000);
+        };
+
         term.attachCustomKeyEventHandler((e) => {
-            // Block all Ctrl+V events (keydown AND keyup) to prevent double paste
-            if (e.ctrlKey && e.key === 'v') {
-                if (e.type === 'keydown') {
-                    e.preventDefault(); // Prevent browser paste event
-                    navigator.clipboard.readText().then(text => {
-                        if (wsRef.current?.readyState === WebSocket.OPEN)
-                            wsRef.current.send(JSON.stringify({ type: 'input', data: text }));
-                    }).catch(() => {});
-                }
-                return false; // block both keydown and keyup
+            // Let the browser emit ClipboardEvent; the capture paste handler
+            // below sends one bracketed payload and prevents xterm's raw paste.
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+                return false;
             }
             // Ctrl+C: copy selected text, or pass through to terminal (SIGINT)
             if (e.ctrlKey && e.key === 'c') {
@@ -304,10 +362,18 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         term.open(el);
         await new Promise(r => setTimeout(r, 50));
 
-        // Block browser paste events on the terminal container to prevent double paste.
-        // Our Ctrl+V handler already sends clipboard content via WS manually.
-        const pasteBlocker = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
-        el.addEventListener('paste', pasteBlocker, true);
+        // Own every browser paste path (Ctrl+V, Cmd+V, context menu, and
+        // textarea paste). xterm also listens for paste, so capture first,
+        // prevent its raw multiline send, and ship one bracketed WS payload.
+        const pasteHandler = (e: ClipboardEvent) => {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            sendBracketedPaste(e.clipboardData?.getData('text/plain') || '');
+            term.focus();
+        };
+        const pasteTargets = [el, term.element, term.textarea].filter(Boolean) as HTMLElement[];
+        pasteTargets.forEach(target => target.addEventListener('paste', pasteHandler, true));
 
         // Initial fit with stabilization
         fitAddon.fit();
@@ -321,8 +387,27 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         setTimeout(() => term.focus(), 800);
 
         // Connect WS with project ID
-        const wsUrl = activeProjectId ? `${WS_URL}?project=${encodeURIComponent(activeProjectId)}` : WS_URL;
-        const ws = new WebSocket(wsUrl);
+        // AD-204: include the session token as a query param. The terminal
+        // server gates the WS upgrade on it. We fetch the token synchronously
+        // via a cached promise, then connect — the cost is one extra HTTP
+        // round-trip on the very first connect (subsequent connects are cached).
+        const wsConnect = async () => {
+            const token = await getSessionToken();
+            const params = new URLSearchParams();
+            if (activeProjectId) params.set('project', activeProjectId);
+            if (token) params.set('token', token);
+            const qs = params.toString();
+            const wsUrl = qs ? `${WS_URL}?${qs}` : WS_URL;
+            return new WebSocket(wsUrl);
+        };
+        let ws: WebSocket;
+        try {
+            // Synchronous-ish: getSessionToken returns a cached Promise after the
+            // first call, so this `await` resolves immediately on every reconnect.
+            ws = await wsConnect();
+        } catch {
+            return; // mount aborted; nothing to clean up
+        }
         wsRef.current = ws;
 
         ws.onopen = () => {
@@ -339,17 +424,56 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         ws.onmessage = (event) => {
             try {
                 const msg = JSON.parse(event.data);
-                if (msg.type === 'output') term.write(msg.data);
-                else if (msg.type === 'clear') { term.clear(); term.reset(); }
+                if (msg.type === 'output') {
+                    // AD-155 reopen #2 fix: stamp every incoming output chunk so
+                    // the resize debounce can hold the PTY cols change until the
+                    // agent's stream quiesces. Mid-stream resizes are what
+                    // produced the character-drop signature ("I'll sto" /
+                    // " before push" overwrite).
+                    lastOutputAtRef.current = Date.now();
+                    term.write(msg.data);
+                } else if (msg.type === 'clear') { term.clear(); term.reset(); }
+                else if (msg.type === 'ready') {
+                    // AD-155: the server reports its real platform + Windows build.
+                    // Set xterm's ConPTY config authoritatively — corrects the
+                    // navigator guess and supplies the build number; a unix backend
+                    // ensures windowsPty is off (e.g. remote Windows browser → unix
+                    // server).
+                    try {
+                        if (msg.platform === 'win32') {
+                            term.options.windowsPty = {
+                                backend: 'conpty',
+                                buildNumber: typeof msg.osBuild === 'number' ? msg.osBuild : undefined,
+                            };
+                        } else if (msg.platform) {
+                            term.options.windowsPty = undefined;
+                        }
+                    } catch { /* options may be locked mid-write; ignore */ }
+                }
                 else if (msg.type === 'exit') { term.write('\r\n\x1b[33m[Session ended]\x1b[0m\r\n'); setConnected(false); }
             } catch {}
         };
-        ws.onclose = () => setConnected(false);
-        ws.onerror = () => { setError('Terminal server not running. Run: node server/terminal.mjs'); setConnected(false); };
+        // AD-204 follow-up: an upgrade rejection (401 from the terminal server's
+        // gate, e.g. token rotated after a server restart) surfaces as a close
+        // before onopen. Drop the cached token so the next reconnect attempt
+        // re-fetches a fresh one — without this, every reconnect after a token
+        // rotation keeps presenting the stale token until the page reloads.
+        let opened = false;
+        ws.addEventListener('open', () => { opened = true; });
+        ws.onclose = () => {
+            if (!opened) invalidateSessionToken();
+            setConnected(false);
+        };
+        ws.onerror = () => {
+            if (!opened) invalidateSessionToken();
+            setError('Terminal server not running. Run: node server/terminal.mjs');
+            setConnected(false);
+        };
 
         term.onData((data) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'input', data })); });
 
-        let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+        let fitTimer: ReturnType<typeof setTimeout> | null = null;
+        let pushTimer: ReturnType<typeof setTimeout> | null = null;
         let lastCols = term.cols;
         let lastRows = term.rows;
         // AD-155 reopen: track whether we've seen the first stable size so the
@@ -357,41 +481,88 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         // to whatever fitAddon computes for the container) doesn't trigger the
         // redraw path. Real cols changes only happen after this latches true.
         let initialResizeDone = false;
+
+        // AD-155 reopen #2: split the resize pipeline.
+        //   1. Local xterm fit runs on the existing 200 ms debounce so the user
+        //      sees the pane fill the new width immediately.
+        //   2. PTY resize + Ctrl+L are *quiesce-debounced*: held until 300 ms
+        //      pass without any incoming output chunk, capped at 5 s of total
+        //      deferral. Mid-stream cols changes were the load-bearing cause of
+        //      the character-drop overwrite ("I'll sto" / " before push") —
+        //      this gates the cols change to a moment when Claude is between
+        //      bursts so its absolute-position escapes don't land on the wrong
+        //      row.
+        const PTY_QUIESCE_MS = 300;
+        const PTY_DEFER_CAP_MS = 5000;
+
+        const sendPtyResize = () => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            const colsChanged = term.cols !== lastCols;
+            const rowsChanged = term.rows !== lastRows;
+            if (!colsChanged && !rowsChanged) return;
+            const colsActuallyChanged = colsChanged && initialResizeDone;
+            lastCols = term.cols;
+            lastRows = term.rows;
+            ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+            // AD-155 10th pass: Sameer's specific ask was "when you resize the
+            // shape it gets messed up; when the agent writes any new text in
+            // its history, then everything gets resized properly. Can we have
+            // it update the layout upon resize as well and not just on writing
+            // something?"
+            //
+            // The reason new agent text reflows everything is that Claude
+            // Code's Ink TUI re-renders its in-memory React tree on each
+            // input event (stdin chunk) and on SIGWINCH. On Windows ConPTY
+            // the SIGWINCH propagation through node-pty's resize() is not
+            // reliable, so Ink can sit on stale dimensions until the next
+            // stdin chunk arrives. We nudge it with an empty bracketed
+            // paste — the terminal strips the delimiters, Ink's stdin sees a
+            // zero-byte input event, Ink re-renders at the now-current cols
+            // without adding any visible content. Pure paste-mode noise; no
+            // characters are committed to Claude's input box.
+            //
+            // Pass 8 explicitly disabled auto-Ctrl+L because it cleared the
+            // visible chat — the empty paste is different (no clear escape,
+            // no visible bytes) and is the smallest valid nudge.
+            //
+            // Only fire on a *real* cols change (post-initial-fit). Rows-only
+            // changes don't affect wrapping so the nudge would be noise.
+            if (colsActuallyChanged) {
+                ws.send(JSON.stringify({ type: 'input', data: '\x1b[200~\x1b[201~' }));
+            }
+            initialResizeDone = true;
+        };
+
+        const schedulePtyResize = (deadline: number) => {
+            if (pushTimer) clearTimeout(pushTimer);
+            const tick = () => {
+                pushTimer = null;
+                const now = Date.now();
+                const sinceOutput = now - lastOutputAtRef.current;
+                if (sinceOutput >= PTY_QUIESCE_MS || now >= deadline) {
+                    sendPtyResize();
+                    return;
+                }
+                const wait = Math.min(PTY_QUIESCE_MS - sinceOutput, deadline - now);
+                pushTimer = setTimeout(tick, Math.max(50, wait));
+            };
+            // Initial check after the same 200 ms used for fit, so the common
+            // case (resize during agent quiet) fires once at the same cadence
+            // as before.
+            pushTimer = setTimeout(tick, 200);
+        };
+
         const obs = new ResizeObserver(() => {
-            // Properly debounce — cancel previous pending fit before scheduling a new one
-            if (resizeTimer) clearTimeout(resizeTimer);
-            resizeTimer = setTimeout(() => {
-                resizeTimer = null;
-                // Use rAF to ensure DOM layout has settled before fitting
+            if (fitTimer) clearTimeout(fitTimer);
+            fitTimer = setTimeout(() => {
+                fitTimer = null;
+                // rAF: let DOM layout settle before fitting.
                 requestAnimationFrame(() => {
                     try {
-                        if (term.element) {
-                            fitAddon.fit();
-                            const colsChanged = term.cols !== lastCols;
-                            const rowsChanged = term.rows !== lastRows;
-                            // Only send resize if dimensions actually changed
-                            if ((colsChanged || rowsChanged) && ws.readyState === WebSocket.OPEN) {
-                                lastCols = term.cols;
-                                lastRows = term.rows;
-                                ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-                                // AD-155 reopen: cols changes break absolute-positioned
-                                // TUIs (Claude Code uses cursor-position escapes for its
-                                // status bar / response blocks). Without an explicit
-                                // redraw, new output renders at new cols while the
-                                // previously-buffered cells stay at the old width — hence
-                                // the "two-column" / mid-line-gap artifacts when
-                                // dragging the pane splitter or collapsing the sidebar.
-                                // SIGWINCH alone is unreliable on Windows ConPTY, so push
-                                // an explicit Ctrl+L (\x0c) once the size has stabilised.
-                                // Skip the very first observation — that's just the
-                                // initial fit, not a user-driven change. Skip rows-only
-                                // changes too — wrapping is column-driven.
-                                if (initialResizeDone && colsChanged) {
-                                    ws.send(JSON.stringify({ type: 'input', data: '\x0c' }));
-                                }
-                                initialResizeDone = true;
-                            }
-                        }
+                        if (!term.element) return;
+                        fitAddon.fit();
+                        // Quiesce-debounce the PTY-side cols push.
+                        schedulePtyResize(Date.now() + PTY_DEFER_CAP_MS);
                     } catch {}
                 });
             }, 200);
@@ -399,8 +570,9 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         obs.observe(el);
 
         cleanupRef.current = () => {
-            if (resizeTimer) clearTimeout(resizeTimer);
-            el.removeEventListener('paste', pasteBlocker, true);
+            if (fitTimer) clearTimeout(fitTimer);
+            if (pushTimer) clearTimeout(pushTimer);
+            pasteTargets.forEach(target => target.removeEventListener('paste', pasteHandler, true));
             obs.disconnect();
             ws.close();
             term.dispose();
@@ -415,7 +587,7 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         if (!activeProjectId) return;
         const timer = setTimeout(initTerminal, 100);
         return () => { clearTimeout(timer); cleanupRef.current?.(); cleanupRef.current = null; };
-    }, [initTerminal, initCountRef.current, activeProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [initTerminal, activeProjectId]);
 
     // AD-144 reopen: when the pane transitions from hidden → visible, xterm
     // needs to refit because its cols/rows measured zero while display:none.
@@ -429,12 +601,10 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         return () => cancelAnimationFrame(raf);
     }, [hidden]);
 
-    // AD-155: orientation changes (placement flip, fullscreen toggle) cause
-    // xterm's existing scrollback to display at stale column positions —
-    // Claude Code's TUI uses absolute cursor positioning, so content rendered
-    // at the old width sits at wrong columns after a dramatic resize. Refit
-    // immediately, force xterm's own redraw, and send Ctrl+L to the running
-    // agent so it repaints its UI at the new dimensions.
+    // AD-155 / AD-270: orientation changes (placement flip, fullscreen toggle)
+    // can leave xterm painted at stale dimensions. Refit and refresh xterm's
+    // own viewport, but do not send Ctrl+L automatically; that clears many
+    // agent TUIs and made maximize/minimize look like the chat was wiped.
     const prevLayoutRef = useRef<string>('');
     useEffect(() => {
         const layout = `${placement}|${isFullscreen ? 'fs' : 'n'}`;
@@ -442,8 +612,21 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
             prevLayoutRef.current = layout;
             return;
         }
+        const prevPlacement = prevLayoutRef.current.split('|')[0];
+        const placementChanged = prevPlacement !== placement;
         if (prevLayoutRef.current === layout) return;
         prevLayoutRef.current = layout;
+
+        // AD-155 9th pass: surface the Force-redraw button after a true
+        // placement change (right ↔ left ↔ top ↔ bottom). Skip fullscreen
+        // toggles — those were flagged in pass 8 as too noisy. Only pulse
+        // when content has been written (lastOutputAtRef > 0), otherwise
+        // we'd hint at a redraw of an empty terminal on initial layout.
+        let fadeTimer: ReturnType<typeof setTimeout> | null = null;
+        if (placementChanged && lastOutputAtRef.current > 0) {
+            setRedrawHint(true);
+            fadeTimer = setTimeout(() => setRedrawHint(false), 8000);
+        }
 
         // Give CSS transition a beat to settle, then fit + refresh + prompt
         // the running agent to redraw.
@@ -452,20 +635,18 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
             try {
                 const term = termInstanceRef.current;
                 if (term) {
+                    if (wsRef.current?.readyState === WebSocket.OPEN) {
+                        wsRef.current.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+                    }
                     term.refresh?.(0, (term.rows ?? 1) - 1);
                     term.scrollToBottom?.();
                 }
             } catch {}
-            // Ctrl+L tells any TUI (Claude Code, bash, PowerShell) to redraw
-            // with the current dimensions. Only send if a run is likely in
-            // progress — avoids clearing the user's prompt line unnecessarily.
-            try {
-                if (wsRef.current?.readyState === WebSocket.OPEN) {
-                    wsRef.current.send(JSON.stringify({ type: 'input', data: '\x0c' }));
-                }
-            } catch {}
         }, 220);
-        return () => clearTimeout(t);
+        return () => {
+            clearTimeout(t);
+            if (fadeTimer) clearTimeout(fadeTimer);
+        };
     }, [placement, isFullscreen]);
 
     // AD-150 v2: when the user flips dark ↔ light (or switches skin), the CSS
@@ -501,22 +682,21 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
         setError(null);
         cleanupRef.current?.();
         cleanupRef.current = null;
-        initCountRef.current += 1;
-        // Force re-init by changing a dep... simplest: just call init directly
         setTimeout(initTerminal, 100);
     }, [initTerminal]);
 
     // ─── Reset session ───────────────────────────────────────────
     const handleResetSession = useCallback(() => {
         setShowResetModal(false);
-        // Kill current shell
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({ type: 'input', data: 'exit\r' }));
-        }
+        // Kill current shell and wipe persisted history server-side. Typing
+        // `exit` is not reliable when a TUI owns the prompt.
         // AD-144: explicit reset wipes the persisted history file too, so the
         // new shell truly starts blank — otherwise the on-disk scrollback from
         // the just-exited shell would replay into the fresh session.
-        fetch('http://localhost:3112/reset-history', {
+        // AD-204: forward the session token to the terminal server.
+        // fetchWithAdhdevToken transparently recovers from a rotated token
+        // (terminal-server restart) by retrying once with a fresh value.
+        fetchWithAdhdevToken('http://localhost:3112/reset-session', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ projectId: activeProjectId || undefined }),
@@ -538,6 +718,10 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
     // running TUI repaints its prompt cleanly. The shell process is NOT
     // killed — Reset Session is still the option for that.
     const handleForceRedraw = useCallback(() => {
+        // AD-155 9th pass: clicking the button consumes the post-placement
+        // pulse hint immediately so it doesn't keep nudging after the user
+        // has already acted on it.
+        setRedrawHint(false);
         try {
             const term = termInstanceRef.current;
             if (term) {
@@ -625,7 +809,7 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                     // left. Drop it in fullscreen so the terminal claims the
                     // full viewport width.
                     (isFullscreen
-                        ? `fixed inset-0 z-50 flex flex-col bg-vd-bg-primary`
+                        ? `fixed inset-0 z-[200] flex flex-col bg-vd-bg-primary`
                         : `flex flex-col bg-vd-bg-primary ${borderClass} border-vd-border relative flex-shrink-0`)
                     // AD-125: unambiguous focus indicator. Ring pulses in when keystrokes are live.
                     + (isFocused
@@ -675,16 +859,24 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                         )}
                         {/* AD-155 5th pass: Force redraw — recovers from
                             stale xterm scrollback after a resize without
-                            killing the shell. */}
+                            killing the shell.
+                            AD-155 9th pass: pulses after a placement change
+                            so the recovery path is discoverable when the
+                            user just rearranged the layout and the old
+                            output is now mis-sized. */}
                         <button
                             onClick={handleForceRedraw}
-                            className="text-[9px] px-1.5 py-0.5 rounded text-vd-text-tertiary hover:text-vd-text-secondary hover:bg-vd-bg-tertiary"
-                            title="Force redraw — clears stale scrollback and asks the running agent to repaint. Use when a resize left things looking broken."
+                            className={`text-[9px] px-1.5 py-0.5 rounded text-vd-text-tertiary hover:text-vd-text-secondary hover:bg-vd-bg-tertiary${redrawHint ? ' text-vd-accent-gold bg-vd-accent-gold/15 ring-1 ring-vd-accent-gold/40 adhdev-redraw-pulse' : ''}`}
+                            title={redrawHint
+                                ? 'Layout changed — click to redraw the terminal at the new size'
+                                : 'Force redraw — clears stale scrollback and asks the running agent to repaint. Use when a resize left things looking broken.'}
                         >
                             <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                                 <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.582m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                             </svg>
                         </button>
+                        {/* Agent launcher — click to start an installed agent or install a missing one */}
+                        <AgentLauncherMenu wsRef={wsRef} connected={connected} projectId={activeProjectId} openSignal={launcherOpenSignal} />
                         {/* Reset session */}
                         <button
                             onClick={() => setShowResetModal(true)}
@@ -758,21 +950,52 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                         </div>
                     </div>
                 ) : (
-                    <div
-                        ref={containerRef}
-                        className="flex-1"
-                        style={{ minHeight: 0, padding: '8px 8px 8px 12px' }}
-                        onClick={() => {
-                            // Focus the terminal when clicking anywhere in the pane
-                            termInstanceRef.current?.focus();
-                        }}
-                    />
+                    <div className="relative flex-1 flex flex-col min-h-0">
+                        <div
+                            ref={containerRef}
+                            className="adhdev-terminal-host flex-1 overflow-hidden"
+                            style={{ minHeight: 0, padding: '8px 18px 8px 12px' }}
+                            onClick={() => {
+                                // Focus the terminal when clicking anywhere in the pane
+                                termInstanceRef.current?.focus();
+                            }}
+                        />
+                        {/* AD-246: paste-confirmation toast. Lives outside the
+                            xterm canvas so the user sees something happened
+                            even when Claude Code condensed the paste into a
+                            tiny "[Pasted text #N]" placeholder.
+                            AD-246 reopen: bumped from 10px top-right to 12px
+                            top-center with a content preview, so the user can
+                            actually verify the clipboard had what they thought
+                            it had — not just that *some* paste landed. */}
+                        {recentPaste && (
+                            <div
+                                className={
+                                    'pointer-events-none absolute top-2 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-md text-[12px] font-medium shadow-lg transition-opacity max-w-[90%] ' +
+                                    (recentPaste.kind === 'ok'
+                                        ? 'bg-vd-accent-gold/25 text-vd-accent-gold border border-vd-accent-gold/40'
+                                        : 'bg-red-500/20 text-red-300 border border-red-500/40')
+                                }
+                            >
+                                {recentPaste.kind === 'ok' ? (
+                                    <span>
+                                        <span className="opacity-70">Pasted {recentPaste.lines} line{recentPaste.lines === 1 ? '' : 's'} ({recentPaste.chars} chars):</span>
+                                        {recentPaste.preview && (
+                                            <span className="ml-1.5 font-mono">&ldquo;{recentPaste.preview}&rdquo;</span>
+                                        )}
+                                    </span>
+                                ) : (
+                                    'Clipboard had no text — image paste isn’t supported in the terminal'
+                                )}
+                            </div>
+                        )}
+                    </div>
                 )}
             </div>
 
             {/* Reset confirmation modal */}
             {showResetModal && (
-                <div className="fixed inset-0 z-[60] flex items-center justify-center" onClick={() => setShowResetModal(false)}>
+                <div className="fixed inset-0 z-[220] flex items-center justify-center" onClick={() => setShowResetModal(false)}>
                     <div className="absolute inset-0 bg-black/50" />
                     <div className="relative bg-vd-bg-secondary border border-vd-border rounded-xl px-6 py-5 max-w-xs mx-4" onClick={e => e.stopPropagation()}>
                         <h3 className="text-sm font-semibold text-vd-text-primary mb-2">Reset Terminal Session?</h3>

@@ -1,0 +1,10 @@
+# Force contributors to pick a template (no blank issues).
+# Adds links that route off-topic asks elsewhere instead of into the tracker.
+blank_issues_enabled: false
+contact_links:
+  - name: Commercial licensing inquiry
+    url: mailto:commercial@adhdev.app
+    about: For companies that want to use ADHDev outside the AGPL terms.
+  - name: Security issue
+    url: mailto:sameernoorani@gmail.com
+    about: Please report security issues privately, not in a public issue.

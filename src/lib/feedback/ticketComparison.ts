@@ -95,11 +95,11 @@ export function parseExpectationSections(description: string): ParsedExpectation
     const rawNotes = cleanSectionText(parts[0].replace(/My Raw Notes:/i, '').replace(/-+\s*$/, ''));
     const merged = parts[1] ? cleanSectionText(parts[1]) : cleanSectionText(normalized);
 
-    // AD-012: prefer the new heading; fall back to the legacy one so existing
-    // tickets that were authored before the rename still parse correctly.
+    // AD-012: prefer the current heading; legacy alias retained so older
+    // tickets authored before the rename still parse correctly.
     const inferredIntent = cleanSectionText(
         extractSection(merged, 'What ADHDev should infer')
-        || extractSection(merged, 'What VibeDeck should infer'),
+        || extractSection(merged, 'What the board should infer'),
     );
     const mode = cleanSectionText(extractSection(merged, 'Mode'));
     const behaviorBullets = extractBullets(extractSection(merged, 'Behavior'));

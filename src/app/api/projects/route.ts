@@ -17,7 +17,8 @@ export async function GET(request: NextRequest) {
             projects: registry.projects,
             activeProjectId: active?.id || null,
         });
-    } catch {
+    } catch (err) {
+        console.error('[ADHDev] GET /api/projects error:', err);
         return NextResponse.json({ projects: [], activeProjectId: null });
     }
 }
@@ -41,7 +42,8 @@ export async function POST(request: NextRequest) {
         }
 
         return NextResponse.json({ error: 'Required: { path } or { switchTo }' }, { status: 400 });
-    } catch {
+    } catch (err) {
+        console.error('[ADHDev] POST /api/projects error:', err);
         return NextResponse.json({ error: 'Failed' }, { status: 500 });
     }
 }
@@ -54,7 +56,8 @@ export async function DELETE(request: NextRequest) {
         const removed = removeProject(id);
         if (!removed) return NextResponse.json({ error: 'Project not found' }, { status: 404 });
         return NextResponse.json({ removed: id });
-    } catch {
+    } catch (err) {
+        console.error('[ADHDev] DELETE /api/projects error:', err);
         return NextResponse.json({ error: 'Failed' }, { status: 500 });
     }
 }

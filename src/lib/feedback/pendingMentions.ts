@@ -25,7 +25,7 @@ function writeMentions(mentions: PendingMention[]): void {
 }
 
 /** Add a pending @mention when a human tags an AI agent in a comment.
- *  Includes context from the conversation trail — all human comments since the last AI comment (VD-052). */
+ *  Includes context from the conversation trail — all human comments since the last AI comment. */
 export function addPendingMention(
     ticketId: string,
     title: string,
@@ -37,7 +37,7 @@ export function addPendingMention(
     // Replace existing entry for this ticket + agent (latest mention wins)
     const filtered = mentions.filter(m => !(m.ticketId === ticketId && m.targetAgent === targetAgent));
 
-    // Build context: all human comments after the last AI comment (VD-052)
+    // Build context: all human comments after the last AI comment
     let context = commentContent;
     if (allComments && allComments.length > 1) {
         // Find last AI comment index

@@ -11,6 +11,9 @@ export interface AdhdevExecutionContract {
     mustCommentPlan: boolean;
     mustCommentCompletion: boolean;
     mustRespondToMentions: boolean;
+    mustPostTicketSpecificAnalysis: boolean;
+    mustResolveBareTicketReferences: boolean;
+    mustMeetDiscussionAnalysisQualityBar: boolean;
     mustKeepStatusAccurate: boolean;
     allowedAgentStatuses: string[];
     doneRequires: string[];
@@ -24,6 +27,9 @@ export function getDefaultExecutionContract(): AdhdevExecutionContract {
         mustCommentPlan: true,
         mustCommentCompletion: true,
         mustRespondToMentions: true,
+        mustPostTicketSpecificAnalysis: true,
+        mustResolveBareTicketReferences: true,
+        mustMeetDiscussionAnalysisQualityBar: true,
         mustKeepStatusAccurate: true,
         allowedAgentStatuses: ['todo', 'reopen', 'done'],
         doneRequires: ['ai_comment', 'execution_summary', 'files_touched', 'verification', 'success_result'],
@@ -56,9 +62,12 @@ export function buildExecutionContractText(
         `Execution contract v${contract.version}:`,
         '- Read the full ticket entry before acting.',
         '- Read all comments and activity on the ticket before acting.',
+        '- Treat a bare ticket id as a request to resolve the live full ticket entry, including comments, activity, images, and current execution state.',
         '- Add or update an AI plan comment before implementation.',
         '- Keep status and execution state accurate while working.',
         `- Reply in comments to ${userName}'s mentions on the ticket.`,
+        '- If asked for thoughts, findings, recommendations, analysis, or review on a ticket, post the substantive response as a ticket comment; terminal-only responses are incomplete.',
+        '- Discussion and analysis comments must address the ticket requirement directly, consider relevant prior AI comments, separate evidence from inference, compare options and tradeoffs, and give a recommendation or explicit blocker.',
         '- Add an AI completion or blocker comment before ending.',
         `- AI may only set statuses: ${contract.allowedAgentStatuses.join(', ')}.`,
         `- Done requires: ${contract.doneRequires.join(', ')}.`,
@@ -73,7 +82,7 @@ export function buildInlineContractNotice(
     contract: AdhdevExecutionContract = getDefaultExecutionContract(),
     userName: string = DEFAULT_USER_DISPLAY_NAME,
 ): string {
-    return `⚠️ AI EXECUTION CONTRACT v${contract.version} — MANDATORY. Before acting on this ticket: (1) Read ADHDEV.md in the project root (2) Read the FULL ticket entry including all comments and activity (3) Post a plan comment before implementation (4) Keep status and execution state accurate (5) Reply to ${userName}'s @mentions in comments (6) Post completion comment with summary, files_touched, verification (7) AI may only set status: ${contract.allowedAgentStatuses.join(', ')} (8) Done requires: ${contract.doneRequires.join(', ')} (9) Address the user as "${userName}" — never as "human"/"user" (10) Include in your Ack Block: ✅ ACK: Embedded Contract Read + ✅ ACK: ADHDev.MD Read`;
+    return `⚠️ AI EXECUTION CONTRACT v${contract.version} — MANDATORY. Before acting on this ticket: (1) Read ADHDEV.md in the project root (2) Read the FULL live ticket entry including all comments, activity, images, and current execution state (3) Treat a bare ticket id as a request to resolve that full live ticket context (4) Use POST /api/feedback/agent-claim before implementation so the live running state starts (5) Keep status and execution state accurate (6) Reply to ${userName}'s @mentions in comments (7) Post ticket-specific thoughts/findings/recommendations/analysis/review as ticket comments, not terminal-only (8) For discussion/analysis, address the requirement, prior AI comments, evidence, tradeoffs, and recommendation (9) Post completion comment with summary, files_touched, verification (10) AI may only set status: ${contract.allowedAgentStatuses.join(', ')} (11) Done requires: ${contract.doneRequires.join(', ')} (12) Address the user as "${userName}" — never as "human"/"user" (13) Include in your Ack Block: ✅ ACK: Embedded Contract Read + ✅ ACK: ADHDev.MD Read`;
 }
 
 export function buildAdhdevProtocol(prefix = 'AD', userName: string = DEFAULT_USER_DISPLAY_NAME): string {
@@ -99,6 +108,7 @@ ADHDev is the control plane for planning and tracking AI-assisted software work.
 Agents should read \`${ADHDEV_PROTOCOL_FILENAME}\` and \`.adhdev/board.json\` before acting.
 When \`.adhdev/board.json\` is large, do not read it blindly in full. Resolve only the relevant ticket, mission, or batch entries, or use targeted search/offset reads.
 For any specific referenced ticket, read the full ticket entry including its comments and activity before acting.
+A bare ticket id such as \`${prefix}-123\` is enough context to act: resolve the live ticket, read its full entry, and apply the user's request to that ticket.
 
 ## Core Objects
 
@@ -135,9 +145,22 @@ Rules:
 ## Commenting Rules
 
 - Comment before implementation with a plan.
+- For direct CLI work, claim the ticket through \`POST http://localhost:3111/api/feedback/agent-claim\` before implementation. That explicit claim opens the ticket's live running state; ordinary comments do not.
 - Comment after implementation with summary, files touched, and verification.
 - If a human mentions an AI in comments, agents should respond in comments rather than silently changing state.
+- If a request asks for thoughts, findings, recommendations, analysis, or review on a ticket, post the substantive response as a ticket comment and summarize it in terminal. Terminal-only responses are incomplete.
 - Comments should capture reasoning, not only outcomes.
+
+## Discussion And Analysis Quality
+
+When asked to comment with thoughts, findings, recommendations, analysis, review, or planning on a ticket, the agent's response must be useful as product/engineering judgment, not just a procedural update:
+
+- Address the actual ticket requirement or user concern directly.
+- Consider relevant earlier comments, including prior AI responses; say where you agree, disagree, or extend them.
+- Separate evidence from inference.
+- Compare viable options and tradeoffs.
+- Recommend a next action, or state the precise blocker that prevents a recommendation.
+- Do not let an apology, claim, receipt, or process explanation substitute for the requested analysis.
 
 ## Execution Contract
 
@@ -148,18 +171,30 @@ ${buildExecutionContractText(getDefaultExecutionContract(), userName)
     .map(line => `- ${line.replace(/^- /, '')}`)
     .join('\n')}
 
+### Receipt model — what's verified vs claimed
+
+Done-time execution metadata is a **structured receipt** of the run. Not every field carries the same weight; agents and reviewers should treat them differently:
+
+- **\`filesTouched\` — verified file list.** When the project is a git repo, the API ground-truths this on the AI's PATCH-to-done by running \`git diff\` against the baseline ref captured at run-start. The agent's self-reported list is replaced. \`execution.filesTouchedSource = 'git-diff'\` labels the verified case; \`'agent'\` labels the fallback (non-git project, missing baseline, or git failure).
+- **\`summary\` — agent-claimed.** Free-form prose. Not verified; trust calibrated to the agent's track record.
+- **\`verification\` — agent-claimed.** "Ran tsc clean", "vitest passing", "tested in browser" — these are agent claims about checks they ran. Useful as breadcrumbs; not ground-truthed by ADHDev.
+- **\`result\` — agent-claimed.** \`success\` / \`blocked\` / etc. The flag the agent set on itself.
+
+Reviewers reading a Done ticket can lean on the **file list** as the structured / verified portion of the receipt and treat the rest as the agent's claimed account, to be spot-checked.
+
 ## Chat Run Protocol
 
 The Brain Dump (\`.adhdev/chat.json\`) is a capture queue for raw thoughts. **Run Chat** triggers triage — board routing only, not engineering. Engineering on any spawned ticket happens later when that ticket is run.
 
 For each chat message with \`status === 'unaddressed'\`, follow this decision order — *exhaust earlier options before reaching for "create new"*:
 
-1. **Extends an existing ticket?** → \`COMMENT\` (drop a comment on the relevant ticket) or \`EDIT\` (PATCH description / fields).
-2. **Belongs with another message already triaged this run?** → \`MERGE\`: append the bullet/context to the ticket already created for the sibling message; do not spawn a duplicate.
-3. **Direct follow-up to a specific existing ticket?** → \`SUB-TASK\`: create with \`relations: [{kind: 'subtask', ticketId: '<parent>'}]\` so the parent's Linked panel surfaces it. Inverse is auto-mirrored — never set both sides.
-4. **Sibling of new tickets being spawned in this same run?** → set \`subtask\` of the originating epic on each (so they share a parent and the Linked panel groups them) — *not* a flat list of disconnected new tickets.
-5. **None of the above?** → \`CREATE\` standalone, but only after explicitly considering 1-4.
-6. **Vague / revisit later?** → \`noted\`.
+1. **Extends an existing OPEN ticket?** → \`COMMENT\` (drop a comment on the relevant ticket) or \`EDIT\` (PATCH description / fields).
+2. **Re-surfaces a previously-shipped ticket** (\`status: done\`) — i.e. the message reports the bug recurring, the feature regressed, or the fix didn't hold? → \`REOPEN\`: PATCH the ticket from \`done\` to \`reopen\`, AND post a comment that explicitly surfaces the **evidence**: source chat msg id (e.g. \`m-abc123\`), the quoted symptom, any attached screenshot, and what changed since the prior fix. Reopening **without evidence** is a redundant respawn dressed up as a state change — don't do that. **Only \`done\` is reopenable by AI.** \`reviewed\` / \`observe\` / \`deferred\` stay human-owned: if a chat message clearly relates to a \`reviewed\` ticket, post a COMMENT on that ticket flagging the recurrence + evidence and let ${userName} decide whether to re-open.
+3. **Belongs with another message already triaged this run?** → \`MERGE\`: append the bullet/context to the ticket already created for the sibling message; do not spawn a duplicate.
+4. **Direct follow-up to a specific existing ticket?** → \`SUB-TASK\`: create with \`relations: [{kind: 'subtask', ticketId: '<parent>'}]\` so the parent's Linked panel surfaces it. Inverse is auto-mirrored — never set both sides.
+5. **Sibling of new tickets being spawned in this same run?** → set \`subtask\` of the originating epic on each (so they share a parent and the Linked panel groups them) — *not* a flat list of disconnected new tickets.
+6. **None of the above?** → \`CREATE\` standalone, but only after explicitly considering 1-5.
+7. **Vague / revisit later?** → \`noted\`.
 
 **Tag taxonomy is closed.** Allowed values: \`bug\`, \`feature\`, \`polish\`, \`perf\`, \`infra\`, \`ai\`. The API rejects anything else on POST/PATCH with a 400. Tags describe *type*, not surface (use the title for surface) and not roadmap phase (that lives in \`wave\`/\`missionId\`).
 
@@ -243,6 +278,8 @@ function buildClaudeMdAdhdevBlock(): string {
 > **MANDATORY:** Read \`ADHDEV.md\` in the project root before acting on any ticket.
 > It defines the execution contract, workflow rules, and acknowledgement requirements.
 > Every ticket carries a \`contractVersion\` and \`_executionContract\` field — read them.
+> A bare ticket id is enough context: resolve the live ticket, read all comments/activity/images/current execution state, and record ticket-specific thoughts or recommendations as comments.
+> Discussion comments must address the ticket requirement, prior AI comments, evidence, tradeoffs, and recommendation; process notes alone are incomplete.
 
 - Board data: \`.adhdev/board.json\`
 - Protocol: \`ADHDEV.md\`
@@ -279,7 +316,11 @@ function ensureClaudeMdReference(projectRoot: string) {
     fs.writeFileSync(claudeMdPath, existing + separator + block + '\n', 'utf-8');
 }
 
-export function ensureAdhdevProtocol(projectRoot: string, prefix = 'AD') {
+export function ensureAdhdevProtocol(
+    projectRoot: string,
+    prefix = 'AD',
+    options: { writeClaudeMdRef?: boolean } = {},
+) {
     const protocolPath = path.join(projectRoot, ADHDEV_PROTOCOL_FILENAME);
     const userName = readUserDisplayName(projectRoot);
     const nextContent = buildAdhdevProtocol(prefix, userName);
@@ -291,7 +332,17 @@ export function ensureAdhdevProtocol(projectRoot: string, prefix = 'AD') {
         fs.writeFileSync(protocolPath, nextContent, 'utf-8');
     }
 
-    // TODO: re-enable after testing — ensureClaudeMdReference(projectRoot);
+    // AD-302: inject a CLAUDE.md ADHDev block so a fresh Claude Code session
+    // in a registered project knows the board exists even before any ticket
+    // is run (the per-run execution contract only fires when an agent is
+    // dispatched against a specific ticket). Gated to project-init only —
+    // running it from every readFeedback would race against users editing
+    // their own CLAUDE.md and would also re-append the auto-injected block
+    // to existing CLAUDE.md files that already had the same content
+    // hand-authored without the marker pair.
+    if (options.writeClaudeMdRef) {
+        ensureClaudeMdReference(projectRoot);
+    }
 
     return protocolPath;
 }

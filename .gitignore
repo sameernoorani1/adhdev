@@ -1,20 +1,15 @@
 node_modules/
 .next/
-.adhdev/uploads/
-.adhdev/terminal-history/
 .claude-tmp/
 *.tsbuildinfo
 
-# Board state — keep all internal product discussions out of the repo
-.adhdev/board.json
-.adhdev/chat.json
-.adhdev/config.json
+# Board state — local per-project data (board, brain-dump, config, uploads,
+# logs, terminal history, atomic-write temps). Changes on every action and
+# holds internal/private notes; the whole directory stays out of the repo.
+.adhdev/
 
 # Private strategy docs — never goes to the repo
 docs/
-
-# Atomic-write temp files
-.adhdev/board.json.tmp-*
 
 # System / env
 *.log
@@ -31,10 +26,20 @@ ADHDEV.md
 CLAUDE.md
 
 # Stray dev artifacts
-Codebase 1.zip
+Codebase*.zip
 .relates.txt
 .tags.txt
 *.bak
+*.adhdev_tmp_img*.webp
+board2.json
+adhdev-board-*.tgz
+next-env.d.zip
+.tmp-tgz-audit/
+
+# Per-ticket audit / report outputs (private, gitignored)
+audit-report.md
+build-check.md
+adhdev-overview.md
 ─────────────────────────────────────────────────────────────────
 
 # Per-user Claude Code permissions (shared settings.json, if any, stays tracked)

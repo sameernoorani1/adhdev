@@ -177,10 +177,18 @@ export function MissionPage({
                                     const waveCount = new Set(missionTickets.map(ticket => ticket.wave?.trim()).filter(Boolean)).size;
                                     const batchCount = batches.filter(batch => batch.ticketIds.some(ticketId => missionTickets.some(ticket => ticket.id === ticketId))).length;
                                     return (
-                                        <button
+                                        <div
                                             key={mission.id}
+                                            role="button"
+                                            tabIndex={0}
                                             onClick={() => onOpenMissionBoard(mission.id)}
-                                            className={`w-full text-left rounded-xl border p-4 transition-colors ${
+                                            onKeyDown={(event) => {
+                                                if (event.key === 'Enter' || event.key === ' ') {
+                                                    event.preventDefault();
+                                                    onOpenMissionBoard(mission.id);
+                                                }
+                                            }}
+                                            className={`w-full text-left rounded-xl border p-4 transition-colors cursor-pointer ${
                                                 isManaging || isActiveBoardMission
                                                     ? 'border-vd-accent-gold bg-vd-accent-gold/10'
                                                     : 'border-vd-border bg-vd-bg-tertiary/40 hover:bg-vd-bg-hover'
@@ -222,7 +230,7 @@ export function MissionPage({
                                                     Manage
                                                 </button>
                                             </div>
-                                        </button>
+                                        </div>
                                     );
                                 })}
                             </div>

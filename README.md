@@ -1,41 +1,84 @@
 # ADHDev
 
-AI Agent Control Plane for developers. Track, trigger, and review AI coding work from a single Kanban board.
+**The human context window is the real bottleneck.**
 
-## Quick Start
+ADHDev is the board that holds what your brain can't — when you're shipping software with AI. You queue work. The AI does it. You review. The board keeps everything straight.
+
+![ADHDev board](assets/Screenshots/main-screen.png)
+
+## Quick start
 
 ```bash
-npx adhdev init    # Initialize in your project
-npx adhdev start   # Open the board at localhost:3111
+npm install -g adhdev-board
+adhdev init
+adhdev start
 ```
 
-`adhdev init` creates `.adhdev/` plus `ADHDEV.md`, the shared operating protocol for humans and AI agents in the project.
+The board opens at `localhost:3111` and `.adhdev/` is created in your project. That's it.
 
 ## What it does
 
-- **Kanban board** for tracking AI agent work (backlog → todo → done → reviewed)
-- **One-click Run** — trigger Claude Code on any ticket from the board
-- **Live streaming** — watch AI responses flow into ticket comments
-- **Agent rules** — enforce transition gates (AI can't skip human review)
-- **File-based storage** — everything lives in `.adhdev/` in your project
+Four things your brain drops when an AI is doing the work:
 
-## For Claude Code users
+**Memory.** What the AI did yesterday is preserved — ticket by ticket, comment by comment, file by file. Open a ticket and you see the whole history. No re-explaining where you left off.
 
-ADHDev integrates with Claude Code via:
-- **Agent SDK** — run Claude Code programmatically from the board
-- **Hooks** — capture CLI activity back into tickets
-- **Agent Brief API** — `GET /api/agent-brief` returns prioritized work queue
+**Sequencing.** Work runs in the right order, not in random order. Tickets have status. Reopens get priority. The board enforces a queue so you're not picking what to look at next every five minutes.
 
-## API
+**Verification.** The AI doesn't get to mark its own homework. An agent can flip a ticket to *done* — but only you can move it to *reviewed*. And in a git repo, every "files touched" claim is ground-truthed against `git diff`, not taken on the agent's word. (Outside a git repo it falls back to the agent's self-report, labeled as such.)
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/tickets` | GET | Full board data |
-| `/api/tickets` | POST | Create ticket |
-| `/api/tickets` | PATCH | Update ticket |
-| `/api/tickets` | DELETE | Delete ticket |
-| `/api/tickets/:id/comments` | POST | Add comment |
-| `/api/upload` | POST | Upload file |
-| `/api/agent-claim` | POST | AI claims a ticket |
-| `/api/agent-brief` | GET | Prioritized work queue |
-| `/api/run` | POST | Trigger Claude Code on a ticket |
+**Chronology.** Reopens get the full history, no backwards-guessing. If a fix didn't hold, the agent picks up the ticket with every prior comment loaded — yours and the AI's — so it knows what was tried and what failed.
+
+## While the AI works, you keep working
+
+You queue the next ticket. Review the last one. Look at the bug from yesterday. The agent doesn't need you holding its hand. You don't have to sit and watch.
+
+## Who it's for
+
+- People shipping software with AI who don't think of themselves as engineers — product folks, designers, founders, indie builders.
+- People using Claude Code or another agent CLI who want work tracked without writing JIRA tickets by hand.
+- Anyone tired of "the AI said done, but it isn't."
+
+## Who it's not for
+
+- Engineers running ten parallel agents with git worktrees. You're already past this; you don't need it.
+- Enterprise compliance shops. No SSO, no audit log infrastructure, no SOC2.
+- Line-by-line code reviewers. The board surfaces what changed and what the AI claimed. If you read every byte of every commit anyway, this adds friction without value.
+
+## Requirements
+
+- Node.js 18+
+- [Claude Code](https://docs.anthropic.com/claude/docs/claude-code) for the one-click Run button. The board works without it — you just trigger your agent however you usually do.
+- Windows, macOS, or Linux
+
+## Local-first
+
+Your data stays in your repo. No accounts. No cloud. No telemetry about how you use the board.
+
+One exception: the app checks for new versions on startup so we can ship security fixes. That check is a single GET to a static manifest file. No user data, no board content, no analytics. Set `ADHDEV_NO_UPDATE_CHECK=1` to turn it off entirely.
+
+## Free vs paid
+
+ADHDev's local product is free. Forever.
+
+A hosted cloud tier is on the roadmap for teams that want a shared board across machines. The cloud tier is purely additive. It does not gate any feature that exists in the local product today.
+
+| Feature | OSS (free) | Cloud (coming) |
+|---|:---:|:---:|
+| Local Kanban board | ✅ | ✅ |
+| Run tickets through your agent CLI | ✅ | ✅ |
+| Codebase auto-scan, draft tickets | ✅ | ✅ |
+| Per-project local storage (`.adhdev/`) | ✅ | ✅ |
+| Multi-machine sync | — | ✅ |
+| Team boards, shared projects | — | ✅ |
+| Hosted runs (no local agent needed) | — | ✅ |
+
+## Links
+
+- [GitHub Issues](https://github.com/sameernoorani1/adhdev/issues)
+- [Contributing](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Self-hosting from source](SELF_HOSTING.md)
+
+## License
+
+[AGPL-3.0-or-later](LICENSE) — see [LICENSING.md](LICENSING.md) for the dual-licensing setup (open-source + commercial available).

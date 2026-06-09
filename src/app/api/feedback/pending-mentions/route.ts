@@ -34,7 +34,8 @@ export async function GET(request: Request) {
             count: pending.length,
             tickets: pending,
         });
-    } catch {
+    } catch (err) {
+        console.error('[ADHDev] GET /api/feedback/pending-mentions error:', err);
         return NextResponse.json({ error: 'Failed to check pending mentions' }, { status: 500 });
     }
 }

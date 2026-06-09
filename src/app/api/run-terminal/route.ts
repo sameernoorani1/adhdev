@@ -1,5 +1,10 @@
 import { NextRequest } from 'next/server';
-import { readFeedback, writeFeedback, resolveTicketById } from '@/lib/feedback/core';
+import { readFeedback, writeFeedback, withFeedbackLock, resolveTicketById, checkAdmin } from '@/lib/feedback/core';
+import { terminalAuthHeaders } from '@/lib/feedback/sessionToken';
+import { getCurrentGitSha } from '@/lib/feedback/gitDiff';
+import { getActiveProject, getProjectById } from '@/lib/feedback/registry';
+import { createRunRecord, markRunFailed, upsertRun } from '@/lib/feedback/runs';
+import { markRunSent } from '@/lib/feedback/runLifecycle';
 
 /**
  * POST /api/run-terminal
@@ -11,6 +16,8 @@ import { readFeedback, writeFeedback, resolveTicketById } from '@/lib/feedback/c
  * for execution within the terminal session.
  */
 export async function POST(request: NextRequest) {
+    const auth = await checkAdmin(request);
+    if (!auth.authorized) return auth.error!;
     try {
         const { ticketId, mode = 'claude-code' } = await request.json();
         if (!ticketId) return Response.json({ error: 'Required: ticketId' }, { status: 400 });
@@ -18,51 +25,63 @@ export async function POST(request: NextRequest) {
         // AD-141: scope reads and the downstream /execute call to the caller's
         // project so tabs on different boards don't cross-wire.
         const projectId = request.headers.get('x-adhdev-project');
-        const data = readFeedback(projectId);
-        const resolved = resolveTicketById(data, ticketId);
-        if (!resolved.ok) return Response.json({ error: resolved.error }, { status: resolved.status || 404 });
+        const runId = `run-${Date.now().toString(36)}-${String(ticketId).toLowerCase()}`;
+        const lockResult = await withFeedbackLock(projectId, () => {
+            const data = readFeedback(projectId);
+            const resolved = resolveTicketById(data, ticketId);
+            if (!resolved.ok) {
+                return { error: { message: resolved.error, status: resolved.status || 404 } };
+            }
 
-        const ticket = resolved.ticket!;
+            const ticket = resolved.ticket!;
+            const now = new Date().toISOString();
+            const idx = resolved.index!;
+            data.tickets[idx].comments = [
+                ...(data.tickets[idx].comments || []),
+                {
+                    id: `c-${Date.now().toString(36)}`,
+                    author: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
+                    authorType: 'ai',
+                    content: `**Claiming ticket.** Terminal run ${runId} declared for ${ticket.id}. Will inspect the ticket, work the request, and post a completion update here.`,
+                    images: [],
+                    createdAt: now,
+                },
+            ];
+            // AD-240: capture git HEAD as the diff baseline.
+            const project = getProjectById(projectId) || getActiveProject();
+            const startedRef = project ? (getCurrentGitSha(project.path) ?? undefined) : undefined;
+            const actor = mode === 'claude-code' ? 'Claude Code' : 'Terminal';
+            upsertRun(data, createRunRecord({
+                runId,
+                projectId,
+                ticketIds: [ticket.id],
+                agent: actor,
+                nowIso: now,
+                startedRef,
+                source: 'terminal-run',
+            }));
+            if (!data.tickets[idx].activity) data.tickets[idx].activity = [];
+            data.tickets[idx].activity.push({
+                action: 'claimed',
+                by: actor,
+                byType: 'ai',
+                at: now
+            });
+            data.tickets[idx].activity.push({
+                action: 'run_dispatching',
+                by: actor,
+                byType: 'ai',
+                at: now
+            });
+            data.tickets[idx].updatedAt = now;
+            writeFeedback(data, projectId);
+            return { ticket };
+        });
 
-        // Mark ticket as in-progress
-        const now = new Date().toISOString();
-        const idx = resolved.index!;
-        data.tickets[idx].comments = [
-            ...(data.tickets[idx].comments || []),
-            {
-                id: `c-${Date.now().toString(36)}`,
-                author: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
-                authorType: 'ai',
-                content: `**Claiming ticket.** Terminal run declared for ${ticket.id}. Will inspect the ticket, work the request, and post a completion update here.`,
-                images: [],
-                createdAt: now,
-            },
-        ];
-        data.tickets[idx].execution = {
-            runId: `run-${Date.now().toString(36)}`,
-            actor: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
-            actorType: 'ai',
-            status: 'in_progress',
-            startedAt: now,
-            updatedAt: now,
-            filesTouched: [],
-            verification: [],
-        };
-        if (!data.tickets[idx].activity) data.tickets[idx].activity = [];
-        data.tickets[idx].activity.push({
-            action: 'claimed',
-            by: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
-            byType: 'ai',
-            at: now
-        });
-        data.tickets[idx].activity.push({
-            action: 'execution_started',
-            by: mode === 'claude-code' ? 'Claude Code' : 'Terminal',
-            byType: 'ai',
-            at: now
-        });
-        data.tickets[idx].updatedAt = now;
-        writeFeedback(data, projectId);
+        if (lockResult.error) {
+            return Response.json({ error: lockResult.error.message }, { status: lockResult.error.status });
+        }
+        const ticket = lockResult.ticket!;
 
         // Build prompt from ticket context
         const prompt = [
@@ -100,14 +119,28 @@ export async function POST(request: NextRequest) {
         try {
             const response = await fetch('http://localhost:3112/execute', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ command, ticketId, projectId: projectId ?? undefined }),
+                // AD-204: forward the session token to the terminal server.
+                headers: { 'Content-Type': 'application/json', ...terminalAuthHeaders() },
+                body: JSON.stringify({ command, ticketId, projectId: projectId ?? undefined, runId }),
             });
 
             if (!response.ok) {
                 throw new Error(`Terminal server responded with ${response.status}`);
             }
+            await withFeedbackLock(projectId, () => {
+                const data = readFeedback(projectId);
+                // AD-269: prompt sent ≠ running. Keep the lease 'dispatching'
+                // until the agent claims; it self-expires if no claim arrives.
+                markRunSent(data, runId, new Date().toISOString());
+                writeFeedback(data, projectId);
+            });
         } catch (err) {
+            console.error('[ADHDev] POST /api/run-terminal terminal-server fallback:', err);
+            await withFeedbackLock(projectId, () => {
+                const data = readFeedback(projectId);
+                markRunFailed(data, runId, new Date().toISOString(), 'Terminal server not available. Run the command manually in your terminal.');
+                writeFeedback(data, projectId);
+            });
             // Fallback: return the command for manual execution
             return Response.json({
                 success: false,
@@ -124,6 +157,7 @@ export async function POST(request: NextRequest) {
             message: 'Command sent to terminal'
         });
     } catch (err) {
+        console.error('[ADHDev] POST /api/run-terminal error:', err);
         return Response.json({ error: String(err) }, { status: 500 });
     }
 }

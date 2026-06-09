@@ -72,6 +72,7 @@ export async function POST(request: NextRequest) {
 
         return NextResponse.json({ folderPath, gitInitialized });
     } catch (err) {
+        console.error('[ADHDev] POST /api/onboarding/create-folder error:', err);
         return NextResponse.json({ error: String(err) }, { status: 500 });
     }
 }

@@ -24,9 +24,6 @@ import type { Mission } from './MissionDetailModal';
 import { SettingsModal, initSkin } from './SettingsModal';
 import { TerminalPane, getSavedPlacement, type TerminalPlacement } from './TerminalPane';
 import { ActivityFeed } from './ActivityFeed';
-import { NotesApp } from '../notes/NotesApp';
-import { PhaseStatusBar } from './PhaseStatusBar';
-import { ProgressPage } from './ProgressPage';
 import { buildRunPrompt } from '@/lib/feedback/runPrompt';
 // AD-162: ambient completion signals (tab title + favicon + Notification + sound).
 import {
@@ -46,8 +43,16 @@ import { CoachMark } from './CoachMark';
 import { ErrorBoundary } from './ErrorBoundary';
 import { ChatPane } from './ChatPane';
 import { OnboardingWizard } from './OnboardingWizard';
+import { fetchWithAdhdevToken } from '@/lib/api/sessionToken';
+import {
+    getLatestCommentCursor,
+    LEGACY_READ_TICKETS_KEY,
+    migrateLegacyReadTickets,
+    READ_CURSORS_KEY,
+    type ReadTicketCursors,
+} from '@/lib/feedback/readState';
 
-// ADHDev brand icon — detailed brain with multi-directional arrows (VD-113, v2 SVG)
+// ADHDev brand icon — detailed brain with multi-directional arrows (v2 SVG)
 function ADHDevIcon({ className = 'w-6 h-6' }: { className?: string }) {
     return (
         <svg className={className} viewBox="0 0 200 194" fill="none">
@@ -70,7 +75,7 @@ function ADHDevIcon({ className = 'w-6 h-6' }: { className?: string }) {
     );
 }
 
-// ADHDev brand text with Press Start 2P pixel font (VD-113, VD-169)
+// ADHDev brand text with Press Start 2P pixel font
 function ADHDevBrand({ size = 'sm' }: { size?: 'sm' | 'xs' | 'base' }) {
     const textClass = size === 'base' ? 'text-sm' : size === 'xs' ? 'text-[7px]' : 'text-xs';
     return (
@@ -135,6 +140,12 @@ interface FeedbackData {
     columns: Record<string, ColumnConfig>;
     tickets: Ticket[];
     missions?: Mission[];
+    activeRuns?: Array<{
+        runId: string;
+        ticketIds: string[];
+        status: 'dispatching' | 'running' | 'finishing' | 'done' | 'blocked' | 'failed' | 'interrupted' | 'stale';
+        agent?: string;
+    }>;
 }
 
 const COLUMN_ORDER = ['backlog', 'todo', 'reopen', 'done', 'reviewed', 'observe', 'deferred'];
@@ -152,8 +163,8 @@ const STATUS_LABELS: Record<string, string> = {
     backlog: 'Backlog',
     todo: 'Todo',
     reopen: 'Reopen',
-    done: 'Done',
-    reviewed: 'Reviewed',
+    done: 'For Review',
+    reviewed: 'Closed',
     observe: 'Observe',
     deferred: 'Deferred',
 };
@@ -172,16 +183,16 @@ const PRIORITY_SORT_ORDER: Record<string, number> = {
     low: 3,
 };
 const FEEDBACK_POLL_MS = 2500;
-// AD-012: renamed from the legacy 'vibedeck-feedback-board' channel. Worst
-// case during the cutover is a stale tab missing one round of cross-tab
-// updates until it refreshes.
+// AD-012: cross-tab broadcast channel. Renamed in the past; worst case during
+// a cutover is a stale tab missing one round of cross-tab updates until refresh.
 const FEEDBACK_BROADCAST_CHANNEL = 'adhdev-feedback-board';
-
 type PriorityFilter = Ticket['priority'];
 type SortBy = 'default' | 'priority' | 'newest' | 'updated';
+type TimeFilter = 'all' | 'today' | '7d' | '30d';
 type TypeFilter = 'all' | 'normal' | 'discussion';
 type StackField = 'status' | 'wave' | 'session' | 'priority';
 type GroupField = 'none' | StackField;
+const HIDDEN_LANES_KEY = 'adhdev-hidden-status-lanes';
 
 interface StackGroup {
     id: string;
@@ -199,14 +210,35 @@ const STACK_FIELD_OPTIONS: Array<{ value: StackField; label: string }> = [
 ];
 
 const EMPTY_STACK_VALUE = '__empty__';
-const PRIORITY_GROUP_ORDER: Array<Ticket['priority']> = ['critical', 'high', 'medium', 'low'];
-const PRIORITY_GROUP_META: Record<Ticket['priority'], { label: string; colorBar: string }> = {
+// AD-320: "Unset" lane id for tickets whose priority is missing or not one
+// of the canonical four. dnd-kit needs a non-empty string id, so the lane is
+// keyed by '__unset_priority__' internally and translated back to '' when
+// the PATCH fires (the API treats falsy priority as "no priority set").
+const UNSET_PRIORITY_ID = '__unset_priority__';
+const PRIORITY_GROUP_ORDER: string[] = ['critical', 'high', 'medium', 'low', UNSET_PRIORITY_ID];
+const PRIORITY_GROUP_META: Record<string, { label: string; colorBar: string }> = {
     critical: { label: 'Critical', colorBar: 'bg-red-500' },
     high: { label: 'High', colorBar: 'bg-orange-500' },
     medium: { label: 'Medium', colorBar: 'bg-yellow-500' },
     low: { label: 'Low', colorBar: 'bg-blue-500' },
+    [UNSET_PRIORITY_ID]: { label: 'Unset', colorBar: 'bg-slate-500' },
 };
+const CANONICAL_PRIORITIES = new Set(['critical', 'high', 'medium', 'low']);
 const PLANNING_COLOR_BARS = ['bg-cyan-500', 'bg-sky-500', 'bg-teal-500', 'bg-fuchsia-500', 'bg-violet-500', 'bg-emerald-500'];
+
+function matchesTimeFilter(value: string | undefined | null, filter: TimeFilter): boolean {
+    if (filter === 'all') return true;
+    if (!value) return false;
+    const ts = new Date(value).getTime();
+    if (!Number.isFinite(ts)) return false;
+    if (filter === 'today') {
+        const start = new Date();
+        start.setHours(0, 0, 0, 0);
+        return ts >= start.getTime();
+    }
+    const days = filter === '7d' ? 7 : 30;
+    return ts >= Date.now() - days * 24 * 60 * 60 * 1000;
+}
 
 function parseSequenceLabel(value: string): number | null {
     const match = value.match(/(\d+)/);
@@ -230,6 +262,8 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     const [search, setSearch] = useState('');
     const [priorityFilter, setPriorityFilter] = useState<PriorityFilter[]>([]);
     const [statusFilter, setStatusFilter] = useState<string[]>([]);
+    const [createdTimeFilter, setCreatedTimeFilter] = useState<TimeFilter>('all');
+    const [updatedTimeFilter, setUpdatedTimeFilter] = useState<TimeFilter>('all');
     const [aiFilter, setAiFilter] = useState<'all' | 'yes' | 'no'>('all');
     const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
     const [missionFilter, setMissionFilter] = useState('all');
@@ -239,6 +273,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // whose `relations` includes a `parent` edge) from the kanban. Default
     // off so today's behaviour is preserved.
     const [hideSubtasks, setHideSubtasks] = useState(false);
+    const [hiddenStatusIds, setHiddenStatusIds] = useState<Set<string>>(() => {
+        if (typeof window === 'undefined') return new Set();
+        try {
+            const parsed = JSON.parse(localStorage.getItem(HIDDEN_LANES_KEY) || '[]');
+            return new Set(Array.isArray(parsed) ? parsed.filter((id) => COLUMN_ORDER.includes(id)) : []);
+        } catch { return new Set(); }
+    });
     const searchRef = useRef<HTMLInputElement>(null);
     const [sortBy, setSortBy] = useState<SortBy>('updated');
     const [stackBy, setStackBy] = useState<StackField>('status');
@@ -262,7 +303,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // Selection state for "Copy for AI" workflow (ephemeral — resets on reload)
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
-    // Batch state — loaded from API (FEEDBACK.json), synced via fetchData polling
+    // Batch state — loaded from API (.adhdev/board.json), synced via fetchData polling
     const [batches, setBatches] = useState<Batch[]>([]);
     const [showBatchPane, setShowBatchPane] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
@@ -273,17 +314,29 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     });
     const [showProjectSwitcher, setShowProjectSwitcher] = useState(false);
     const [switchingProjectId, setSwitchingProjectId] = useState<string | null>(null);
-    const [showAddProjectForm, setShowAddProjectForm] = useState(false);
+    // AD-286: "+ Add project" now launches the full OnboardingWizard (folder
+    // pick + agent + git posture) instead of the legacy 3-field inline form,
+    // matching the first-run flow.
+    const [showAddProjectWizard, setShowAddProjectWizard] = useState(false);
     // AD-128: flag a broken or outdated system `claude` so Run / manual REPL use isn't silently stuck.
     const [claudeHealth, setClaudeHealth] = useState<{ ok: boolean; version: string | null; outdated: boolean; error: string | null } | null>(null);
     const [claudeBannerDismissed, setClaudeBannerDismissed] = useState<boolean>(() => {
         if (typeof window === 'undefined') return false;
         return sessionStorage.getItem('adhdev-claude-banner-dismissed') === '1';
     });
-    const [newProjectPath, setNewProjectPath] = useState('');
-    const [newProjectName, setNewProjectName] = useState('');
-    const [newProjectPrefix, setNewProjectPrefix] = useState('AD');
-    const [isAddingProject, setIsAddingProject] = useState(false);
+    // AD-228: Install-in-progress state for the friendly first-run install card.
+    // Drives the re-probe loop that auto-dismisses the banner once `claude` is
+    // detected after the install completes (or after a 3-minute timeout).
+    const [claudeInstallInProgress, setClaudeInstallInProgress] = useState(false);
+    // AD-236: session-only tip dismissal. Replaces the previous permanent
+    // hideTips flip — that was destructive (one click, no undo from the UI).
+    // Now the tip popover button hides tips for the current session only;
+    // they return on next launch. Permanent dismissal still lives in
+    // Settings → "Hide tips" toggle for users who genuinely want them gone.
+    const [tipsHiddenThisSession, setTipsHiddenThisSession] = useState<boolean>(() => {
+        if (typeof window === 'undefined') return false;
+        return sessionStorage.getItem('adhdev-tips-hidden-session') === '1';
+    });
     // AD-011: configured user display name. Replaces hardcoded 'Sameer' in
     // optimistic comments + mission decision authoring. Refetched on project
     // switch so the per-project config is honoured.
@@ -317,14 +370,14 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         connected: boolean;
         agentStatus: 'inactive' | 'running';
         agentName: string | null;
-        requestStatus: 'idle' | 'running' | 'interrupted';
+        requestStatus: 'idle' | 'dispatching' | 'running' | 'interrupted';
     }>({
         connected: false,
         agentStatus: 'inactive',
         agentName: null,
         requestStatus: 'idle',
     });
-    const [activeExecutionIds, setActiveExecutionIds] = useState<Set<string>>(new Set());
+    const [terminalExecutionIds, setTerminalExecutionIds] = useState<Set<string>>(new Set());
     const [termPlacement, setTermPlacement] = useState<TerminalPlacement>('right');
     // AD-136: onboarding state + events, fetched from /api/onboarding.
     // AD-166: extended with wizard fields (wizardCompleted, wizardStep, etc.).
@@ -338,6 +391,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         folderSource?: 'existing' | 'new' | null;
         folderPath?: string | null;
         agentDetected?: string | null;
+        // AD-332: the agent the user picked in the wizard (id + variant + flags).
+        // Drives the one-click connectAgent launch.
+        preferredAgent?: { id: string; variantId: string; customFlags?: string } | null;
         populated?: boolean;
         gitPosture?: 'experiment' | 'github' | 'remote' | null;
         remoteUrl?: string | null;
@@ -346,13 +402,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // OR a `?wizard=onboarding` query-param escape hatch so the user can replay
     // the wizard without resetting state.
     const [showOnboardingWizard, setShowOnboardingWizard] = useState(false);
+    const [onboardingWizardStartStep, setOnboardingWizardStartStep] = useState<number | null>(null);
     const [onboardingEvents, setOnboardingEvents] = useState<Record<string, string>>({});
     // AD-130 fix: gate any onboarding UI until the initial GET completes, otherwise
     // the welcome modal flashes on every page load before the fetch resolves.
     const [onboardingLoaded, setOnboardingLoaded] = useState(false);
     const [showActivityFeed, setShowActivityFeed] = useState(false);
-    const [activeView, setActiveView] = useState<'board' | 'notes' | 'missions'>('board');
-    const [showProgressPage, setShowProgressPage] = useState(false);
+    const [activeView, setActiveView] = useState<'board' | 'missions'>('board');
     const broadcastRef = useRef<BroadcastChannel | null>(null);
     const selectedTicketIdRef = useRef<string | null>(null);
     const pendingMutationCountRef = useRef(0);
@@ -431,6 +487,29 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         toastTimer.current = setTimeout(() => setToast(null), duration);
     }, []);
 
+    const openFeedbackIssue = useCallback(() => {
+        const activeProject = projects.find(project => project.id === activeProjectId);
+        const body = [
+            '## What happened?',
+            '',
+            '',
+            '## What did you expect?',
+            '',
+            '',
+            '## ADHDev diagnostics',
+            '',
+            `- Project: ${activeProject?.name || 'Unknown'}`,
+            `- Tickets: ${data?.tickets.length ?? 0}`,
+            `- Active runs: ${data?.activeRuns?.filter(run => ['dispatching', 'running', 'finishing'].includes(run.status)).length ?? 0}`,
+            `- Browser: ${typeof navigator !== 'undefined' ? navigator.userAgent : 'Unknown'}`,
+        ].join('\n');
+        const params = new URLSearchParams({
+            title: 'Feedback: ',
+            body,
+        });
+        window.open(`https://github.com/sameernoorani1/adhdev/issues/new?${params.toString()}`, '_blank', 'noopener,noreferrer');
+    }, [activeProjectId, data?.activeRuns, data?.tickets.length, projects]);
+
     const toggleSelect = useCallback((id: string) => {
         setSelectedIds(prev => {
             const next = new Set(prev);
@@ -446,7 +525,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 stackBy === 'status'
                     ? ticket.status
                     : stackBy === 'priority'
-                        ? ticket.priority
+                        // AD-320: route non-canonical priorities (missing,
+                        // empty, legacy strings) into the Unset lane id.
+                        ? (CANONICAL_PRIORITIES.has(String(ticket.priority || '')) ? ticket.priority : UNSET_PRIORITY_ID)
                         : (stackBy === 'wave' ? ticket.wave : ticket.session)?.trim() || EMPTY_STACK_VALUE;
             return ticketGroupId === groupId;
         }).map(t => t.id);
@@ -489,7 +570,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         await syncBatches();
     }, [selectedIds, batches.length, syncBatches]);
 
-    // Plan batches from selected tickets — copies AI prompt to clipboard (VD-158)
+    // Plan batches from selected tickets — copies AI prompt to clipboard
     const handleBatchFromSelected = useCallback(async () => {
         if (selectedIds.size === 0) return;
         const ids = Array.from(selectedIds);
@@ -696,39 +777,67 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         }
     }, [showToast]);
 
-    const handleAddProject = useCallback(async () => {
-        const path = newProjectPath.trim();
-        const name = newProjectName.trim();
-        const prefix = (newProjectPrefix.trim() || 'AD').toUpperCase();
+    // AD-286: invoked when the wizard's "Add new project" Finish button fires.
+    // Creates the project, makes it active, applies the wizard's collected
+    // onboarding state to the *new* project (the wizard deferred persistence
+    // because the new project didn't exist mid-flow), and refreshes data.
+    const handleCreateProjectFromWizard = useCallback(async (state: {
+        folderSource?: 'existing' | 'new' | null;
+        folderPath?: string | null;
+        agentDetected?: string | null;
+        populated?: boolean;
+        gitPosture?: 'experiment' | 'github' | 'remote' | null;
+        remoteUrl?: string | null;
+        preferredAgent?: { id: string; variantId: string; customFlags?: string } | null;
+    }) => {
+        const path = (state.folderPath || '').trim();
         if (!path) {
             showToast('Project path is required.', 3000);
             return;
         }
-
-        setIsAddingProject(true);
         try {
             const res = await fetch('/api/projects', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path, name: name || undefined, prefix }),
+                body: JSON.stringify({ path }),
             });
             const result = await res.json();
             if (!res.ok || !result.project) {
                 showToast(result.error || 'Failed to add project.', 4000);
                 return;
             }
-
             const addedProject = result.project;
             setProjects(prev => {
                 const withoutExisting = prev.filter(project => project.id !== addedProject.id);
                 return [...withoutExisting, addedProject];
             });
             setActiveProjectId(addedProject.id);
-            setShowAddProjectForm(false);
             setShowProjectSwitcher(false);
-            setNewProjectPath('');
-            setNewProjectName('');
-            setNewProjectPrefix('AD');
+            setShowAddProjectWizard(false);
+
+            // Apply the wizard's collected state to the new (now active) project.
+            // registerProject already flips the active project in the registry,
+            // so the PATCH below lands on the new project's config.
+            try {
+                await fetch('/api/onboarding', {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        onboardingState: {
+                            wizardCompleted: true,
+                            wizardStep: 4,
+                            folderSource: state.folderSource,
+                            folderPath: state.folderPath,
+                            agentDetected: state.agentDetected,
+                            populated: state.populated,
+                            gitPosture: state.gitPosture,
+                            remoteUrl: state.remoteUrl,
+                            preferredAgent: state.preferredAgent,
+                        },
+                    }),
+                });
+            } catch { /* non-fatal — project still created */ }
+
             const feedbackRes = await fetch('/api/feedback');
             if (feedbackRes.ok) {
                 const nextData = await feedbackRes.json();
@@ -738,13 +847,11 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             showToast(`Added ${addedProject.name}.`, 3000);
         } catch {
             showToast('Failed to add project.', 4000);
-        } finally {
-            setIsAddingProject(false);
         }
-    }, [newProjectName, newProjectPath, newProjectPrefix, showToast]);
+    }, [showToast]);
 
     const formatBatchForCopy = useCallback((batch: Batch, index: number, total: number) => {
-        // Exclude done/reviewed/observe tickets from the copy (VD-065)
+        // Exclude done/reviewed/observe tickets from the copy
         const doneStatuses = new Set(['done', 'reviewed', 'observe', 'deferred']);
         const activeIds = batch.ticketIds.filter(id => {
             const t = data?.tickets.find(tk => tk.id === id);
@@ -805,20 +912,48 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         }
     }, [showToast]);
 
-    // Track which tickets the user has "read" (opened) — persisted in localStorage
-    const [readTickets, setReadTickets] = useState<Set<string>>(() => {
-        if (typeof window === 'undefined') return new Set();
+    // Track the exact latest comment the user has read per ticket.
+    const [readTicketCursors, setReadTicketCursors] = useState<ReadTicketCursors>(() => {
+        if (typeof window === 'undefined') return {};
         try {
-            const stored = localStorage.getItem('vd-read-tickets');
-            return stored ? new Set(JSON.parse(stored)) : new Set();
-        } catch { return new Set(); }
+            const stored = localStorage.getItem(READ_CURSORS_KEY);
+            return stored ? JSON.parse(stored) : {};
+        } catch { return {}; }
     });
 
-    const markTicketRead = useCallback((ticketId: string) => {
-        setReadTickets(prev => {
+    const markTicketRead = useCallback((ticket: Ticket) => {
+        const cursor = getLatestCommentCursor(ticket);
+        if (!cursor) return;
+        setReadTicketCursors(prev => {
+            if (prev[ticket.id] === cursor) return prev;
+            const next = { ...prev, [ticket.id]: cursor };
+            try { localStorage.setItem(READ_CURSORS_KEY, JSON.stringify(next)); } catch {}
+            return next;
+        });
+    }, []);
+
+    useEffect(() => {
+        if (!data || typeof window === 'undefined') return;
+        if (localStorage.getItem(READ_CURSORS_KEY)) return;
+        const legacyRaw = localStorage.getItem(LEGACY_READ_TICKETS_KEY);
+        if (!legacyRaw) return;
+
+        try {
+            const migrated = migrateLegacyReadTickets(data.tickets, JSON.parse(legacyRaw));
+            localStorage.setItem(READ_CURSORS_KEY, JSON.stringify(migrated));
+            setReadTicketCursors(migrated);
+        } catch {
+            localStorage.setItem(READ_CURSORS_KEY, JSON.stringify({}));
+        }
+    }, [data]);
+
+    const setLaneHidden = useCallback((status: string, hidden: boolean) => {
+        setHiddenStatusIds(prev => {
             const next = new Set(prev);
-            next.add(ticketId);
-            try { localStorage.setItem('vd-read-tickets', JSON.stringify(Array.from(next))); } catch {}
+            if (hidden) next.add(status);
+            else next.delete(status);
+            if (next.size >= COLUMN_ORDER.length) next.delete(status);
+            try { localStorage.setItem(HIDDEN_LANES_KEY, JSON.stringify(Array.from(next))); } catch {}
             return next;
         });
     }, []);
@@ -925,6 +1060,12 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         } catch { /* optimistic update already applied */ }
     }, []);
 
+    const openCodebaseScan = useCallback(() => {
+        setOnboardingWizardStartStep(3);
+        setOnboardingState(prev => ({ ...prev, wizardStep: 3, folderSource: 'existing' }));
+        setShowOnboardingWizard(true);
+    }, []);
+
     // AD-127: re-apply theme whenever the active project changes so each
     // project keeps its own skin + palette.
     useEffect(() => {
@@ -951,6 +1092,25 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // command so the user isn't debugging phantom "prompt ignored" issues (AD-133).
     useEffect(() => {
         let cancelled = false;
+        // AD-228: ?simulate-claude=not_found|outdated|broken|ok lets us exercise
+        // every banner state without uninstalling Claude Code. Critical for
+        // verifying the fresh-machine "never detected" path without needing a
+        // real fresh-machine sandbox each iteration.
+        if (typeof window !== 'undefined') {
+            const sim = new URLSearchParams(window.location.search).get('simulate-claude');
+            if (sim) {
+                const simulated =
+                    sim === 'not_found' ? { ok: false, version: null, outdated: false, error: 'not_found' as string | null } :
+                    sim === 'outdated' ? { ok: true, version: '1.0.128', outdated: true, error: null } :
+                    sim === 'broken' ? { ok: false, version: null, outdated: false, error: 'spawn_failed' as string | null } :
+                    sim === 'ok' ? { ok: true, version: '2.5.0', outdated: false, error: null } :
+                    null;
+                if (simulated) {
+                    setClaudeHealth(simulated);
+                    return () => { cancelled = true; };
+                }
+            }
+        }
         fetch('/api/claude-version')
             .then(r => r.json())
             .then(d => {
@@ -967,6 +1127,41 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             });
         return () => { cancelled = true; };
     }, []);
+
+    // AD-228: re-probe loop after the user kicks off the embedded install.
+    // Polls /api/claude-version every 5s for up to 3 minutes; once the probe
+    // returns ok+!outdated, the banner auto-dismisses by virtue of the
+    // updated claudeHealth state. Caps at 36 attempts to avoid running forever
+    // if the install fails silently.
+    useEffect(() => {
+        if (!claudeInstallInProgress) return;
+        let cancelled = false;
+        let attempts = 0;
+        const intervalId = setInterval(() => {
+            if (cancelled) return;
+            attempts++;
+            if (attempts > 36) {
+                setClaudeInstallInProgress(false);
+                return;
+            }
+            fetch('/api/claude-version')
+                .then(r => r.json())
+                .then(d => {
+                    if (cancelled) return;
+                    setClaudeHealth({
+                        ok: !!d.ok,
+                        version: d.version ?? null,
+                        outdated: !!d.outdated,
+                        error: d.error ?? null,
+                    });
+                    if (d.ok && !d.outdated) {
+                        setClaudeInstallInProgress(false);
+                    }
+                })
+                .catch(() => { /* keep polling */ });
+        }, 5000);
+        return () => { cancelled = true; clearInterval(intervalId); };
+    }, [claudeInstallInProgress]);
 
     // Poll explicit terminal runtime state for UI status.
     // AD-141: scope the probe to the current board's project so two tabs on
@@ -985,9 +1180,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     connected: !!d.connected,
                     agentStatus: d.agentStatus === 'running' ? 'running' : 'inactive',
                     agentName: d.agentName || null,
-                    requestStatus: d.requestStatus === 'running' || d.requestStatus === 'interrupted' ? d.requestStatus : 'idle',
+                    requestStatus: d.requestStatus === 'running' || d.requestStatus === 'dispatching' || d.requestStatus === 'interrupted' ? d.requestStatus : 'idle',
                 });
-                setActiveExecutionIds(new Set(Array.isArray(d.captureTicketIds) ? d.captureTicketIds : []));
+                const nextExecutionIds = new Set<string>(d.requestStatus === 'running' && Array.isArray(d.captureTicketIds) ? d.captureTicketIds : []);
+                setTerminalExecutionIds(prev => {
+                    if (prev.size === nextExecutionIds.size && Array.from(prev).every(id => nextExecutionIds.has(id))) return prev;
+                    return nextExecutionIds;
+                });
             }).catch(() => {
                 setTerminalRuntime({
                     connected: false,
@@ -995,7 +1194,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     agentName: null,
                     requestStatus: 'idle',
                 });
-                setActiveExecutionIds(new Set());
+                setTerminalExecutionIds(prev => prev.size === 0 ? prev : new Set());
             });
         };
         poll();
@@ -1007,6 +1206,24 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             document.removeEventListener('visibilitychange', onVisible);
         };
     }, [activeProjectId]);
+
+    const activeExecutionIds = useMemo(() => {
+        const ids = new Set<string>(terminalExecutionIds);
+        for (const run of data?.activeRuns || []) {
+            if (run.status !== 'running' && run.status !== 'finishing') continue;
+            for (const id of run.ticketIds || []) ids.add(String(id).toUpperCase());
+        }
+        return ids;
+    }, [data?.activeRuns, terminalExecutionIds]);
+
+    const activeRunStatusByTicket = useMemo(() => {
+        const statuses = new Map<string, 'dispatching' | 'running' | 'finishing'>();
+        for (const run of data?.activeRuns || []) {
+            if (run.status !== 'dispatching' && run.status !== 'running' && run.status !== 'finishing') continue;
+            for (const id of run.ticketIds || []) statuses.set(String(id).toUpperCase(), run.status);
+        }
+        return statuses;
+    }, [data?.activeRuns]);
 
     // AD-011: pull the configured display name on mount + project switch.
     // The fetch interceptor at the top of this component scopes the request
@@ -1024,6 +1241,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
 
     // When ticket data refreshes, clear read state for tickets with NEW comments since last read
     // (This resets the dot when AI posts a new comment after the user read it)
+    /*
     const lastSeenRef = useRef<Record<string, string>>({});
     useEffect(() => {
         if (!data) return;
@@ -1044,6 +1262,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             lastSeenRef.current[t.id] = lastTime;
         }
     }, [data, readTickets]);
+    */
 
     // Detect mobile
     useEffect(() => {
@@ -1065,22 +1284,95 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // AD-189: showPlanChoice removed — Plan Batches button moved into BatchPane.
     const [showFilters, setShowFilters] = useState(false);
     const filterRef = useRef<HTMLDivElement>(null);
+    const newTicketButtonRef = useRef<HTMLButtonElement | null>(null);
+    const brainDumpButtonRef = useRef<HTMLButtonElement | null>(null);
+    // AD-332: anchor for the "connect your agent" coachmark — the first thing a
+    // new user should do after the intro, but nothing pointed them at it before.
+    const terminalButtonRef = useRef<HTMLButtonElement | null>(null);
+    // AD-335: the connect coachmark routes the user to the in-terminal agent
+    // PICKER (where they choose + install/launch any agent) rather than auto-
+    // picking one. launcherOpenSignal is a counter we bump to fling that menu
+    // open. Dismissal uses the standard coachMarks['connect-agent'] flag (same
+    // as the other tips) so an onboarding reset clears it and the step reappears
+    // first — AD-335: a sessionStorage flag here leaked across resets and let the
+    // new-ticket / brain-dump tips jump the queue ahead of connecting an agent.
+    const [launcherOpenSignal, setLauncherOpenSignal] = useState(0);
+    const liveActiveRun = useMemo(() => {
+        const runs = data?.activeRuns || [];
+        return runs.find(run => run.status === 'running' || run.status === 'finishing')
+            || runs.find(run => run.status === 'dispatching')
+            || null;
+    }, [data?.activeRuns]);
+    const terminalRequestDispatching = terminalRuntime.requestStatus === 'dispatching';
+    const terminalRunDispatching = terminalRequestDispatching || liveActiveRun?.status === 'dispatching';
     const terminalRequestRunning = terminalRuntime.requestStatus === 'running';
+    const terminalRunRunning = terminalRequestRunning || liveActiveRun?.status === 'running' || liveActiveRun?.status === 'finishing';
     const terminalAgentRunning = terminalRuntime.agentStatus === 'running';
+    const terminalAgentName = terminalRunRunning && liveActiveRun?.agent
+        ? liveActiveRun.agent
+        : terminalRuntime.agentName || liveActiveRun?.agent || 'Agent';
     const terminalLabel = !terminalRuntime.connected
         ? 'Terminal'
-        : terminalRequestRunning
-            ? `⚡ ${terminalRuntime.agentName || 'Agent'}`
+        : terminalRunDispatching
+            ? 'Sending...'
+            : terminalRunRunning
+            ? `${terminalAgentName} Running`
             : terminalAgentRunning
-                ? `${terminalRuntime.agentName || 'Agent'} Ready`
+                ? `${terminalAgentName} Ready`
                 : 'Shell Ready';
     const terminalTitle = !terminalRuntime.connected
         ? 'Open terminal'
-        : terminalRequestRunning
-            ? `${terminalRuntime.agentName || 'Coding agent'} is working`
+        : terminalRunDispatching
+            ? 'Prompt sent; waiting for agent activity'
+            : terminalRunRunning
+            ? `${terminalAgentName} is working`
             : terminalAgentRunning
-                ? `${terminalRuntime.agentName || 'Coding agent'} is running and idle`
+                ? `${terminalAgentName} is running and idle`
                 : 'Shell is connected';
+    const markCoachMarkSeen = useCallback((key: string) => {
+        void patchOnboardingState({ coachMarks: { ...(onboardingState.coachMarks || {}), [key]: true } });
+    }, [onboardingState.coachMarks, patchOnboardingState]);
+
+    // AD-335: open the terminal and fling the agent PICKER open, so the user
+    // chooses + installs/launches any agent themselves (fixes "it only offered
+    // Codex"). It deliberately does NOT mark the step seen — opening the picker
+    // is the START of the step, not the end. The tutorial stays paused on
+    // "connect" until an agent is actually running (auto-advances via the
+    // terminalAgentRunning gate) or the user explicitly clicks "Later". Marking
+    // it seen here made the New Ticket tip pop the instant the terminal opened,
+    // before the user had installed/launched anything.
+    const openAgentPicker = useCallback(() => {
+        setShowTerminal(true);
+        setLauncherOpenSignal(n => n + 1);
+    }, []);
+    const boardCoachmarkHidden = !onboardingLoaded
+        || !onboardingState.welcomeSeen
+        || !!onboardingState.hideTips
+        || tipsHiddenThisSession
+        || isMobile
+        || !!selectedTicket;
+    const activeBoardCoachmark = useMemo(() => {
+        if (boardCoachmarkHidden) return null;
+        const coachMarks = onboardingState.coachMarks || {};
+        const ticketCount = data?.tickets?.length ?? 0;
+        // AD-332/AD-335: connecting the agent is step zero — Run does nothing
+        // without it. Show it FIRST and keep showing until an agent is actually
+        // running (not merely picked/installed) or the user dismisses it, so the
+        // rest of the tutorial never jumps the queue. Gated on the coachMarks
+        // flag (cleared by an onboarding reset) so a fresh user always sees it.
+        if (!terminalAgentRunning && !coachMarks['connect-agent']) return 'connect-agent';
+        if (!coachMarks['new-ticket']) return 'new-ticket';
+        if (!coachMarks['brain-dump-main']) return 'brain-dump-main';
+        if (!coachMarks.drag && dragAnchorReady && ticketCount >= 2) return 'drag';
+        return null;
+    }, [
+        boardCoachmarkHidden,
+        data?.tickets?.length,
+        dragAnchorReady,
+        onboardingState.coachMarks,
+        terminalAgentRunning,
+    ]);
+
     const [sidebarExpanded, setSidebarExpanded] = useState(() => {
         if (typeof window === 'undefined') return false;
         try { return localStorage.getItem('vd-sidebar-expanded') === 'true'; } catch { return false; }
@@ -1119,6 +1411,22 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         }
     }, [groupedBy, stackBy]);
 
+    // AD-222: when entering a mission, auto-switch the board's primary
+    // grouping to Wave (since waves are the mission's planned sequence).
+    // Leaving a mission (filter cleared back to 'all' or '__none__') reverts
+    // to the default Status grouping. Switching between missions counts as a
+    // re-entry, so each mission gets its Wave default. The user can manually
+    // override during a mission session — we only fire on transitions.
+    const prevMissionFilterRef = useRef(missionFilter);
+    useEffect(() => {
+        const prev = prevMissionFilterRef.current;
+        if (prev === missionFilter) return;
+        prevMissionFilterRef.current = missionFilter;
+        const isInMission = (v: string) => v !== 'all' && v !== '__none__';
+        if (isInMission(missionFilter)) setStackBy('wave');
+        else if (isInMission(prev)) setStackBy('status');
+    }, [missionFilter]);
+
     const handleTouchStart = useCallback((e: React.TouchEvent) => {
         touchStartX.current = e.touches[0].clientX;
         touchStartY.current = e.touches[0].clientY;
@@ -1128,14 +1436,17 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         const dy = e.changedTouches[0].clientY - touchStartY.current;
         // Only trigger if horizontal swipe > 60px and more horizontal than vertical
         if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
-            const idx = COLUMN_ORDER.indexOf(mobileTab);
-            if (dx < 0 && idx < COLUMN_ORDER.length - 1) {
-                switchTab(COLUMN_ORDER[idx + 1], 'left'); // swipe left → next
+            const visibleIds = stackBy === 'status'
+                ? COLUMN_ORDER.filter(status => !hiddenStatusIds.has(status))
+                : COLUMN_ORDER;
+            const idx = visibleIds.indexOf(mobileTab);
+            if (dx < 0 && idx < visibleIds.length - 1) {
+                switchTab(visibleIds[idx + 1], 'left'); // swipe left → next
             } else if (dx > 0 && idx > 0) {
-                switchTab(COLUMN_ORDER[idx - 1], 'right'); // swipe right → prev
+                switchTab(visibleIds[idx - 1], 'right'); // swipe right → prev
             }
         }
-    }, [mobileTab, switchTab]);
+    }, [hiddenStatusIds, mobileTab, stackBy, switchTab]);
 
     // Keyboard shortcuts: Escape to close modals/pane, N to new ticket, B to toggle batch pane, Ctrl+F to search
     useEffect(() => {
@@ -1195,17 +1506,12 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 e.preventDefault();
                 setShowBatchPane(prev => !prev);
             }
-            // P to open notes (when no modal is open and not in an input)
-            if (e.key === 'p' && !selectedTicket && !showNewTicket && !isInput) {
-                e.preventDefault();
-                setActiveView(activeView === 'notes' ? 'board' : 'notes');
-            }
         };
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
     }, [selectedTicket, showNewTicket, showBatchPane, showTerminal, termFullscreen]);
 
-    // Close filter popover on click outside (VD-111)
+    // Close filter popover on click outside
     useEffect(() => {
         if (!showFilters) return;
         const handleClick = (e: MouseEvent) => {
@@ -1217,7 +1523,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         return () => document.removeEventListener('click', handleClick);
     }, [showFilters]);
 
-    // Fetch data — with auto-retry on failure (VD-171)
+    // Fetch data — with auto-retry on failure
     const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const [fetchError, setFetchError] = useState(false);
     const fetchData = useCallback(async (options?: { force?: boolean }) => {
@@ -1284,7 +1590,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     // notifier owns document.title — splitting these would race (two effects
     // both writing document.title would fight on every poll tick).
     const projectNameForTitle = projects.find(p => p.id === activeProjectId)?.name ?? null;
-    const prevRequestStatusRef = useRef<'idle' | 'running' | 'interrupted'>('idle');
+    const prevRequestStatusRef = useRef<'idle' | 'dispatching' | 'running' | 'interrupted'>('idle');
     const lastActiveTicketsRef = useRef<string[]>([]);
     useEffect(() => {
         if (typeof document === 'undefined') return;
@@ -1357,12 +1663,16 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 ? missionFilter
                 : null;
 
-        fetch('http://localhost:3112/ui-context', {
+        // AD-204: forward the session token to the terminal server. The token
+        // is cached after first fetch so this doesn't add a round-trip per call.
+        // fetchWithAdhdevToken auto-recovers if the terminal server restarted
+        // and rotated the token (one 401 → invalidate cache → retry).
+        fetchWithAdhdevToken('http://localhost:3112/ui-context', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 activeProjectId,
-                view: showProgressPage ? 'progress' : showActivityFeed ? 'activity' : activeView,
+                view: showActivityFeed ? 'activity' : activeView,
                 missionFilter: missionFilter !== 'all' ? missionFilter : null,
                 selectedMissionId,
                 selectedTicketId: selectedTicket?.id || null,
@@ -1371,7 +1681,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 groupedBy,
                 showBatchPane,
                 showActivityFeed,
-                showProgressPage,
             }),
             signal: controller.signal,
         }).catch(() => {});
@@ -1387,7 +1696,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         selectedTicket,
         showActivityFeed,
         showBatchPane,
-        showProgressPage,
         stackBy,
     ]);
 
@@ -1436,8 +1744,8 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     }, [fetchData]);
 
     // DnD sensors
-    const pointerSensor = useSensor(PointerSensor, { activationConstraint: { distance: 5 } });
-    const touchSensor = useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } });
+    const pointerSensor = useSensor(PointerSensor, { activationConstraint: { distance: 3 } });
+    const touchSensor = useSensor(TouchSensor, { activationConstraint: { delay: 90, tolerance: 8 } });
     const keyboardSensor = useSensor(KeyboardSensor);
     const sensors = useSensors(pointerSensor, touchSensor, keyboardSensor);
 
@@ -1454,7 +1762,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     const filteredTickets = useMemo(() => {
         if (!data) return [];
         return data.tickets.filter((t) => {
-            // Search matches title, id, description, tags, or comments (VD-110)
+            // Search matches title, id, description, tags, or comments
             if (search) {
                 const q = search.toLowerCase();
                 const matchesTitle = t.title.toLowerCase().includes(q);
@@ -1466,7 +1774,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             }
             if (priorityFilter.length > 0 && !priorityFilter.includes(t.priority)) return false;
             if (statusFilter.length > 0 && !statusFilter.includes(t.status)) return false;
-            // aiFilter removed (VD-155) — batch selection replaced AI addressable
+            if (!matchesTimeFilter(t.createdAt, createdTimeFilter)) return false;
+            if (!matchesTimeFilter(t.updatedAt, updatedTimeFilter)) return false;
+            // aiFilter removed — batch selection replaced AI addressable
             // Type filter: normalize old values (issue→normal, idea→discussion)
             const tType = t.ticketType === 'idea' ? 'discussion' : t.ticketType === 'discussion' ? 'discussion' : 'normal';
             if (typeFilter === 'normal' && tType !== 'normal') return false;
@@ -1493,7 +1803,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             if (hideSubtasks && (t.relations || []).some(r => r.kind === 'parent')) return false;
             return true;
         });
-    }, [data, search, priorityFilter, statusFilter, aiFilter, typeFilter, missionFilter, batchFilter, batchedTicketIds, creatorFilter, hideSubtasks]);
+    }, [data, search, priorityFilter, statusFilter, createdTimeFilter, updatedTimeFilter, aiFilter, typeFilter, missionFilter, batchFilter, batchedTicketIds, creatorFilter, hideSubtasks]);
 
     // Sort function
     const sortTickets = useCallback((tickets: Ticket[]): Ticket[] => {
@@ -1532,16 +1842,20 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             return COLUMN_ORDER.map((status) => ({
                 id: status,
                 value: status,
-                label: data.columns[status]?.label || status,
+                label: STATUS_LABELS[status] || data.columns[status]?.label || status,
                 colorBar: COLUMN_COLORS[status] || 'bg-gray-500',
                 instruction: data.columns[status]?.aiInstruction || '',
             }));
         }
 
         if (stackBy === 'priority') {
+            // AD-320: PRIORITY_GROUP_ORDER ends with an Unset lane so tickets
+            // with a missing/legacy priority field stop disappearing from the
+            // view. The lane uses a sentinel id; drag-end translates it to ''
+            // when PATCHing the ticket.
             return PRIORITY_GROUP_ORDER.map((priority) => ({
                 id: priority,
-                value: priority,
+                value: priority === UNSET_PRIORITY_ID ? '' : priority,
                 label: PRIORITY_GROUP_META[priority].label,
                 colorBar: PRIORITY_GROUP_META[priority].colorBar,
                 instruction: '',
@@ -1567,6 +1881,12 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         return groups;
     }, [data, stackBy, waveOptions, sessionOptions]);
 
+    const visibleStackGroups = useMemo(() => (
+        stackBy === 'status'
+            ? stackGroups.filter(group => !hiddenStatusIds.has(group.id))
+            : stackGroups
+    ), [hiddenStatusIds, stackBy, stackGroups]);
+
     const groupedTickets = useMemo(() => {
         const grouped: Record<string, Ticket[]> = {};
         for (const group of stackGroups) grouped[group.id] = [];
@@ -1576,7 +1896,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 stackBy === 'status'
                     ? ticket.status
                     : stackBy === 'priority'
-                        ? ticket.priority
+                        // AD-320: non-canonical priorities fall into the Unset
+                        // lane (sentinel id) instead of vanishing from the view.
+                        ? (CANONICAL_PRIORITIES.has(String(ticket.priority || '')) ? ticket.priority : UNSET_PRIORITY_ID)
                         : (stackBy === 'wave' ? ticket.wave : ticket.session)?.trim() || '';
             const groupId = rawValue || EMPTY_STACK_VALUE;
             if (!grouped[groupId]) grouped[groupId] = [];
@@ -1591,11 +1913,11 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
     }, [filteredTickets, sortTickets, stackBy, stackGroups]);
 
     useEffect(() => {
-        if (stackGroups.length === 0) return;
-        if (!stackGroups.some(group => group.id === mobileTab)) {
-            setMobileTab(stackGroups[0].id);
+        if (visibleStackGroups.length === 0) return;
+        if (!visibleStackGroups.some(group => group.id === mobileTab)) {
+            setMobileTab(visibleStackGroups[0].id);
         }
-    }, [stackGroups, mobileTab]);
+    }, [visibleStackGroups, mobileTab]);
 
     // Collect all unique tags across all tickets
     const allTags = useMemo(() => {
@@ -1625,12 +1947,14 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         return s;
     }, [data]);
 
-    // Active filter count (VD-111)
+    // Active filter count
     const activeFilterCount = useMemo(() => {
         let count = 0;
         if (missionFilter !== 'all') count++;
         if (priorityFilter.length > 0) count++;
         if (statusFilter.length > 0) count++;
+        if (createdTimeFilter !== 'all') count++;
+        if (updatedTimeFilter !== 'all') count++;
         if (typeFilter !== 'all') count++;
         if (aiFilter !== 'all') count++;
         if (creatorFilter !== 'all') count++;
@@ -1640,11 +1964,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         if (groupedBy !== 'none') count++;
         if (hideSubtasks) count++;
         return count;
-    }, [missionFilter, priorityFilter, statusFilter, typeFilter, aiFilter, creatorFilter, batchFilter, sortBy, stackBy, groupedBy, hideSubtasks]);
+    }, [missionFilter, priorityFilter, statusFilter, createdTimeFilter, updatedTimeFilter, typeFilter, aiFilter, creatorFilter, batchFilter, sortBy, stackBy, groupedBy, hideSubtasks]);
 
     const clearAllFilters = useCallback(() => {
         setPriorityFilter([]);
         setStatusFilter([]);
+        setCreatedTimeFilter('all');
+        setUpdatedTimeFilter('all');
         setTypeFilter('all');
         setMissionFilter('all');
         setAiFilter('all');
@@ -1674,7 +2000,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 const overTicket = data.tickets.find((ticket) => ticket.id === overId);
                 if (!overTicket) return null;
                 if (stackBy === 'status') return overTicket.status;
-                if (stackBy === 'priority') return overTicket.priority;
+                // AD-320: when hovering over another ticket whose priority
+                // isn't canonical, bucket the drop into the Unset lane id so
+                // the comparison below matches the lane's sentinel.
+                if (stackBy === 'priority') {
+                    const p = String(overTicket.priority || '');
+                    return CANONICAL_PRIORITIES.has(p) ? overTicket.priority : UNSET_PRIORITY_ID;
+                }
                 return (stackBy === 'wave' ? overTicket.wave : overTicket.session)?.trim() || EMPTY_STACK_VALUE;
             })();
 
@@ -1683,12 +2015,18 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         const ticket = data.tickets.find((t) => t.id === ticketId);
         if (!ticket) return;
 
-        const normalizedValue = groupId === EMPTY_STACK_VALUE ? '' : groupId;
+        // AD-320: translate the Unset sentinel back to '' for the actual
+        // PATCH/optimistic update; the API stores priority as the bare value.
+        const normalizedValue = groupId === EMPTY_STACK_VALUE
+            ? ''
+            : groupId === UNSET_PRIORITY_ID
+                ? ''
+                : groupId;
         const currentValue =
             stackBy === 'status'
                 ? ticket.status
                 : stackBy === 'priority'
-                    ? ticket.priority
+                    ? (CANONICAL_PRIORITIES.has(String(ticket.priority || '')) ? ticket.priority : '')
                     : (stackBy === 'wave' ? ticket.wave : ticket.session)?.trim() || '';
 
         if (currentValue === normalizedValue) return;
@@ -1893,7 +2231,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
 
     const activeTicket = activeId ? data?.tickets.find((t) => t.id === activeId) ?? null : null;
 
-    // Board-level drag handlers (VD-024: drop files to create new ticket)
+    // Board-level drag handlers (drop files to create new ticket)
     const handleBoardDragOver = useCallback((e: React.DragEvent) => {
         // AD-185(c): also bail when the Inbox/chat panel is open — drops
         // there should land in the chat composer, not the board's
@@ -1922,13 +2260,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             setNewTicketDefaultStatus('backlog');
             setShowNewTicket(true);
         } else {
-            // Multiple files → show choice dialog (VD-024)
+            // Multiple files → show choice dialog
             setPendingDropFiles(files);
             setShowDropChoice(true);
         }
     }, []);
 
-    // VD-024: Create one ticket with all files
+    // Create one ticket with all files
     const handleDropChoiceSingle = useCallback(() => {
         setShowDropChoice(false);
         setDroppedFiles(pendingDropFiles);
@@ -1937,7 +2275,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         setShowNewTicket(true);
     }, [pendingDropFiles]);
 
-    // VD-024: Create separate tickets per file (auto-named)
+    // Create separate tickets per file (auto-named)
     const handleDropChoiceSeparate = useCallback(async () => {
         setCreatingSeparate(true);
         for (const file of pendingDropFiles) {
@@ -1999,34 +2337,77 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
             onDragLeave={handleBoardDragLeave}
             onDrop={handleBoardDrop}
         >
-            {/* AD-128: Claude Code upgrade banner — only when we detect a real problem */}
-            {!claudeBannerDismissed && claudeHealth && (!claudeHealth.ok || claudeHealth.outdated) && (
-                <div className={`flex-shrink-0 px-4 py-2 text-xs flex items-center gap-3 border-b ${claudeHealth.outdated ? 'bg-amber-500/10 border-amber-500/30 text-amber-300' : 'bg-red-500/10 border-red-500/30 text-red-300'}`}>
+            {/* AD-128 / AD-228: Claude Code health banner — three distinct states.
+                State A (`not_found`)  → friendly first-run install card (blue, helpful tone).
+                State B (`outdated`)   → amber upgrade banner with copy-to-clipboard (live REPL may be running).
+                State C (other errors) → red dismissable broken banner.
+                State D (working)      → no banner at all. */}
+            {!claudeBannerDismissed && claudeHealth && claudeHealth.error === 'not_found' && (
+                <div className="flex-shrink-0 px-4 py-2.5 text-xs flex items-center gap-3 border-b bg-blue-500/10 border-blue-500/30 text-blue-100">
+                    <svg className="w-5 h-5 flex-shrink-0 text-blue-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-3-3v6m9-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <div className="flex-1 leading-snug">
+                        <span className="font-semibold">To run agents on your tickets, install Claude Code.</span>
+                        {' '}
+                        <span className="opacity-90">
+                            {claudeInstallInProgress
+                                ? 'Installing — watch the terminal pane. This banner will dismiss itself once Claude Code is detected.'
+                                : 'One click — we\'ll run the install in the embedded terminal.'}
+                        </span>
+                    </div>
+                    <button
+                        disabled={claudeInstallInProgress}
+                        onClick={async () => {
+                            if (claudeInstallInProgress) return;
+                            setShowTerminal(true);
+                            setClaudeInstallInProgress(true);
+                            try {
+                                const r = await fetch('/api/install-claude', { method: 'POST' });
+                                if (!r.ok) {
+                                    const d = await r.json().catch(() => ({} as { error?: string; command?: string }));
+                                    try { await navigator.clipboard.writeText(d.command || 'npm i -g @anthropic-ai/claude-code@latest'); } catch {}
+                                    showToast(d.error || 'Auto-install failed — command copied; paste it in the terminal.', 7000);
+                                    setClaudeInstallInProgress(false);
+                                } else {
+                                    showToast('Installing Claude Code — banner will dismiss when it\'s detected.', 5000);
+                                }
+                            } catch {
+                                try { await navigator.clipboard.writeText('npm i -g @anthropic-ai/claude-code@latest'); } catch {}
+                                showToast('Could not reach the terminal server. Command copied — paste it in the terminal.', 8000);
+                                setClaudeInstallInProgress(false);
+                            }
+                        }}
+                        className="flex-shrink-0 px-3 py-1 rounded border border-blue-400/40 hover:bg-blue-400/15 disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-medium"
+                    >
+                        {claudeInstallInProgress ? 'Installing…' : 'Install Claude Code'}
+                    </button>
+                    <button
+                        onClick={() => {
+                            setClaudeBannerDismissed(true);
+                            try { sessionStorage.setItem('adhdev-claude-banner-dismissed', '1'); } catch {}
+                        }}
+                        className="flex-shrink-0 opacity-70 hover:opacity-100"
+                        title="Dismiss for this session"
+                    >
+                        &times;
+                    </button>
+                </div>
+            )}
+            {!claudeBannerDismissed && claudeHealth && claudeHealth.ok && claudeHealth.outdated && (
+                <div className="flex-shrink-0 px-4 py-2 text-xs flex items-center gap-3 border-b bg-amber-500/10 border-amber-500/30 text-amber-300">
                     <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                         <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
                     </svg>
                     <div className="flex-1 leading-snug">
-                        {claudeHealth.ok && claudeHealth.outdated ? (
-                            <>
-                                <span className="font-semibold">Your Claude Code is old (version {claudeHealth.version}).</span>
-                                {' '}This version crashes on <code className="px-1 bg-black/30 rounded">/model</code> and can't use Claude 4.x.
-                            </>
-                        ) : claudeHealth.error === 'not_found' ? (
-                            <>
-                                <span className="font-semibold">Claude Code isn't installed.</span>
-                            </>
-                        ) : (
-                            <>
-                                <span className="font-semibold">Claude Code is broken</span>
-                                {claudeHealth.error ? ` (${claudeHealth.error})` : ''}.
-                            </>
-                        )}
-                        {' '}<span className="opacity-90">To fix: (1) close Claude if it's running — type <code className="px-1 bg-black/30 rounded">/exit</code> in the terminal. (2) Click <b>Upgrade now</b> to paste the install command, then press Enter.</span>
+                        <span className="font-semibold">Your Claude Code is old (version {claudeHealth.version}).</span>
+                        {' '}This version crashes on <code className="px-1 bg-black/30 rounded">/model</code> and can't use Claude 4.x.
+                        {' '}<span className="opacity-90">To fix: (1) close Claude if it's running — type <code className="px-1 bg-black/30 rounded">/exit</code> in the terminal. (2) Click <b>Copy upgrade</b> to copy the install command, then paste and press Enter.</span>
                     </div>
                     <button
                         onClick={async () => {
                             const cmd = 'npm i -g @anthropic-ai/claude-code@latest';
-                            // AD-128 follow-up: copy the command and open/focus the terminal
+                            // AD-128: copy the command and open/focus the terminal
                             // so the next click+paste is all that's needed. We DON'T auto-send
                             // because Claude's REPL may still be alive (just crashing), and
                             // typing an npm install into a live REPL would feed it as a prompt.
@@ -2054,8 +2435,45 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     </button>
                 </div>
             )}
+            {!claudeBannerDismissed && claudeHealth && !claudeHealth.ok && claudeHealth.error !== 'not_found' && (
+                <div className="flex-shrink-0 px-4 py-2 text-xs flex items-center gap-3 border-b bg-red-500/10 border-red-500/30 text-red-300">
+                    <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                    </svg>
+                    <div className="flex-1 leading-snug">
+                        <span className="font-semibold">Claude Code isn't responding</span>
+                        {claudeHealth.error ? ` (${claudeHealth.error})` : ''}.
+                        {' '}<span className="opacity-90">Try reinstalling — copy the command and run it in the terminal.</span>
+                    </div>
+                    <button
+                        onClick={async () => {
+                            const cmd = 'npm i -g @anthropic-ai/claude-code@latest';
+                            setShowTerminal(true);
+                            try {
+                                await navigator.clipboard.writeText(cmd);
+                                showToast('Copied. Paste it in the terminal and press Enter.', 6000);
+                            } catch {
+                                showToast('Copy failed — run this in a terminal: npm i -g @anthropic-ai/claude-code@latest', 8000);
+                            }
+                        }}
+                        className="flex-shrink-0 px-2 py-0.5 rounded border border-current/30 hover:bg-current/10 transition-colors font-medium"
+                    >
+                        Copy reinstall
+                    </button>
+                    <button
+                        onClick={() => {
+                            setClaudeBannerDismissed(true);
+                            try { sessionStorage.setItem('adhdev-claude-banner-dismissed', '1'); } catch {}
+                        }}
+                        className="flex-shrink-0 opacity-70 hover:opacity-100"
+                        title="Dismiss for this session"
+                    >
+                        &times;
+                    </button>
+                </div>
+            )}
 
-            {/* Board-level drag overlay (VD-024) */}
+            {/* Board-level drag overlay */}
             {boardDragOver && (
                 <div className="absolute inset-0 z-40 bg-vd-accent-gold/10 border-4 border-dashed border-vd-accent-gold/50 flex items-center justify-center pointer-events-none">
                     <div className="bg-vd-bg-secondary/90 rounded-xl px-8 py-6 text-center shadow-xl">
@@ -2066,7 +2484,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 </div>
             )}
 
-            {/* Multi-file drop choice dialog (VD-024) */}
+            {/* Multi-file drop choice dialog */}
             {showDropChoice && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center">
                     <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => { setShowDropChoice(false); setPendingDropFiles([]); }} />
@@ -2109,7 +2527,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 </div>
             )}
 
-            {/* Expandable sidebar (VD-111 v2) — hidden when embedded in admin shell (VD-180) */}
+            {/* Expandable sidebar (v2) — hidden when embedded in admin shell */}
             {!isMobile && !embedded && (
                 <aside className={`fixed left-0 top-0 bottom-0 z-30 bg-vd-bg-secondary border-r border-vd-border flex flex-col py-3 transition-all duration-200 ${sidebarExpanded ? 'w-44' : 'w-12'}`}>
                     {/* Logo + expand toggle */}
@@ -2141,7 +2559,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                             {showProjectSwitcher && (
                                 <>
                                     {/* Backdrop to close on click outside */}
-                                    <div className="fixed inset-0 z-40" onClick={() => { setShowProjectSwitcher(false); setShowAddProjectForm(false); }} />
+                                    <div className="fixed inset-0 z-40" onClick={() => { setShowProjectSwitcher(false); }} />
                                     <div className={`absolute z-50 rounded-lg border border-vd-border bg-vd-bg-secondary shadow-panel overflow-hidden min-w-[200px] ${sidebarExpanded ? 'left-0 right-0 top-full mt-1' : 'left-full top-0 ml-2'}`}>
                                         <div className="px-2.5 py-1.5 text-[9px] text-vd-text-tertiary uppercase tracking-wider border-b border-vd-border">Projects</div>
                                         {projects.map(p => {
@@ -2156,6 +2574,20 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                                     // AD-127: surface switching state so the click feels acknowledged.
                                                     setSwitchingProjectId(p.id);
                                                     showToast(`Switching to ${p.name}…`);
+                                                    // AD-316: clear the old board state and write the new
+                                                    // project id to sessionStorage *before* fetchData runs.
+                                                    // Without this, the fetch wrapper at L420ish still reads
+                                                    // the OLD project id (sessionStorage hasn't been mirrored
+                                                    // yet by its useEffect), and setData(d) pours the previous
+                                                    // project's tickets into the new project's header — the
+                                                    // "stale cards under new theme" flash that AD-316 reports.
+                                                    // Clearing `data` flips the render into the loading screen
+                                                    // while the new fetch is in flight.
+                                                    if (typeof window !== 'undefined') {
+                                                        sessionStorage.setItem('adhdev-active-project-id', p.id);
+                                                    }
+                                                    setData(null);
+                                                    setLoading(true);
                                                     try {
                                                         await fetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ switchTo: p.id }) });
                                                         setActiveProjectId(p.id);
@@ -2181,56 +2613,19 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                             );
                                         })}
                                         <div className="border-t border-vd-border" />
+                                        {/* AD-286: launch the OnboardingWizard in add-project mode
+                                            instead of the legacy 3-field inline form. Closes the
+                                            switcher dropdown so the wizard owns the screen. */}
                                         <button
-                                            onClick={() => setShowAddProjectForm(prev => !prev)}
+                                            onClick={() => {
+                                                setShowProjectSwitcher(false);
+                                                setShowAddProjectWizard(true);
+                                            }}
                                             className="w-full text-left px-2.5 py-2 text-[10px] flex items-center gap-2 text-vd-accent-gold hover:bg-vd-bg-tertiary transition-colors"
                                         >
                                             <span className="text-xs">+</span>
-                                            <span>{showAddProjectForm ? 'Hide add project' : 'Add project'}</span>
+                                            <span>Add project</span>
                                         </button>
-                                        {showAddProjectForm && (
-                                            <div className="border-t border-vd-border px-2.5 py-2 space-y-2">
-                                                <input
-                                                    value={newProjectPath}
-                                                    onChange={(e) => setNewProjectPath(e.target.value)}
-                                                    placeholder="C:\\Codebases\\my-project"
-                                                    className="w-full bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-[10px] text-vd-text-primary placeholder-vd-text-tertiary focus:border-vd-accent-gold focus:outline-none"
-                                                />
-                                                <input
-                                                    value={newProjectName}
-                                                    onChange={(e) => setNewProjectName(e.target.value)}
-                                                    placeholder="Optional display name"
-                                                    className="w-full bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-[10px] text-vd-text-primary placeholder-vd-text-tertiary focus:border-vd-accent-gold focus:outline-none"
-                                                />
-                                                <input
-                                                    value={newProjectPrefix}
-                                                    onChange={(e) => setNewProjectPrefix(e.target.value.toUpperCase())}
-                                                    placeholder="AD"
-                                                    maxLength={6}
-                                                    className="w-full bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-[10px] text-vd-text-primary placeholder-vd-text-tertiary focus:border-vd-accent-gold focus:outline-none"
-                                                />
-                                                <div className="flex items-center justify-between gap-2">
-                                                    <button
-                                                        onClick={() => {
-                                                            setShowAddProjectForm(false);
-                                                            setNewProjectPath('');
-                                                            setNewProjectName('');
-                                                            setNewProjectPrefix('AD');
-                                                        }}
-                                                        className="px-2 py-1 text-[10px] text-vd-text-tertiary hover:text-vd-text-primary transition-colors"
-                                                    >
-                                                        Cancel
-                                                    </button>
-                                                    <button
-                                                        onClick={handleAddProject}
-                                                        disabled={isAddingProject}
-                                                        className="px-2.5 py-1 text-[10px] font-medium rounded-md border border-vd-accent-gold/30 text-vd-accent-gold hover:bg-vd-accent-gold/10 transition-colors disabled:opacity-50"
-                                                    >
-                                                        {isAddingProject ? 'Adding...' : 'Add Project'}
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        )}
                                     </div>
                                 </>
                             )}
@@ -2243,10 +2638,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         <button
                             onClick={() => {
                                 setActiveView('board');
-                                setShowProgressPage(false);
                                 setShowActivityFeed(false);
                             }}
-                            className={`rounded-lg flex items-center gap-2.5 ${activeView === 'board' && !showProgressPage && !showActivityFeed ? 'bg-vd-accent-gold/10 text-vd-accent-gold' : 'text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary'} ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
+                            className={`rounded-lg flex items-center gap-2.5 ${activeView === 'board' && !showActivityFeed ? 'bg-vd-accent-gold/10 text-vd-accent-gold' : 'text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary'} ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
                             title="Board">
                             <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 4.5v15m6-15v15m-10.875 0h15.75c.621 0 1.125-.504 1.125-1.125V5.625c0-.621-.504-1.125-1.125-1.125H4.125C3.504 4.5 3 5.004 3 5.625v12.75c0 .621.504 1.125 1.125 1.125z" />
@@ -2258,7 +2652,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         <button
                             onClick={() => {
                                 setShowActivityFeed(!showActivityFeed);
-                                setShowProgressPage(false);
                                 if (!showActivityFeed) setActiveView('board');
                             }}
                             className={`rounded-lg flex items-center gap-2.5 transition-colors ${showActivityFeed ? 'bg-vd-accent-gold/10 text-vd-accent-gold' : 'text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary'} ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
@@ -2275,7 +2668,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                             onClick={() => {
                                 setActiveView('missions');
                                 setShowActivityFeed(false);
-                                setShowProgressPage(false);
                             }}
                             className={`rounded-lg flex items-center gap-2.5 transition-colors ${activeView === 'missions' ? 'bg-vd-accent-gold/10 text-vd-accent-gold' : 'text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary'} ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
                             title="Missions"
@@ -2288,36 +2680,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                 <path strokeLinecap="round" strokeLinejoin="round" d="M15.59 14.37a6 6 0 01-5.84 7.38v-4.8m5.84-2.58a14.98 14.98 0 006.16-12.12A14.98 14.98 0 009.631 8.41m5.96 5.96a14.926 14.926 0 01-5.841 2.58m-.119-8.54a6 6 0 00-7.381 5.84h4.8m2.581-5.84a14.927 14.927 0 00-2.58 5.84m2.699 2.7c-.103.021-.207.041-.311.06a15.09 15.09 0 01-2.448-2.448 14.9 14.9 0 01.06-.312m-2.24 2.39a4.493 4.493 0 00-1.757 4.306 4.493 4.493 0 004.306-1.758M16.5 9a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0z" />
                             </svg>
                             {sidebarExpanded && <span className="text-xs font-medium">Missions</span>}
-                        </button>
-
-                        {/* Progress */}
-                        <button
-                            onClick={() => {
-                                setShowProgressPage(!showProgressPage);
-                                setShowActivityFeed(false);
-                                if (!showProgressPage) setActiveView('board');
-                            }}
-                            className={`rounded-lg flex items-center gap-2.5 transition-colors ${showProgressPage ? 'bg-vd-accent-gold/10 text-vd-accent-gold' : 'text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary'} ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
-                            title="Progress"
-                        >
-                            <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z" />
-                            </svg>
-                            {sidebarExpanded && <span className="text-xs font-medium">Progress</span>}
-                        </button>
-
-                        {/* Notes */}
-                        <button
-                            onClick={() => {
-                                setActiveView(activeView === 'notes' ? 'board' : 'notes');
-                            }}
-                            className={`rounded-lg flex items-center gap-2.5 transition-colors ${activeView === 'notes' ? 'bg-vd-accent-gold/10 text-vd-accent-gold' : 'text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary'} ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
-                            title="Notes"
-                        >
-                            <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L6.832 19.82a4.5 4.5 0 01-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 011.13-1.897L16.863 4.487zm0 0L19.5 7.125" />
-                            </svg>
-                            {sidebarExpanded && <span className="text-xs font-medium">Notes</span>}
                         </button>
                     </nav>
 
@@ -2366,6 +2728,16 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     {/* Bottom: Settings */}
                     <div className="px-1.5 flex flex-col gap-0.5">
                         <button
+                            onClick={openFeedbackIssue}
+                            className={`rounded-lg flex items-center gap-2.5 text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary transition-colors ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
+                            title="Send feedback"
+                        >
+                            <svg className="w-[18px] h-[18px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M8.625 12.75h6.75m-6.75-3h6.75m-8.25 9.75 2.25-2.25h7.125a3 3 0 0 0 3-3V7.5a3 3 0 0 0-3-3h-9a3 3 0 0 0-3 3v6.75a3 3 0 0 0 3 3h.375Z" />
+                            </svg>
+                            {sidebarExpanded && <span className="text-xs font-medium">Send feedback</span>}
+                        </button>
+                        <button
                             onClick={() => setShowSettings(true)}
                             className={`rounded-lg flex items-center gap-2.5 text-vd-text-tertiary hover:text-vd-text-primary hover:bg-vd-bg-tertiary transition-colors ${sidebarExpanded ? 'px-2.5 py-2' : 'w-9 h-9 mx-auto justify-center'}`}
                             title="Settings"
@@ -2380,7 +2752,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 </aside>
             )}
 
-            {/* Top toolbar — action buttons + search + filters (VD-111 v2) */}
+            {/* Top toolbar — action buttons + search + filters (v2) */}
             <div className={`sticky top-0 z-20 bg-vd-bg-primary/95 backdrop-blur-sm border-b border-vd-border flex-shrink-0 transition-all duration-200 ${!isMobile && !embedded ? (sidebarExpanded ? 'pl-44' : 'pl-12') : ''}`}>
                 <div className="px-4 py-2 flex items-center gap-2">
                     {/* Brand — mobile always, desktop when sidebar collapsed */}
@@ -2499,14 +2871,28 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                             ))}
                                         </select>
                                     </label>
-                                    <label className="block">
-                                        <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Sort</span>
-                                        <select value={sortBy} onChange={(e) => setSortBy(e.target.value as SortBy)} className="mt-0.5 w-full text-xs bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-vd-text-primary focus:border-vd-accent-gold focus:outline-none">
-                                            <option value="updated">Recently Updated</option><option value="default">Default Order</option><option value="priority">By Priority</option><option value="newest">Newest First</option>
-                                        </select>
-                                    </label>
-                                    <div className="block">
-                                        <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Status</span>
+                                     <label className="block">
+                                         <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Sort</span>
+                                         <select value={sortBy} onChange={(e) => setSortBy(e.target.value as SortBy)} className="mt-0.5 w-full text-xs bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-vd-text-primary focus:border-vd-accent-gold focus:outline-none">
+                                             <option value="updated">Recently Updated</option><option value="default">Default Order</option><option value="priority">By Priority</option><option value="newest">Newest First</option>
+                                         </select>
+                                     </label>
+                                     <div className="grid grid-cols-2 gap-2">
+                                         <label className="block">
+                                             <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Created</span>
+                                             <select value={createdTimeFilter} onChange={(e) => setCreatedTimeFilter(e.target.value as TimeFilter)} className="mt-0.5 w-full text-xs bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-vd-text-primary focus:border-vd-accent-gold focus:outline-none">
+                                                 <option value="all">Any time</option><option value="today">Today</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option>
+                                             </select>
+                                         </label>
+                                         <label className="block">
+                                             <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Updated</span>
+                                             <select value={updatedTimeFilter} onChange={(e) => setUpdatedTimeFilter(e.target.value as TimeFilter)} className="mt-0.5 w-full text-xs bg-vd-bg-input border border-vd-border rounded-md px-2 py-1.5 text-vd-text-primary focus:border-vd-accent-gold focus:outline-none">
+                                                 <option value="all">Any time</option><option value="today">Today</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option>
+                                             </select>
+                                         </label>
+                                     </div>
+                                     <div className="block">
+                                         <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Status</span>
                                         <div className="mt-1 flex flex-wrap gap-1.5">
                                             {COLUMN_ORDER.map((status) => {
                                                 const selected = statusFilter.includes(status);
@@ -2530,7 +2916,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                     <div className="block">
                                         <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Priority</span>
                                         <div className="mt-1 flex flex-wrap gap-1.5">
-                                            {PRIORITY_GROUP_ORDER.map((priority) => {
+                                            {/* AD-320: filter buttons stay limited to the canonical priorities;
+                                                the Unset lane sentinel is a stack-view-only construct. */}
+                                            {(PRIORITY_GROUP_ORDER.filter(p => p !== UNSET_PRIORITY_ID) as Ticket['priority'][]).map((priority) => {
                                                 const selected = priorityFilter.includes(priority);
                                                 return (
                                                     <button
@@ -2584,7 +2972,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                             </select>
                                         </label>
                                     )}
-                                    {/* AI Addressable filter removed — batch selection replaced it (VD-155) */}
+                                    {/* AI Addressable filter removed — batch selection replaced it */}
                                     {batches.length > 0 && (
                                         <label className="block">
                                             <span className="text-[10px] text-vd-text-tertiary uppercase tracking-wider">Batch Status</span>
@@ -2610,7 +2998,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
 
                     {/* Action buttons — right side */}
                     <div className="flex items-center gap-1.5 ml-auto flex-shrink-0">
-                        {/* Batches toggle — icon only (VD-111) */}
+                        {/* Batches toggle — icon only */}
                         <button
                             onClick={() => setShowBatchPane(prev => !prev)}
                             className={`relative p-1.5 border rounded-lg transition-colors ${
@@ -2633,9 +3021,10 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                             outline reads against the topbar background. */}
                         {!isMobile && (
                             <button
+                                ref={terminalButtonRef}
                                 onClick={() => setShowTerminal(!showTerminal)}
                                 className={`relative px-2.5 py-1.5 text-xs font-medium border rounded-lg transition-colors ${
-                                    terminalRequestRunning
+                                    (terminalRunRunning || terminalRunDispatching)
                                         ? 'border-vd-accent-gold text-vd-accent-gold animate-pulse'
                                         : terminalAgentRunning
                                         ? 'border-emerald-500/60 text-emerald-400'
@@ -2645,13 +3034,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                 }`}
                                 title={terminalTitle}
                             >
-                                {terminalRequestRunning && (
+                                {terminalRunRunning && (
                                     <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
                                         <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-vd-accent-gold opacity-75"></span>
                                         <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-vd-accent-gold"></span>
                                     </span>
                                 )}
-                                {terminalAgentRunning && !terminalRequestRunning && (
+                                {terminalAgentRunning && !terminalRunRunning && (
                                     <span className="absolute -top-1 -right-1 h-2.5 w-2.5 rounded-full bg-emerald-400" />
                                 )}
                                 {/* AD-141: terminal icon inline with the label, inherits the button's
@@ -2665,7 +3054,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                             </button>
                         )}
 
-                        {/* + Batch — shown when tickets selected (VD-111).
+                        {/* + Batch — shown when tickets selected.
                             AD-198: now sits to the right of the Terminal/Shell
                             toggle so Shell-Ready reads as a sibling of the
                             Batches icon. */}
@@ -2708,6 +3097,20 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                             });
                                             const result = await res.json();
                                             if (result.success && result.terminal) {
+                                                if (result.activeRun) {
+                                                    setData(prev => prev ? {
+                                                        ...prev,
+                                                        activeRuns: [
+                                                            ...(prev.activeRuns || []).filter(run => run.runId !== result.activeRun.runId),
+                                                            result.activeRun,
+                                                        ],
+                                                    } : prev);
+                                                    setTerminalExecutionIds(prev => {
+                                                        const next = new Set(prev);
+                                                        for (const id of result.activeRun.ticketIds || []) next.add(String(id).toUpperCase());
+                                                        return next;
+                                                    });
+                                                }
                                                 if (Array.isArray(result.updatedTickets)) {
                                                     for (const updatedTicket of result.updatedTickets) {
                                                         replaceTicketLocally(updatedTicket);
@@ -2769,20 +3172,6 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                 </button>
                             </div>
                         )}
-                        {selectedIds.size === 0 && (
-                            <button
-                                onClick={async () => {
-                                    await navigator.clipboard.writeText('Read .adhdev/board.json and work on all actionable tickets (status: todo, reopen).');
-                                    showToast('Copied! Paste into your AI agent.', 3000);
-                                }}
-                                className="px-2.5 py-1.5 text-xs font-medium border border-vd-accent-gold/40 text-vd-accent-gold rounded-lg hover:bg-vd-accent-gold/10 transition-colors"
-                                title="Copy for AI"
-                            >
-                                <span className="hidden sm:inline">Copy for AI</span>
-                                <svg className="w-4 h-4 sm:hidden" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M15.666 3.888A2.25 2.25 0 0013.5 2.25h-3c-1.03 0-1.9.693-2.166 1.638m7.332 0c.055.194.084.4.084.612v0a.75.75 0 01-.75.75H9.75a.75.75 0 01-.75-.75v0c0-.212.03-.418.084-.612m7.332 0c.646.049 1.288.11 1.927.184 1.1.128 1.907 1.077 1.907 2.185V19.5a2.25 2.25 0 01-2.25 2.25H6.75A2.25 2.25 0 014.5 19.5V6.257c0-1.108.806-2.057 1.907-2.185a48.208 48.208 0 011.927-.184" /></svg>
-                            </button>
-                        )}
-
                         {/* AD-181 / AD-188: Inbox toggle — second-from-right
                             placement, immediately left of New Ticket per
                             chat message m-moir8zwy-cxe8.
@@ -2792,7 +3181,11 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                             outlines other action buttons already use. */}
                         {!isMobile && (
                             <button
-                                onClick={() => setShowChat(prev => !prev)}
+                                ref={brainDumpButtonRef}
+                                onClick={() => {
+                                    if (activeBoardCoachmark === 'brain-dump-main') markCoachMarkSeen('brain-dump-main');
+                                    setShowChat(prev => !prev);
+                                }}
                                 className={`relative px-2.5 py-1.5 text-xs font-medium border rounded-lg transition-colors ${
                                     chatProcessing
                                         ? 'border-vd-accent-gold text-vd-accent-gold animate-pulse'
@@ -2815,7 +3208,12 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         )}
                         {/* New ticket */}
                         <button
-                            onClick={() => { setNewTicketDefaultStatus(undefined); setShowNewTicket(true); }}
+                            ref={newTicketButtonRef}
+                            onClick={() => {
+                                if (activeBoardCoachmark === 'new-ticket') markCoachMarkSeen('new-ticket');
+                                setNewTicketDefaultStatus(undefined);
+                                setShowNewTicket(true);
+                            }}
                             className="px-2.5 py-1.5 text-xs font-medium bg-vd-accent-gold text-vd-bg-primary rounded-lg hover:bg-vd-accent-gold-light transition-colors"
                         >
                             <span className="hidden sm:inline">+ New Ticket</span>
@@ -2823,12 +3221,11 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         </button>
                     </div>
                 </div>
-                {/* Subtle shortcut hints (VD-111) */}
+                {/* Subtle shortcut hints */}
                 <div className="px-4 pb-1 hidden sm:flex items-center gap-3 text-[10px] text-vd-text-tertiary/50">
                     <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">Ctrl+F</kbd> Search</span>
                     <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">B</kbd> Batches</span>
                     <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">N</kbd> New ticket</span>
-                    <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">P</kbd> Notepad</span>
                     <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">Ctrl+Shift+F</kbd> Terminal fullscreen</span>
                     <span><kbd className="px-1 py-0.5 rounded bg-vd-bg-tertiary/50 text-[9px]">Esc</kbd> Close</span>
                 </div>
@@ -2862,9 +3259,10 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     onToggleFullscreen={() => setTermFullscreen(f => !f)}
                     sidebarPad={sidebarPad}
                     order={termOrder}
+                    launcherOpenSignal={launcherOpenSignal}
                 />
             )}
-            {/* Board, Missions, Notes, or Progress Page */}
+            {/* Board or Missions */}
             {activeView === 'missions' && data ? (
                 <MissionPage
                     missions={data.missions || []}
@@ -2884,15 +3282,8 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         setMissionFilter(missionId);
                         setActiveView('board');
                         setShowActivityFeed(false);
-                        setShowProgressPage(false);
                     }}
                 />
-            ) : activeView === 'notes' ? (
-                <div className="flex-1 min-h-0 min-w-0 overflow-hidden">
-                    <NotesApp />
-                </div>
-            ) : showProgressPage && data ? (
-                <ProgressPage tickets={data.tickets} onClose={() => setShowProgressPage(false)} />
             ) : (
             <div className="px-4 pb-4 flex-1 min-h-0 flex flex-col min-w-0">
                 {missionFilter !== 'all' && data && (() => {
@@ -2932,7 +3323,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     <div className="flex-1 flex flex-col min-h-0">
                         {/* Tab bar — tap to switch columns */}
                         <div className="flex gap-0.5 pb-2 flex-wrap">
-                            {stackGroups.map((group) => {
+                            {visibleStackGroups.map((group) => {
                                 const count = (groupedTickets[group.id] || []).length;
                                 const shortLabel = group.label.length > 8
                                     ? group.label.split(/\s+/).map(part => part[0]).join('').slice(0, 3).toUpperCase()
@@ -2942,8 +3333,8 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                         key={group.id}
                                         onClick={() => {
                                             if (group.id === mobileTab) return;
-                                            const fromIdx = stackGroups.findIndex(entry => entry.id === mobileTab);
-                                            const toIdx = stackGroups.findIndex(entry => entry.id === group.id);
+                                            const fromIdx = visibleStackGroups.findIndex(entry => entry.id === mobileTab);
+                                            const toIdx = visibleStackGroups.findIndex(entry => entry.id === group.id);
                                             switchTab(group.id, toIdx > fromIdx ? 'left' : 'right');
                                         }}
                                         className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-colors ${
@@ -2978,7 +3369,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
 
                         {/* Active column — full width, vertically scrollable */}
                         {(() => {
-                            const activeGroup = stackGroups.find(group => group.id === mobileTab);
+                            const activeGroup = visibleStackGroups.find(group => group.id === mobileTab);
                             const colTickets = groupedTickets[mobileTab] || [];
                             const colColor = activeGroup?.colorBar || 'bg-gray-500';
                             return (
@@ -2997,7 +3388,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                         {colTickets.map((ticket) => (
                                             <div
                                                 key={ticket.id}
-                                                onClick={() => { markTicketRead(ticket.id); setSelectedTicket(ticket); }}
+                                                onClick={() => { markTicketRead(ticket); setSelectedTicket(ticket); }}
                                                 className="bg-vd-bg-secondary rounded-lg p-3 border border-vd-border active:bg-vd-bg-hover"
                                             >
                                                 <div className="flex items-start gap-2">
@@ -3048,6 +3439,41 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         })()}
                         <p className="text-center text-[10px] text-vd-text-tertiary pt-1">Swipe left/right to change column</p>
                     </div>
+                ) : (data?.tickets?.length ?? 0) === 0 ? (
+                    /* ---- AD-234: empty-board state (folder selected, 0 tickets) ----
+                       Replaces the 5-column kanban with a full-width CTA so the
+                       user has a single clear next action instead of five "No
+                       tickets" placeholders that read as "ADHDev is broken." */
+                    <div className="flex-1 flex items-center justify-center px-6">
+                        <div className="max-w-md w-full text-center space-y-6 py-12">
+                            <div>
+                                <div className="w-14 h-14 mx-auto mb-3 rounded-full bg-vd-accent-gold/10 border border-vd-accent-gold/30 flex items-center justify-center">
+                                    <svg className="w-7 h-7 text-vd-accent-gold" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                                        <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+                                    </svg>
+                                </div>
+                                <h2 className="text-base font-semibold text-vd-text-primary">Your board is ready.</h2>
+                                <p className="text-xs text-vd-text-tertiary mt-1">Add the first ticket — or scan this codebase for ones already lurking.</p>
+                            </div>
+                            <div className="flex flex-col gap-2">
+                                <button
+                                    onClick={() => handleAddTicketToColumn('todo')}
+                                    className="px-4 py-2 text-sm font-medium bg-vd-accent-gold text-vd-text-inverse rounded-md hover:opacity-90"
+                                >
+                                    Create your first ticket
+                                </button>
+                                <button
+                                    onClick={openCodebaseScan}
+                                    className="px-4 py-2 text-sm font-medium border border-vd-accent-gold/40 text-vd-accent-gold rounded-md hover:bg-vd-accent-gold/10"
+                                >
+                                    Run codebase scan
+                                </button>
+                            </div>
+                            <p className="text-[10px] text-vd-text-tertiary">
+                                Tip: the <span className="text-vd-text-secondary font-medium">+ New Ticket</span> button in the header does the same as the first option.
+                            </p>
+                        </div>
+                    </div>
                 ) : (
                     /* ---- DESKTOP: Kanban columns with DnD ---- */
                     <DndContext
@@ -3068,15 +3494,15 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                 }}
                             >
                                 <div style={{ display: 'inline-flex', gap: '12px', height: '100%', padding: '0 4px 12px 4px', minWidth: '100%' }}>
-                                    {stackGroups.map((group) => (
+                                    {visibleStackGroups.map((group) => (
                                         <KanbanColumn
                                             key={group.id}
                                             status={group.id}
                                             config={{ label: group.label, aiInstruction: group.instruction || '' }}
                                             tickets={groupedTickets[group.id] || []}
                                             colorBar={group.colorBar}
-                                            onTicketClick={(ticket) => { markTicketRead(ticket.id); setSelectedTicket(ticket); }}
-                                            readTickets={readTickets}
+                                            onTicketClick={(ticket) => { markTicketRead(ticket); setSelectedTicket(ticket); }}
+                                            readTicketCursors={readTicketCursors}
                                             onUpdateInstruction={stackBy === 'status' ? handleUpdateInstruction : () => {}}
                                             onToggleAi={handleToggleAi}
                                             onAddTicket={stackBy === 'status' && ['backlog', 'todo'].includes(group.id) ? handleAddTicketToColumn : undefined}
@@ -3084,6 +3510,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                                             onToggleSelect={toggleSelect}
                                             onSelectColumn={selectColumn}
                                             activeExecutionIds={activeExecutionIds}
+                                            activeRunStatusByTicket={activeRunStatusByTicket}
                                             stackBy={stackBy}
                                             groupedBy={groupedBy}
                                         />
@@ -3182,6 +3609,13 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                         setNewTicketDefaultStatus(undefined);
                         setShowNewTicket(true);
                     }}
+                    // AD-251: clicking a linked-ticket row in the modal
+                    // swaps the modal to that ticket. Resolve case-insensitively
+                    // because the relations graph stores ids in upper-case.
+                    onSelectTicket={(linkedId) => {
+                        const target = (data?.tickets || []).find(t => t.id.toUpperCase() === linkedId.toUpperCase());
+                        if (target) setSelectedTicket(target);
+                    }}
                     onUpdate={handleUpdateTicket}
                     onAddComment={handleAddComment}
                     onDelete={handleDeleteTicket}
@@ -3197,11 +3631,16 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     terminalVisible={showTerminal && !isMobile}
                     terminalPlacement={termPlacement}
                     coachMarks={onboardingState.coachMarks || {}}
-                    hideTips={!!onboardingState.hideTips}
+                    hideTips={!!onboardingState.hideTips || tipsHiddenThisSession}
                     onCoachMarkSeen={(key) => {
                         void patchOnboardingState({ coachMarks: { ...(onboardingState.coachMarks || {}), [key]: true } });
                     }}
-                    onHideAllTips={() => { void patchOnboardingState({ hideTips: true }); }}
+                    onHideAllTips={() => {
+                        // AD-236: session-only dismissal. Tips return on next launch.
+                        // Persistent dismissal lives in Settings.
+                        setTipsHiddenThisSession(true);
+                        try { sessionStorage.setItem('adhdev-tips-hidden-session', '1'); } catch { /* ignore */ }
+                    }}
                 />
             </ErrorBoundary>
 
@@ -3211,6 +3650,9 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     onClose={() => setShowSettings(false)}
                     projectId={activeProjectId}
                     projectName={projects.find(p => p.id === activeProjectId)?.name ?? null}
+                    laneOptions={COLUMN_ORDER.map(status => ({ id: status, label: STATUS_LABELS[status] || status }))}
+                    hiddenLaneIds={hiddenStatusIds}
+                    onLaneVisibilityChange={setLaneHidden}
                 />
             )}
 
@@ -3227,28 +3669,73 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     scrollToMessageId={chatScrollToId}
                     onScrollHandled={() => setChatScrollToId(null)}
                     onProcessingChange={setChatProcessing}
+                    onRequireAgent={() => setShowTerminal(true)}
                 />
             </ErrorBoundary>
+
+            {/* AD-332 / AD-335: step zero — get the user to connect a coding
+                agent right after the intro. "Choose an agent" opens the terminal
+                and the agent picker, where they install/launch ANY agent (not
+                auto-pointed at one) and pick a variant. Dismisses on click so the
+                tutorial proceeds whether they launch or back out. Persists until
+                an agent is actually running; "Later" defers for the session only,
+                so a user who skips is re-nudged next launch. */}
+            <CoachMark
+                show={activeBoardCoachmark === 'connect-agent' && !showTerminal}
+                targetRef={terminalButtonRef}
+                placement="bottom"
+                title="Start your agent"
+                message="Run needs a coding agent. Open the picker to install or launch one — your choice of agent and mode."
+                actionLabel="Choose an agent"
+                onAction={openAgentPicker}
+                onSeen={() => markCoachMarkSeen('connect-agent')}
+                onHideAll={() => {
+                    setTipsHiddenThisSession(true);
+                    try { sessionStorage.setItem('adhdev-tips-hidden-session', '1'); } catch { /* ignore */ }
+                }}
+            />
+
+            <CoachMark
+                show={activeBoardCoachmark === 'new-ticket'}
+                targetRef={newTicketButtonRef}
+                placement="bottom"
+                title="New ticket"
+                message="Capture work here. Press N anywhere on the board for the same action."
+                onSeen={() => markCoachMarkSeen('new-ticket')}
+                onHideAll={() => {
+                    setTipsHiddenThisSession(true);
+                    try { sessionStorage.setItem('adhdev-tips-hidden-session', '1'); } catch { /* ignore */ }
+                }}
+            />
+
+            <CoachMark
+                show={activeBoardCoachmark === 'brain-dump-main'}
+                targetRef={brainDumpButtonRef}
+                placement="bottom"
+                title="Brain Dump"
+                message="Drop loose notes here, then let ADHDev triage them into tickets when you are ready."
+                onSeen={() => markCoachMarkSeen('brain-dump-main')}
+                onHideAll={() => {
+                    setTipsHiddenThisSession(true);
+                    try { sessionStorage.setItem('adhdev-tips-hidden-session', '1'); } catch { /* ignore */ }
+                }}
+            />
 
             {/* AD-137/130: drag coach mark. Anchored to the first visible ticket card.
                 Suppressed while welcome modal is open (no stacking). Only shows when
                 no other coach mark is active at the board level — sequential reveal. */}
             <CoachMark
-                show={
-                    onboardingLoaded
-                    && dragAnchorReady
-                    && !!onboardingState.welcomeSeen
-                    && !onboardingState.coachMarks?.drag
-                    && !onboardingState.hideTips
-                    && !isMobile
-                    && !selectedTicket  // never stack a board-level hint behind an open ticket modal
-                }
+                show={activeBoardCoachmark === 'drag'}
                 targetRef={dragAnchorRef}
                 placement="right"
                 title="Pro tip"
                 message="Grab any card and drop it in another column. ADHDev tracks the move as activity so nothing slips through."
-                onSeen={() => { void patchOnboardingState({ coachMarks: { ...(onboardingState.coachMarks || {}), drag: true } }); }}
-                onHideAll={() => { void patchOnboardingState({ hideTips: true }); }}
+                onSeen={() => markCoachMarkSeen('drag')}
+                onHideAll={() => {
+                    // AD-236: session-only dismissal. Tips return on next launch.
+                    setTipsHiddenThisSession(true);
+                    try { sessionStorage.setItem('adhdev-tips-hidden-session', '1'); } catch { /* ignore */ }
+                }}
             />
 
             {/* AD-166: 4-step onboarding wizard. Takes precedence over the
@@ -3259,15 +3746,28 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                 <OnboardingWizard
                     initialState={{
                         wizardCompleted: onboardingState.wizardCompleted,
-                        wizardStep: onboardingState.wizardStep,
-                        folderSource: onboardingState.folderSource,
+                        wizardStep: onboardingWizardStartStep || onboardingState.wizardStep,
+                        folderSource: onboardingWizardStartStep === 3 ? 'existing' : onboardingState.folderSource,
                         folderPath: onboardingState.folderPath,
                         agentDetected: onboardingState.agentDetected,
                         gitPosture: onboardingState.gitPosture,
                         remoteUrl: onboardingState.remoteUrl,
                     }}
                     onPatchOnboarding={patchOnboardingState}
-                    onClose={() => setShowOnboardingWizard(false)}
+                    onClose={() => { setShowOnboardingWizard(false); setOnboardingWizardStartStep(null); }}
+                />
+            )}
+
+            {/* AD-286: same wizard, "Add new project" mode. onCreateProject
+                signals the mode and is called on Finish with the wizard's full
+                state — we then POST /api/projects and apply the state to the
+                freshly-active new project. */}
+            {showAddProjectWizard && (
+                <OnboardingWizard
+                    initialState={{}}
+                    onPatchOnboarding={() => { /* deferred in add-project mode */ }}
+                    onCreateProject={handleCreateProjectFromWizard}
+                    onClose={() => setShowAddProjectWizard(false)}
                 />
             )}
 
@@ -3281,6 +3781,7 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
                     <WelcomeModal
                         demoTicketId={demo ? demo.id : null}
                         onClose={() => { void patchOnboardingState({ welcomeSeen: true }); }}
+                        onStartSetup={() => setShowOnboardingWizard(true)}
                         onRunDemo={async (id) => {
                             try {
                                 await fetch('/api/run', {

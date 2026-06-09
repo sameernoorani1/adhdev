@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { readFeedback, writeFeedback, type SessionActivityEntry } from '@/lib/feedback/core';
+import { readFeedback, writeFeedback, withFeedbackLock, type SessionActivityEntry } from '@/lib/feedback/core';
 
 /**
  * POST /api/hooks/activity
@@ -66,6 +66,7 @@ export async function POST(request: NextRequest) {
         const headerTicketId = request.headers.get('x-adhdev-ticket') || undefined;
         const eventName = payload.hook_event_name || 'unknown';
 
+        return await withFeedbackLock(null, () => {
         const data = readFeedback();
         const now = new Date().toISOString();
         const sessionId = payload.session_id || 'unknown';
@@ -101,24 +102,20 @@ export async function POST(request: NextRequest) {
                         at: now,
                     });
 
-                    // Track files touched in execution metadata
+                    // Track files touched in execution metadata.
+                    // AD-247: heartbeat-ONLY. Hook activity records file
+                    // edits onto an *already-running* execution; it no longer
+                    // creates a fresh in_progress execution on a ticket that
+                    // has none. Sameer's spec on AD-232 / AD-244: Running
+                    // state must come from the UI Run button alone — hooks
+                    // are a side-channel signal and shouldn't promote.
                     if (summary.file && (summary.action === 'file_created' || summary.action === 'file_edited')) {
-                        if (!ticket.execution) {
-                            ticket.execution = {
-                                runId: `exec-${Date.now().toString(36)}`,
-                                actor: 'Claude Code',
-                                actorType: 'ai',
-                                status: 'in_progress',
-                                startedAt: now,
-                                updatedAt: now,
-                                filesTouched: [],
-                                verification: [],
-                            };
+                        if (ticket.execution?.status === 'in_progress') {
+                            if (!ticket.execution.filesTouched.includes(summary.file)) {
+                                ticket.execution.filesTouched.push(summary.file);
+                            }
+                            ticket.execution.updatedAt = now;
                         }
-                        if (!ticket.execution.filesTouched.includes(summary.file)) {
-                            ticket.execution.filesTouched.push(summary.file);
-                        }
-                        ticket.execution.updatedAt = now;
                     }
 
                     ticket.updatedAt = now;
@@ -159,7 +156,9 @@ export async function POST(request: NextRequest) {
         writeFeedback(data);
 
         return NextResponse.json({ received: true, event: eventName });
+        });
     } catch (err) {
+        console.error('[ADHDev] POST /api/hooks/activity error:', err);
         return NextResponse.json({ error: String(err) }, { status: 500 });
     }
 }
@@ -185,7 +184,8 @@ export async function GET(request: NextRequest) {
         const result = activity.slice(-limit).reverse();
 
         return NextResponse.json({ activity: result, total: activity.length });
-    } catch {
+    } catch (err) {
+        console.error('[ADHDev] GET /api/hooks/activity error:', err);
         return NextResponse.json({ activity: [], total: 0 });
     }
 }

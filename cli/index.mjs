@@ -1,13 +1,49 @@
 #!/usr/bin/env node
+// adhdev-board — Copyright (c) 2026 Sameer Noorani. Licensed under AGPL-3.0-or-later.
+// See LICENSE at the repo root for the full text.
 
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
-import { join, resolve, basename } from 'path';
+import { join, resolve, basename, dirname } from 'path';
 import { execSync, spawn } from 'child_process';
 import { homedir } from 'os';
+import { fileURLToPath } from 'url';
 import readline from 'readline';
+import { checkVersion } from './version-check.mjs';
 
 const args = process.argv.slice(2);
 const command = args[0];
+
+// AD-280: read the running package version from package.json so the
+// version check can compare against the manifest. Best-effort; if the
+// read fails for any reason, the check is skipped entirely (fail open).
+function getPackageVersion() {
+    try {
+        const here = dirname(fileURLToPath(import.meta.url));
+        const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf-8'));
+        return typeof pkg.version === 'string' ? pkg.version : null;
+    } catch {
+        return null;
+    }
+}
+
+// AD-280: gate startup on the manifest. Returns when the caller can continue.
+// On 'block' actions, prints the message and exits with code 1.
+async function runVersionCheckOrExit() {
+    const currentVersion = getPackageVersion();
+    if (!currentVersion) return; // No version to compare → fail open.
+    const result = await checkVersion({ currentVersion });
+    if (result.action === 'block') {
+        console.log('');
+        console.log(`  ${result.message}`);
+        console.log('');
+        process.exit(1);
+    }
+    if (result.action === 'nudge') {
+        console.log('');
+        console.log(`  ${result.message}`);
+        console.log('');
+    }
+}
 
 // AD-134: minimal interactive prompt. Resolves to the user's trimmed input, or
 // `fallback` when the user just hits Enter (mirrors `npm init` UX).
@@ -47,7 +83,7 @@ function probeClaudeVersion() {
 const LOGO = `
   ╔═══════════════════════════════╗
   ║        A D H D e v            ║
-  ║   AI Agent Control Plane      ║
+  ║   The board for AI work       ║
   ╚═══════════════════════════════╝
 `;
 
@@ -391,6 +427,7 @@ function configureClaudeHooks(projectRoot) {
 
 async function init() {
   console.log(LOGO);
+  await runVersionCheckOrExit();
   // First positional arg after "init" is the path; skip flags like --name=, -y, etc.
   const positional = args.slice(1).find(a => !a.startsWith('-'));
   const projectRoot = resolve(positional || '.');
@@ -477,14 +514,32 @@ async function init() {
     console.log(`  ✓ Project "${project.name}" already registered (set as active)`);
   }
 
-  // Add to .gitignore
+  // Add to .gitignore. Privacy-by-default: .adhdev/ holds the user's board,
+  // brain-dump (chat.json), config, and uploaded artifacts — per-project local
+  // state that changes on every action and can contain private notes. Ignore
+  // the whole directory so a stray `git add .` never commits/leaks it. Create
+  // .gitignore if the project doesn't have one yet (previously this was skipped
+  // entirely when absent, and only `.adhdev/uploads/` was covered when present
+  // — board.json/chat.json/config.json were left exposed).
   const gitignorePath = join(projectRoot, '.gitignore');
+  const ignoreMarker = '# ADHDev board state';
+  const ignoreBlock = [
+    '# ADHDev board state — local per-project data (board, brain-dump, config,',
+    '# uploads). Changes on every action and may contain private notes; keep it',
+    '# out of git.',
+    '.adhdev/',
+  ].join('\n');
   if (existsSync(gitignorePath)) {
     const content = readFileSync(gitignorePath, 'utf-8');
-    if (!content.includes('.adhdev/uploads')) {
-      writeFileSync(gitignorePath, content.trimEnd() + '\n.adhdev/uploads/\n');
-      console.log('  ✓ Added .adhdev/uploads/ to .gitignore');
+    const alreadyIgnored = content.includes(ignoreMarker)
+      || /(^|\n)\.adhdev\/[ \t]*(\r?\n|$)/.test(content);
+    if (!alreadyIgnored) {
+      writeFileSync(gitignorePath, content.trimEnd() + '\n\n' + ignoreBlock + '\n');
+      console.log('  ✓ Added .adhdev/ (board state) to .gitignore');
     }
+  } else {
+    writeFileSync(gitignorePath, ignoreBlock + '\n');
+    console.log('  ✓ Created .gitignore with .adhdev/ (board state) ignored');
   }
 
   // Configure Claude Code hooks if .claude/ exists
@@ -543,12 +598,36 @@ async function isPortInUse(port) {
 
 async function start() {
   console.log(LOGO);
+  await runVersionCheckOrExit();
 
   const registry = readRegistry();
   if (registry.projects.length === 0) {
-    console.log('  No projects registered. Initializing current directory...\n');
-    initProjectDir(process.cwd());
-    registerProject(process.cwd());
+    // AD-239: prompt before silently initializing in cwd. If the user runs
+    // `adhdev` from the wrong folder by mistake (Desktop, home dir, etc.),
+    // we'd otherwise pollute that folder with .adhdev/ + use the folder's
+    // basename as the project name. One Y/n confirmation + an optional name
+    // override is cheap insurance.
+    const cwd = process.cwd();
+    const defaultName = basename(cwd);
+    const interactive = process.stdin.isTTY && !args.includes('--yes') && !args.includes('-y');
+
+    if (interactive) {
+      const proceed = await prompt(`  Initialize ADHDev in ${cwd}? Project name will be "${defaultName}". (Y/n): `, 'Y');
+      if (/^n/i.test(String(proceed).trim())) {
+        console.log('  Aborted. Run `adhdev init` from inside a project directory to start.\n');
+        process.exit(0);
+      }
+      const customName = await prompt(`  Custom project name (Enter to keep "${defaultName}"): `, defaultName);
+      console.log('');
+      initProjectDir(cwd);
+      registerProject(cwd, String(customName).trim() || defaultName);
+    } else {
+      // No TTY or --yes flag → non-interactive auto-init (preserves the
+      // CI / scripted-install path).
+      console.log('  No projects registered. Initializing current directory...\n');
+      initProjectDir(cwd);
+      registerProject(cwd);
+    }
   }
 
   const active = registry.projects.find(p => p.id === registry.activeProjectId) || registry.projects[0];
@@ -559,8 +638,54 @@ async function start() {
   const port = 3111;
   const termPort = 3112;
 
-  // Check if ports are already in use — if board port is taken, just open browser
+  const pkgDir = findPackageDir();
+  if (!pkgDir) {
+    console.log('  Error: Cannot find ADHDev package.\n');
+    process.exit(1);
+  }
+
+  // AD-293: probe terminal server independently of the board. Earlier code
+  // returned early as soon as the board port was busy, which left the board
+  // half-broken when Next survived but the terminal server had died (or had
+  // never been started — e.g. the user restarted Next manually). Run the
+  // terminal probe + launch first so it heals in either branch below.
   const boardInUse = await isPortInUse(port);
+  const termInUse = await isPortInUse(termPort);
+  const terminalScript = join(pkgDir, 'server', 'terminal.mjs');
+  let termChild = null;
+  if (existsSync(terminalScript) && !termInUse) {
+    // When the board is already up we're about to exit this process, so the
+    // terminal server has to outlive us — detach + unref. When the board is
+    // also being started here, keep it attached so cleanup() tears both down
+    // together on Ctrl-C.
+    const detach = boardInUse;
+    termChild = spawn('node', [terminalScript], {
+      cwd: active?.path || process.cwd(),
+      env: { ...process.env, TERMINAL_PORT: String(termPort), ADHDEV_CWD: active?.path || process.cwd() },
+      stdio: detach ? 'ignore' : ['ignore', 'pipe', 'pipe'],
+      detached: detach,
+      windowsHide: true,
+    });
+    if (detach) {
+      termChild.unref();
+      console.log(`  ✓ Terminal server starting on ws://localhost:${termPort} (detached)`);
+    } else {
+      termChild.stdout.on('data', (d) => {
+        const msg = d.toString().trim();
+        if (msg) console.log(`  [terminal] ${msg}`);
+      });
+      termChild.stderr.on('data', (d) => {
+        const msg = d.toString().trim();
+        if (msg && !msg.includes('ExperimentalWarning')) console.error(`  [terminal] ${msg}`);
+      });
+      console.log(`  ✓ Terminal server starting on ws://localhost:${termPort}`);
+    }
+  } else if (termInUse) {
+    console.log(`  ✓ Terminal server already running on ws://localhost:${termPort}`);
+  }
+
+  // Board already up → open the browser and exit (terminal server above has
+  // already been healed if it was missing).
   if (boardInUse) {
     console.log(`  ✓ Board already running on http://localhost:${port}`);
     console.log('  Opening browser...\n');
@@ -569,33 +694,6 @@ async function start() {
       execSync(`${openCmd} http://localhost:${port}`, { stdio: 'ignore' });
     } catch { /* fine */ }
     return;
-  }
-
-  const pkgDir = findPackageDir();
-  if (!pkgDir) {
-    console.log('  Error: Cannot find ADHDev package.\n');
-    process.exit(1);
-  }
-
-  // Start terminal WebSocket server (background, skip if already running)
-  const terminalScript = join(pkgDir, 'server', 'terminal.mjs');
-  let termChild = null;
-  const termInUse = await isPortInUse(termPort);
-  if (existsSync(terminalScript) && !termInUse) {
-    termChild = spawn('node', [terminalScript], {
-      cwd: active?.path || process.cwd(),
-      env: { ...process.env, TERMINAL_PORT: String(termPort), ADHDEV_CWD: active?.path || process.cwd() },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    termChild.stdout.on('data', (d) => {
-      const msg = d.toString().trim();
-      if (msg) console.log(`  [terminal] ${msg}`);
-    });
-    termChild.stderr.on('data', (d) => {
-      const msg = d.toString().trim();
-      if (msg && !msg.includes('ExperimentalWarning')) console.error(`  [terminal] ${msg}`);
-    });
-    console.log(`  ✓ Terminal server starting on ws://localhost:${termPort}`);
   }
 
   // Start Next.js board server
@@ -609,16 +707,44 @@ async function start() {
   const isSourceCheckout = existsSync(join(pkgDir, '.git'));
   const hasPrebuild = existsSync(join(pkgDir, '.next', 'BUILD_ID'));
   const useProd = !isSourceCheckout && hasPrebuild;
+  // AD-201: bind to 127.0.0.1 so the dev/prod server is not reachable from the
+  // wider network. The terminal server is similarly bound (server/terminal.mjs).
   const nextArgs = useProd
-    ? ['next', 'start', '-p', String(port)]
-    : ['next', 'dev', '-p', String(port)];
+    ? ['next', 'start', '-H', '127.0.0.1', '-p', String(port)]
+    : ['next', 'dev', '-H', '127.0.0.1', '-p', String(port)];
   console.log(`  ✓ Board starting on http://localhost:${port} (${useProd ? 'prod' : 'dev'} mode)\n`);
 
-  const nextChild = spawn('npx', nextArgs, {
+  // AD-238 (fourth pass): bypass `npx` entirely and resolve the Next.js
+  // binary via `require.resolve('next/dist/bin/next')`, then run it with
+  // `node`. `node` is `.exe` on Windows and a real binary elsewhere — spawn
+  // executes it directly, no shell, no `.cmd` shim, no `npx` wrapper.
+  // Earlier passes routed through `cmd.exe /c npx` to avoid EINVAL on the
+  // `.cmd` shim, but `npx` itself spawns internally with `shell: true`
+  // (re-introducing DEP0190 in the user's startup output, which is what we
+  // were trying to silence). Going straight to `node <next-bin>` collapses
+  // the chain to a single Node process, no shell anywhere, no DEP0190.
+  // `nextArgs[0]` was the literal string `next` (for npx) — drop it; we
+  // pass the rest as Next's own argv.
+  const { createRequire } = await import('module');
+  const localRequire = createRequire(import.meta.url);
+  let nextBinPath;
+  try {
+    nextBinPath = localRequire.resolve('next/dist/bin/next', { paths: [pkgDir] });
+  } catch {
+    // Fallback: relative to the bundled package's node_modules. Should never
+    // hit on a sane install — every npm install of adhdev-board pulls Next
+    // as a runtime dep — but if it does we surface a clear error rather
+    // than a cryptic spawn EINVAL.
+    console.error('  ✗ Next.js not found inside the package. Re-install adhdev-board?');
+    process.exit(1);
+  }
+  // nextArgs was ['next', 'start'|'dev', ...] for npx. Drop the leading
+  // `next` token — we're invoking the bin directly now.
+  const nextOwnArgs = nextArgs.slice(1);
+  const nextChild = spawn(process.execPath, [nextBinPath, ...nextOwnArgs], {
     cwd: pkgDir,
     env: { ...process.env, PORT: String(port) },
     stdio: 'inherit',
-    shell: true,
   });
 
   // Auto-open browser once ready — single attempt via polling

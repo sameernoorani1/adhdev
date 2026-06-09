@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { csrfRejectReason, ALLOWED_ORIGINS } from '@/middleware';
 import { tokenGuardReason } from '@/lib/feedback/core';
 
@@ -25,6 +27,14 @@ describe('csrfRejectReason — edge origin/Sec-Fetch gate', () => {
 
     it('passes a no-Origin non-browser caller through the edge (the token gate authenticates it)', () => {
         expect(csrfRejectReason('POST', null, null)).toBeNull();
+    });
+
+    it('rejects an opaque "Origin: null" (sandboxed iframe / data: URL) — the string "null" is NOT the absent header', () => {
+        // request.headers.get('origin') returns the STRING "null" for a sandboxed
+        // iframe, vs JS null when the header is truly absent. The string must be
+        // rejected (not in the allowlist); only a genuinely-absent Origin defers
+        // to the Node token gate.
+        expect(csrfRejectReason('POST', 'null', null)).toMatch(/cross-origin/);
     });
 
     it('exposes the localhost allowlist', () => {
@@ -58,5 +68,31 @@ describe('tokenGuardReason — node token gate for no-Origin callers', () => {
 
     it('degrades to allow when no server token is configured (no lockout)', () => {
         expect(tokenGuardReason('POST', null, null, null)).toBeNull();
+    });
+
+    it('defers a string "null" Origin to the edge (only a genuinely-absent Origin is token-gated)', () => {
+        // A request with an opaque "null" string Origin was already rejected by
+        // the edge middleware; the token gate only owns the JS-null (header
+        // absent) case, so it must not re-evaluate or accidentally allow it.
+        expect(tokenGuardReason('POST', 'null', null, TOKEN)).toBeNull();
+    });
+});
+
+// AD-346 regression guard: the bug this caught — git-init was left ungated while
+// its 3 RCE siblings were gated. Reading the route sources and asserting the gate
+// is wired is a threat-model test (the routes MUST be gated), not an
+// implementation-detail check.
+describe('every state-changing RCE route wires checkAdmin(request)', () => {
+    const RCE_ROUTES = [
+        'src/app/api/launch-agent/route.ts',
+        'src/app/api/install-claude/route.ts',
+        'src/app/api/install-agent/route.ts',
+        'src/app/api/run-terminal/route.ts',
+        'src/app/api/onboarding/git-init/route.ts',
+    ];
+
+    it.each(RCE_ROUTES)('%s gates its POST behind checkAdmin(request)', (rel) => {
+        const src = readFileSync(join(process.cwd(), rel), 'utf-8');
+        expect(src).toMatch(/checkAdmin\(request\)/);
     });
 });

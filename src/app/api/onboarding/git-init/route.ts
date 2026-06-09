@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { checkAdmin } from '@/lib/feedback/core';
 
 // AD-166 / AD-231: git posture executor for the onboarding wizard.
 //
@@ -94,6 +95,12 @@ function validateRemoteUrl(raw: string): { ok: true } | { ok: false; error: stri
 }
 
 export async function POST(request: NextRequest) {
+    // AD-346: this route spawns `git` and writes files in a body-supplied folder
+    // — same RCE/file-write class as install-claude / launch-agent, so it gets
+    // the same gate. The edge middleware already blocks the browser CSRF vector;
+    // this adds the no-Origin token check for parity with the other 3 routes.
+    const auth = await checkAdmin(request);
+    if (!auth.authorized) return auth.error!;
     try {
         const body = await request.json();
         const folderPath = String(body.folderPath || '').trim();

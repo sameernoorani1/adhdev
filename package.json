@@ -13,7 +13,7 @@
     "url": "https://github.com/sameernoorani1/adhdev/issues"
   },
   "bin": {
-    "adhdev": "./cli/index.mjs"
+    "adhdev": "cli/index.mjs"
   },
   "files": [
     "cli",

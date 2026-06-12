@@ -989,7 +989,24 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         };
         fetch('/api/onboarding').then(r => r.json()).then(d => {
             const s = d.onboardingState || {};
-            setOnboardingState({
+            // AD-365: the SERVER (config.json onboardingState) is authoritative for
+            // whether this project has STARTED onboarding. On a genuinely fresh
+            // project — `adhdev init` writes config.json with NO onboardingState — do
+            // NOT let stale browser localStorage from a previous project/session
+            // suppress the first-run flow. That was the "coachmarks only show after a
+            // Settings reset" bug: reset works precisely because it ALSO clears
+            // localStorage (SettingsModal), while a fresh init never touches it, so a
+            // re-used browser inherited welcomeSeen='1' + dismissed coachMarks and the
+            // whole tutorial stayed hidden. Once the user actually touches onboarding
+            // the server gains state and we resume OR-merging localStorage so a
+            // per-project dismissal still survives a network blip.
+            const fresh = Object.keys(s).length === 0;
+            setOnboardingState(fresh ? {
+                welcomeSeen: false,
+                checklistDismissed: false,
+                hideTips: false,
+                coachMarks: {},
+            } : {
                 ...s,
                 welcomeSeen:        s.welcomeSeen        || readLocal('welcomeSeen'),
                 checklistDismissed: s.checklistDismissed || readLocal('checklistDismissed'),
@@ -1083,9 +1100,21 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         const explicit = params.get('wizard') === 'onboarding';
         const firstRun = !onboardingState.wizardCompleted && !onboardingState.welcomeSeen;
         if (explicit || firstRun) {
+            // AD-363: `adhdev init` already created the project we're looking at, so
+            // the wizard's Step 1 "Pick a folder" is a redundant second ask. When the
+            // active project already has a folder, pre-fill it and jump straight to
+            // "Connect an agent" (Step 2). Explicit replays (?wizard=onboarding) and
+            // the genuine no-project first-install case still start at Step 1.
+            if (!explicit) {
+                const activeProject = projects.find(p => p.id === activeProjectId);
+                if (activeProject?.path) {
+                    setOnboardingState(prev => ({ ...prev, folderPath: activeProject.path, folderSource: 'existing' }));
+                    setOnboardingWizardStartStep(prev => prev ?? 2);
+                }
+            }
             setShowOnboardingWizard(true);
         }
-    }, [onboardingLoaded, onboardingState.wizardCompleted, onboardingState.welcomeSeen]);
+    }, [onboardingLoaded, onboardingState.wizardCompleted, onboardingState.welcomeSeen, projects, activeProjectId]);
 
     // AD-128: probe the user's system `claude` binary once on mount. If missing,
     // erroring, or pre-2.x, surface a dismissable banner with the correct upgrade

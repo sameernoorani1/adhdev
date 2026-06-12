@@ -58,10 +58,14 @@ jobs:
           echo "adhdev --version => $V"
           echo "$V" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+' && echo "version PASS" || { echo "version FAIL"; exit 1; }
 
+      # --no-start is REQUIRED here: bare `adhdev init` boots the board and runs
+      # forever (cli/index.mjs:580 `await start()`), so the step never exits and
+      # the job hangs until timeout. --no-start makes init print "Done!" and
+      # return (cli/index.mjs:575-577) — the dedicated step below tests `start`.
       - name: adhdev init (clean project)
         run: |
           mkdir -p /tmp/proj && cd /tmp/proj && git init -q
-          adhdev init --yes
+          adhdev init --yes --no-start
           test -d .adhdev && echo "init PASS" || { echo "init FAIL"; exit 1; }
 
       - name: adhdev start (board comes up)

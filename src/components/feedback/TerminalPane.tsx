@@ -168,6 +168,10 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
     const [connected, setConnected] = useState(false);
     const [isFocused, setIsFocused] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    // AD-370: the terminal server is up but node-pty failed to load on this
+    // machine. It sends a `terminal-unavailable` message in place of a shell;
+    // we hold the reason and render an explanatory panel instead of a dead pane.
+    const [terminalDown, setTerminalDown] = useState<string | null>(null);
     const [showResetModal, setShowResetModal] = useState(false);
     const [showPlacementMenu, setShowPlacementMenu] = useState(false);
     // AD-246: Claude Code's CLI condenses multi-line pastes into a tiny
@@ -451,6 +455,16 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                     } catch { /* options may be locked mid-write; ignore */ }
                 }
                 else if (msg.type === 'exit') { term.write('\r\n\x1b[33m[Session ended]\x1b[0m\r\n'); setConnected(false); }
+                // AD-370: server is up but has no PTY backend. Render the
+                // explanatory panel rather than leaving a blank, dead pane.
+                else if (msg.type === 'terminal-unavailable') {
+                    setTerminalDown(
+                        (typeof msg.reason === 'string' && msg.reason.trim())
+                            ? msg.reason.trim()
+                            : "node-pty (the terminal's native component) could not be loaded.",
+                    );
+                    setConnected(false);
+                }
             } catch {}
         };
         // AD-204 follow-up: an upgrade rejection (401 from the terminal server's
@@ -680,6 +694,7 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
     // ─── Reconnect ───────────────────────────────────────────────
     const handleReconnect = useCallback(() => {
         setError(null);
+        setTerminalDown(null);
         cleanupRef.current?.();
         cleanupRef.current = null;
         setTimeout(initTerminal, 100);
@@ -941,7 +956,44 @@ export function TerminalPane({ onClose, placement, onPlacementChange, activeProj
                 </div>
 
                 {/* Body */}
-                {error ? (
+                {terminalDown ? (
+                    // AD-370: node-pty didn't install on this machine. The board
+                    // is fully functional — this pane is the only thing affected,
+                    // so explain what happened, what still works, and the fix
+                    // instead of showing a blank/dead terminal.
+                    <div className="flex-1 overflow-auto p-5">
+                        <div className="max-w-md mx-auto text-left">
+                            <div className="flex items-center gap-2 mb-3">
+                                <svg className="w-4 h-4 text-vd-accent-gold flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                                </svg>
+                                <h3 className="text-[13px] font-semibold text-vd-text-primary">Embedded terminal unavailable on this machine</h3>
+                            </div>
+                            <p className="text-[11.5px] text-vd-text-secondary mb-3 leading-relaxed">
+                                The terminal&rsquo;s native component (<code className="text-vd-accent-gold">node-pty</code>) didn&rsquo;t install here, so the in-app terminal can&rsquo;t start.
+                            </p>
+                            <div className="text-[11.5px] text-vd-text-secondary mb-3 leading-relaxed">
+                                <span className="text-vd-text-primary font-medium">Everything else still works</span> — your board, tickets, comments, brain-dump, and the <span className="text-vd-text-primary font-medium">Run</span> button. Just run your coding agent in your <span className="text-vd-text-primary font-medium">own</span> terminal as usual; Run will hand you the prompt to paste.
+                            </div>
+                            <p className="text-[11px] text-vd-text-tertiary mb-1.5">To get the embedded terminal back:</p>
+                            <code className="text-[11px] bg-vd-bg-tertiary text-vd-accent-gold px-3 py-1.5 rounded block mb-2">npm rebuild node-pty</code>
+                            <p className="text-[10.5px] text-vd-text-tertiary mb-3 leading-relaxed">
+                                &hellip;or install your platform&rsquo;s build tools (C/C++ toolchain), then restart <code>adhdev</code>.{' '}
+                                <a
+                                    href="https://github.com/sameernoorani1/adhdev#the-embedded-terminal-wont-start"
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-vd-accent-gold underline hover:no-underline"
+                                >Troubleshooting&nbsp;&rarr;</a>
+                            </p>
+                            <details className="text-[10px] text-vd-text-tertiary mb-3">
+                                <summary className="cursor-pointer hover:text-vd-text-secondary">Technical detail</summary>
+                                <pre className="mt-1.5 whitespace-pre-wrap break-words bg-vd-bg-tertiary rounded p-2 text-vd-text-tertiary">{terminalDown}</pre>
+                            </details>
+                            <button onClick={handleReconnect} className="text-[10px] px-3 py-1 rounded bg-vd-accent-gold text-vd-text-inverse font-medium">Retry</button>
+                        </div>
+                    </div>
+                ) : error ? (
                     <div className="flex-1 flex items-center justify-center p-4">
                         <div className="text-center">
                             <p className="text-[12px] text-red-400 mb-2">{error}</p>

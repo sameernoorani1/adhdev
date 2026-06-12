@@ -1,0 +1,10 @@
+# AD-366: enforce LF for text/source so a Windows-developed repo never ships
+# CRLF to Unix users. The bin entrypoint (cli/index.mjs) shipped with a CRLF
+# shebang, which the macOS/Linux kernel parsed as interpreter `node\r` ->
+# `env: node\r: No such file or directory`. eol=lf makes Git store and check
+# out these files with LF regardless of the developer's core.autocrlf setting.
+*.mjs text eol=lf
+*.ts  text eol=lf
+*.tsx text eol=lf
+*.json text eol=lf
+*.md  text eol=lf

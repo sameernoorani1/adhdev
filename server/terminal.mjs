@@ -110,13 +110,27 @@ function applyCorsHeaders(req, res) {
 const SHELL = process.env.ADHDEV_SHELL
     || (process.platform === 'win32' ? 'cmd.exe' : (process.env.SHELL || '/bin/bash'));
 
-let pty;
+// AD-370: node-pty is a native module. On machines without a prebuilt binary
+// AND without build tools (node-gyp toolchain) — the exact non-engineer
+// audience, corporate proxies, unusual platforms — the import fails. We used to
+// `process.exit(1)` here, which silently killed the terminal server and made
+// the WHOLE board look broken even though kanban / comments / brain-dump / Run
+// all work fine without a PTY. Instead we DEGRADE: keep the HTTP+WS server up,
+// report `terminalAvailable: false` (+ reason) on /status, tell connecting WS
+// clients so they can render an explanatory panel, and let the Run button fall
+// back to "run your agent in your own terminal". PTY absence degrades one
+// feature, not the product.
+let pty = null;
+let terminalAvailable = true;
+let terminalUnavailableReason = null;
 try {
     pty = await import('node-pty');
 } catch (err) {
-    console.error('Failed to load node-pty:', err.message);
-    console.error('Install with: npm install node-pty');
-    process.exit(1);
+    terminalAvailable = false;
+    terminalUnavailableReason = (err && err.message) ? err.message : String(err);
+    console.error('[terminal] node-pty failed to load — embedded terminal disabled (the board still works).');
+    console.error('[terminal] reason:', terminalUnavailableReason);
+    console.error('[terminal] fix: run `npm rebuild node-pty` (or install your platform build tools), then restart `adhdev start`.');
 }
 
 const DEFAULT_PROJECT_ID = '__default__';
@@ -697,6 +711,10 @@ function createSessionState(projectId) {
 }
 
 function getOrCreateSession(projectId) {
+    // AD-370: no PTY backend — never attempt to spawn a shell. Callers
+    // (/execute, WS connect) gate on terminalAvailable before reaching here;
+    // this is the defensive backstop so a stray call can't throw.
+    if (!terminalAvailable || !pty) return null;
     const id = normalizeProjectId(projectId);
     const existing = sessions.get(id);
     if (existing?.shell) return existing;
@@ -827,6 +845,10 @@ function snapshotSessionStatus(session) {
             requestStartedAt: null,
             requestUpdatedAt: null,
             lastEvent: null,
+            // AD-370: surface PTY availability even with no session so the
+            // OnboardingWizard / Run pre-flight / TerminalPane can all react.
+            terminalAvailable,
+            terminalReason: terminalUnavailableReason,
             uiContext,
         };
     }
@@ -846,6 +868,8 @@ function snapshotSessionStatus(session) {
         requestUpdatedAt: session.requestState.updatedAt,
         lastEvent: session.requestState.lastEvent,
         projectId: session.projectId,
+        terminalAvailable,
+        terminalReason: terminalUnavailableReason,
         uiContext,
     };
 }
@@ -939,6 +963,15 @@ const httpServer = createServer((req, res) => {
                 if (!command) {
                     res.writeHead(400);
                     res.end(JSON.stringify({ error: 'Command required' }));
+                    return;
+                }
+
+                // AD-370: no PTY — can't run anything embedded. Return a clear,
+                // structured 503 so the Run path falls back to copy-the-prompt /
+                // run-in-your-own-terminal instead of throwing on a null shell.
+                if (!terminalAvailable) {
+                    res.writeHead(503, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'terminal-unavailable', reason: terminalUnavailableReason }));
                     return;
                 }
 
@@ -1160,6 +1193,15 @@ wss.on('connection', (ws, req) => {
     const projectId = normalizeProjectId(url.searchParams.get('project'));
     ws.projectId = projectId;
     if (!currentProjectId) currentProjectId = projectId;
+
+    // AD-370: degraded mode — no PTY backend. Tell the client so it renders the
+    // explanatory panel, then leave the socket open and idle (no shell to
+    // attach, no broadcast list to join). Not closing avoids a reconnect storm;
+    // the client treats this message as terminal — it stops showing "connecting".
+    if (!terminalAvailable) {
+        try { ws.send(JSON.stringify({ type: 'terminal-unavailable', reason: terminalUnavailableReason })); } catch {}
+        return;
+    }
 
     clients.add(ws);
     const session = getOrCreateSession(projectId);

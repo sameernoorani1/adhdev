@@ -72,6 +72,37 @@ A hosted cloud tier is on the roadmap for teams that want a shared board across 
 | Team boards, shared projects | — | ✅ |
 | Hosted runs (no local agent needed) | — | ✅ |
 
+## Troubleshooting
+
+### The embedded terminal won't start
+
+The in-app terminal uses [`node-pty`](https://github.com/microsoft/node-pty), a
+native module. It installs a prebuilt binary when one exists for your
+platform/Node version; otherwise npm compiles it with `node-gyp`, which needs a
+C/C++ build toolchain. On machines without a prebuilt binary **and** without
+build tools, that step fails and `node-pty` can't load.
+
+**This only affects the embedded terminal pane.** The rest of ADHDev works
+normally — board, tickets, comments, brain-dump, and the **Run** button (which
+hands you the prompt to paste). Just run your coding agent in your own terminal.
+
+To get the embedded terminal back, rebuild the native module:
+
+```bash
+npm rebuild node-pty
+```
+
+If that still fails, install your platform's build tools, then rebuild:
+
+- **macOS:** `xcode-select --install`
+- **Debian/Ubuntu:** `sudo apt-get install -y build-essential python3`
+- **Windows:** the "Desktop development with C++" workload from Visual Studio
+  Build Tools (most Windows setups ship a prebuilt binary and never hit this).
+
+Then restart `adhdev`; the pane's **Retry** button reconnects once the rebuild
+succeeds. The terminal server reports `{"terminalAvailable": false, "terminalReason": "..."}`
+at `http://localhost:3112/status` while it's degraded.
+
 ## Links
 
 - [GitHub Issues](https://github.com/sameernoorani1/adhdev/issues)

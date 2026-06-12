@@ -40,6 +40,11 @@ export async function GET(request: NextRequest) {
                 requestStartedAt: data.requestStartedAt || null,
                 requestUpdatedAt: data.requestUpdatedAt || null,
                 lastEvent: data.lastEvent || null,
+                // AD-370: forward PTY availability. Absent field => assume true
+                // (older terminal server / normal case where the embedded
+                // terminal works).
+                terminalAvailable: data.terminalAvailable !== false,
+                terminalReason: data.terminalReason || null,
             });
         }
 

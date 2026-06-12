@@ -8,6 +8,15 @@ const PHASE_DEVELOPMENT_SERVER = 'phase-development-server';
  */
 export default function nextConfig(phase) {
   return {
+    // AD-372: this package ships via full `next start` with the whole Next/React
+    // tree as runtime deps (~200MB+ global install). `output: 'standalone'` would
+    // emit a self-contained `.next/standalone` server bundle that drops the
+    // node_modules weight and cuts install size/time — a deliberate POST-LAUNCH
+    // optimization candidate, not enabled now (it changes the boot path and needs
+    // its own smoke test). Until it's enabled, `.next/standalone` is never
+    // produced, so it must NOT be listed in package.json `files` (npm silently
+    // skips missing entries, which hid this for a while).
+    // output: 'standalone',
     // Dev and prod-build use SEPARATE output dirs. `next dev` runs for hours and
     // holds `.next` (HMR writes + Windows file locks); when `npm pack` →
     // `next build` writes the SAME `.next`, the build's page-data collection

@@ -1,0 +1,80 @@
+name: install-smoke
+
+# AD-371: the CRLF-shebang bug (AD-366) was a CLASS, not an instance — a
+# Windows-developed repo shipping to a Unix-majority audience. A one-off
+# Codespace test fixes today; this clean-install smoke test on real macOS +
+# Linux runners fixes always. It packs the tarball exactly as `npm publish`
+# would, installs it globally, and exercises the published `adhdev` bin
+# (--version, init, start) the way a first-time user does. A CRLF shebang makes
+# the bin fail to launch on these runners, turning the matrix red.
+
+on: [push, workflow_dispatch]
+
+jobs:
+  smoke:
+    name: clean install · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Don't depend on adhdev.app/version.json being reachable from CI — the
+      # check fails open anyway (AD-369), but skipping it keeps the run
+      # deterministic and fast.
+      ADHDEV_NO_UPDATE_CHECK: '1'
+      # Headless runners: never try to pop a browser.
+      ADHDEV_NO_OPEN: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Pack tarball (runs prepack -> next build)
+        run: npm pack
+
+      - name: Global install from the tarball
+        run: npm i -g ./adhdev-board-*.tgz
+
+      # CRLF regression guard: assert the installed bin entrypoint is LF before
+      # we even run it. A `\r` in the shebang is exactly what broke every
+      # Mac/Linux install (AD-366); this turns such a regression red fast and
+      # unambiguously, with a clear message, rather than a cryptic spawn error.
+      - name: Assert bin entrypoint is LF (CRLF regression guard)
+        run: |
+          BIN="$(npm root -g)/adhdev-board/cli/index.mjs"
+          test -f "$BIN" || { echo "FAIL: bin not found at $BIN"; exit 1; }
+          node -e "const b=require('fs').readFileSync(process.argv[1]); if (b.includes('\r\n')) { console.error('FAIL: CRLF in bin entrypoint — Mac/Linux installs would break'); process.exit(1); } console.log('PASS: bin entrypoint is LF');" "$BIN"
+
+      - name: adhdev --version
+        run: |
+          V="$(adhdev --version)"
+          echo "adhdev --version => $V"
+          echo "$V" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+' && echo "version PASS" || { echo "version FAIL"; exit 1; }
+
+      - name: adhdev init (clean project)
+        run: |
+          mkdir -p /tmp/proj && cd /tmp/proj && git init -q
+          adhdev init --yes
+          test -d .adhdev && echo "init PASS" || { echo "init FAIL"; exit 1; }
+
+      - name: adhdev start (board comes up)
+        run: |
+          cd /tmp/proj
+          adhdev start --no-open > /tmp/adhdev-start.log 2>&1 &
+          START_PID=$!
+          ok=0
+          for i in $(seq 1 40); do
+            if curl -sf http://localhost:3111 > /dev/null; then ok=1; break; fi
+            sleep 2
+          done
+          echo "--- adhdev start log (tail) ---"
+          tail -n 40 /tmp/adhdev-start.log || true
+          kill "$START_PID" 2>/dev/null || true
+          if [ "$ok" = "1" ]; then echo "board PASS"; else echo "board FAIL"; exit 1; fi

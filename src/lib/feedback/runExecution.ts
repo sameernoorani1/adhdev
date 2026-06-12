@@ -52,6 +52,9 @@ interface TerminalAgentStatus {
     connected: boolean;
     agentActive: boolean;
     agentName: string | null;
+    // AD-370: false when the terminal server is up but node-pty failed to load
+    // (no embedded shell). Defaults true when the field is absent.
+    terminalAvailable: boolean;
 }
 
 async function getTerminalAgentStatus(projectId?: string | null): Promise<TerminalAgentStatus> {
@@ -73,7 +76,7 @@ async function getTerminalAgentStatus(projectId?: string | null): Promise<Termin
         clearTimeout(timeout);
 
         if (!res?.ok) {
-            return { connected: false, agentActive: false, agentName: null };
+            return { connected: false, agentActive: false, agentName: null, terminalAvailable: true };
         }
 
         const data = await res.json();
@@ -81,10 +84,30 @@ async function getTerminalAgentStatus(projectId?: string | null): Promise<Termin
             connected: true,
             agentActive: Boolean(data.agentActive),
             agentName: data.agentName || null,
+            // AD-370: absent => true (older server / normal PTY-works case).
+            terminalAvailable: data.terminalAvailable !== false,
         };
     } catch {
-        return { connected: false, agentActive: false, agentName: null };
+        return { connected: false, agentActive: false, agentName: null, terminalAvailable: true };
     }
+}
+
+// AD-370: shared fallback result for "terminal server is up but has no PTY".
+// The board still works; Run hands the user the prompt to paste into their own
+// terminal (the UI surfaces `prompt` + `guidance` and opens the pane, where the
+// explanatory panel is shown). Not a failure of the run — a degraded path.
+function terminalUnavailableResult(prompt: string, guidance: string[]): RunExecutionResult {
+    return {
+        success: false,
+        terminal: false,
+        agentReady: false,
+        agentName: null,
+        ticketIds: [],
+        prompt,
+        autoOpenTerminal: true,
+        message: "The embedded terminal isn't available on this machine (its native component didn't install). Copy the prompt below and run it with your coding agent in your own terminal.",
+        guidance,
+    };
 }
 
 export async function executeAgentPrompt(
@@ -123,6 +146,11 @@ export async function executeAgentPrompt(
             message: 'Terminal is not connected. Open the terminal pane and start your coding agent.',
             guidance,
         };
+    }
+
+    // AD-370: server is up but node-pty didn't load — fall back to copy-the-prompt.
+    if (terminalStatus.terminalAvailable === false) {
+        return terminalUnavailableResult(trimmedPrompt, guidance);
     }
 
     if (options.agentRequirement === 'required' && !terminalStatus.agentActive) {
@@ -234,6 +262,11 @@ export async function executeRunPrompt(ticketIds: string[], projectId?: string |
             message: 'Terminal is not connected. Open the terminal pane and start your coding agent.',
             guidance,
         };
+    }
+
+    // AD-370: server is up but node-pty didn't load — fall back to copy-the-prompt.
+    if (terminalStatus.terminalAvailable === false) {
+        return { ...terminalUnavailableResult(prompt, guidance), ticketIds: ids };
     }
 
     if (options.agentRequirement === 'required' && !terminalStatus.agentActive) {

@@ -45,6 +45,16 @@ function mockFetchThrowing() {
     return async () => { throw new Error('network down'); };
 }
 
+// AD-369: a fetch impl that never resolves on its own — it only settles when
+// the AbortController's timeout fires. Models a slow/black-holed endpoint and
+// lets us prove the timeout bounds the wait instead of hanging startup.
+function mockFetchHanging() {
+    return (_url, { signal } = {}) => new Promise((_resolve, reject) => {
+        if (signal?.aborted) return reject(new Error('aborted'));
+        signal?.addEventListener('abort', () => reject(new Error('aborted')));
+    });
+}
+
 describe('compareVersions', () => {
     it('returns 0 for equal versions', () => {
         expect(compareVersions('1.2.3', '1.2.3')).toBe(0);
@@ -117,6 +127,24 @@ describe('fetchManifest', () => {
         const r = await fetchManifest('https://x', DEFAULT_TIMEOUT_MS, undefined);
         expect(r).toBeNull();
     });
+    // AD-369: malformed JSON on a 200 — res.json() rejects. Must fail open (null),
+    // never throw out of fetchManifest.
+    it('returns null when the body is not valid JSON (200 but res.json() throws)', async () => {
+        const fetchImpl = async () => ({ ok: true, json: async () => { throw new SyntaxError('Unexpected token < in JSON'); } });
+        const r = await fetchManifest('https://x', DEFAULT_TIMEOUT_MS, fetchImpl);
+        expect(r).toBeNull();
+    });
+    // AD-369: a slow / black-holed endpoint must be aborted by the timeout and
+    // return null — never hang `adhdev start`. Proves the wait is bounded by
+    // timeoutMs (≤3s in production via DEFAULT_TIMEOUT_MS).
+    it('aborts a slow response via the timeout and returns null (never hangs)', async () => {
+        const start = Date.now();
+        const r = await fetchManifest('https://x', 30, mockFetchHanging());
+        const elapsed = Date.now() - start;
+        expect(r).toBeNull();
+        expect(elapsed).toBeGreaterThanOrEqual(20); // the abort timer fired
+        expect(elapsed).toBeLessThan(2000);          // and we did not hang
+    });
 });
 
 describe('checkVersion', () => {
@@ -179,6 +207,15 @@ describe('checkVersion', () => {
 
     it('fails open silently when fetch fails AND cache is empty', async () => {
         const r = await checkVersion({ ...baseOpts(), fetchImpl: mockFetchThrowing() });
+        expect(r.action).toBe('continue');
+        expect(r.features).toEqual(defaultFeatures());
+    });
+
+    // AD-369: a 404 (non-2xx) manifest must never block startup — the manifest
+    // being unreachable/absent is the expected pre-launch state and must fail open.
+    it('fails open (continue) on a 404 / non-2xx manifest', async () => {
+        const fetchImpl = mockFetch({}, { ok: false });
+        const r = await checkVersion({ ...baseOpts(), fetchImpl });
         expect(r.action).toBe('continue');
         expect(r.features).toEqual(defaultFeatures());
     });

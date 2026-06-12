@@ -747,29 +747,36 @@ async function start() {
     stdio: 'inherit',
   });
 
-  // Auto-open browser once ready — single attempt via polling
+  // Auto-open browser once ready — single attempt via polling. AD-371: skipped
+  // with `--no-open` (or ADHDEV_NO_OPEN=1) so headless / CI / scripted installs
+  // never spawn `open` / `xdg-open` where there's no browser to receive it. The
+  // CI install-smoke job relies on this to boot the board without a GUI attempt.
+  const noOpen = args.includes('--no-open') || process.env.ADHDEV_NO_OPEN === '1';
   let opened = false;
   let checking = false;
-  const http = await import('http');
-  const openInterval = setInterval(() => {
-    if (opened || checking) return;
-    checking = true;
-    const req = http.default.get(`http://localhost:${port}/api/projects`, (res) => {
-      checking = false;
-      if (opened) return;
-      if (res.statusCode === 200) {
-        opened = true;
-        clearInterval(openInterval);
-        try {
-          const openCmd = process.platform === 'win32' ? 'start ""' : process.platform === 'darwin' ? 'open' : 'xdg-open';
-          execSync(`${openCmd} http://localhost:${port}`, { stdio: 'ignore' });
-        } catch { /* fine */ }
-      }
-    });
-    req.on('error', () => { checking = false; });
-    req.end();
-  }, 2000);
-  setTimeout(() => clearInterval(openInterval), 30000);
+  let openInterval = null;
+  if (!noOpen) {
+    const http = await import('http');
+    openInterval = setInterval(() => {
+      if (opened || checking) return;
+      checking = true;
+      const req = http.default.get(`http://localhost:${port}/api/projects`, (res) => {
+        checking = false;
+        if (opened) return;
+        if (res.statusCode === 200) {
+          opened = true;
+          clearInterval(openInterval);
+          try {
+            const openCmd = process.platform === 'win32' ? 'start ""' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+            execSync(`${openCmd} http://localhost:${port}`, { stdio: 'ignore' });
+          } catch { /* fine */ }
+        }
+      });
+      req.on('error', () => { checking = false; });
+      req.end();
+    }, 2000);
+    setTimeout(() => clearInterval(openInterval), 30000);
+  }
 
   // Clean shutdown — kill both processes
   const cleanup = () => {
@@ -922,10 +929,13 @@ function showHelp() {
   console.log('    init [path]     Initialize ADHDev in a project (default: current dir)');
   console.log('                    Prompts for project name, ticket prefix, and seed tickets.');
   console.log('                    Flags: --name=X --prefix=X --no-seed --no-start -y/--yes');
+  console.log('    start           Start the board (same as running `adhdev` with no args)');
+  console.log('                    Flags: -y/--yes (non-interactive)  --no-open (don\'t open a browser)');
   console.log('    add <path>      Register an existing project');
   console.log('    list            Show all registered projects');
   console.log('    switch <name>   Switch active project');
   console.log('    status          Show active project summary');
+  console.log('    --version       Print the installed version');
   console.log('    help            Show this help');
   console.log('');
   console.log('  Run `adhdev` with no arguments to start the board.\n');
@@ -938,6 +948,18 @@ switch (command) {
   case 'switch': case 'use': switchProject(); break;
   case 'status': status(); break;
   case 'help': case '--help': case '-h': showHelp(); break;
+  // AD-371: `--version`/`-v`/`version` print the package version and exit 0.
+  // The clean-install smoke test runs `adhdev --version` as its first liveness
+  // check; before this it fell through to the "unknown command" default and
+  // exited 1. No network/version-manifest call — just the local version.
+  case '--version': case '-v': case 'version':
+    console.log(getPackageVersion() || 'unknown');
+    break;
+  // AD-371: `adhdev start` is the documented quick-start command (README) and
+  // the smoke test boots with it, but there was no explicit case — only the
+  // bare-`adhdev` (command === undefined) path started the board, so
+  // `adhdev start` hit the default and errored. Alias it to start().
+  case 'start': start(); break;
   case undefined: start(); break;
   default:
     console.log(`  Unknown command: ${command}. Run 'adhdev help' for usage.`);

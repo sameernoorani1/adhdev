@@ -52,9 +52,20 @@ You queue the next ticket. Review the last one. Look at the bug from yesterday. 
 
 ## Local-first
 
-Your data stays in your repo. No accounts. No cloud. No telemetry about how you use the board.
+Your data stays in your repo. No accounts. No cloud. **We never see your board content, tickets, code, or file paths.**
 
-One exception: the app checks for new versions on startup so we can ship security fixes. That check is a single GET to a static manifest file. No user data, no board content, no analytics. Set `ADHDEV_NO_UPDATE_CHECK=1` to turn it off entirely.
+On startup the app makes a single request to a version manifest (so we can ship updates and security fixes, and flip a killswitch if a release is broken). That request carries a small amount of **anonymous** diagnostic data:
+
+- a random install ID (generated locally, not tied to you or your machine name),
+- the app version, your OS / architecture, and Node version,
+- the coarse location your network IP resolves to — the same thing every website you visit already sees.
+
+It's used only for aggregate counts: how many installs are out there, which versions and platforms are in use. **No board content, no tickets, no code, no file paths, no accounts — and we never track what you do inside the board.**
+
+Opt out any time:
+
+- `ADHDEV_NO_ANALYTICS=1` — drops the anonymous diagnostics (still checks for updates).
+- `ADHDEV_NO_UPDATE_CHECK=1` — turns off the startup request entirely.
 
 ## Free vs paid
 

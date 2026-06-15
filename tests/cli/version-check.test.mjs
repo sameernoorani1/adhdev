@@ -17,6 +17,8 @@ import {
     writeFeatureFlags,
     defaultFeatures,
     checkVersion,
+    getOrCreateInstallId,
+    telemetryHeaders,
     DEFAULT_CACHE_TTL_MS,
     DEFAULT_TIMEOUT_MS,
 } from '../../cli/version-check.mjs';
@@ -257,5 +259,76 @@ describe('checkVersion', () => {
         // is too thin to be worth a separate test.)
         const r = await checkVersion({ ...baseOpts(), noUpdateCheck: true });
         expect(r.action).toBe('continue');
+    });
+});
+
+// AD-373 follow-up: anonymous install telemetry on the version check.
+describe('install telemetry', () => {
+    const installIdPath = () => join(tmp, 'install-id');
+
+    // A fetch impl that records the headers it was called with so we can assert
+    // exactly what the diagnostics carry.
+    function recordingFetch(manifest) {
+        const calls = [];
+        const impl = async (_url, opts = {}) => {
+            calls.push(opts.headers || {});
+            return { ok: true, json: async () => manifest };
+        };
+        impl.calls = calls;
+        return impl;
+    }
+
+    const MANIFEST = { latest: '0.2.0', minimum_supported: '0.1.0', killswitch: false };
+
+    it('getOrCreateInstallId creates a well-formed id and reuses it', () => {
+        const p = installIdPath();
+        const a = getOrCreateInstallId(p);
+        expect(a).toMatch(/^[a-z0-9-]{8,64}$/i);
+        expect(existsSync(p)).toBe(true);
+        expect(getOrCreateInstallId(p)).toBe(a); // stable across calls
+    });
+
+    it('telemetryHeaders carries id/version/platform and nothing identifying', () => {
+        const h = telemetryHeaders({ currentVersion: '0.2.0', installIdPath: installIdPath() });
+        expect(h['x-adhdev-install']).toMatch(/^[a-z0-9-]{8,64}$/i);
+        expect(h['x-adhdev-version']).toBe('0.2.0');
+        expect(h['x-adhdev-platform']).toBe(process.platform);
+        expect(h['User-Agent']).toContain('adhdev-board/0.2.0');
+    });
+
+    it('sends anonymous diagnostics on a cold-cache fetch', async () => {
+        const fetchImpl = recordingFetch(MANIFEST);
+        await checkVersion({
+            currentVersion: '0.2.0',
+            cachePath: cachePath(), featuresPath: featuresPath(), installIdPath: installIdPath(),
+            fetchImpl,
+        });
+        expect(fetchImpl.calls.length).toBe(1);
+        expect(fetchImpl.calls[0]['x-adhdev-install']).toBeTruthy();
+        expect(fetchImpl.calls[0]['x-adhdev-version']).toBe('0.2.0');
+    });
+
+    it('omits diagnostics (and never writes an install-id) when noAnalytics is set', async () => {
+        const fetchImpl = recordingFetch(MANIFEST);
+        await checkVersion({
+            currentVersion: '0.2.0',
+            noAnalytics: true,
+            cachePath: cachePath(), featuresPath: featuresPath(), installIdPath: installIdPath(),
+            fetchImpl,
+        });
+        expect(fetchImpl.calls.length).toBe(1); // still checks for updates
+        expect(fetchImpl.calls[0]['x-adhdev-install']).toBeUndefined();
+        expect(existsSync(installIdPath())).toBe(false);
+    });
+
+    it('sends no request at all when noUpdateCheck is set', async () => {
+        const fetchImpl = recordingFetch(MANIFEST);
+        await checkVersion({
+            currentVersion: '0.2.0',
+            noUpdateCheck: true,
+            cachePath: cachePath(), featuresPath: featuresPath(), installIdPath: installIdPath(),
+            fetchImpl,
+        });
+        expect(fetchImpl.calls.length).toBe(0);
     });
 });

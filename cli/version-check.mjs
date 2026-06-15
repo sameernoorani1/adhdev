@@ -16,6 +16,8 @@ export const DEFAULT_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 export const DEFAULT_TIMEOUT_MS = 3000;
 const DEFAULT_CACHE_PATH = join(homedir(), '.adhdev', 'manifest-cache.json');
 const DEFAULT_FEATURES_PATH = join(homedir(), '.adhdev', 'features.json');
+const DEFAULT_INSTALL_ID_PATH = join(homedir(), '.adhdev', 'install-id');
+export { DEFAULT_INSTALL_ID_PATH };
 
 // Hardcoded defaults — used when no manifest is available.
 // All flags default to false so absence-of-manifest never lights up a feature.
@@ -87,16 +89,63 @@ export function writeFeatureFlags(featuresPath, features) {
     }
 }
 
+// AD-373 follow-up: anonymous install identifier. Random, persisted once to
+// ~/.adhdev/install-id, never tied to any account or board content. Lets the
+// version manifest endpoint count DISTINCT installs (vs raw requests) and break
+// them down by version/platform. Only generated/sent when analytics is enabled
+// (see telemetryHeaders / ADHDEV_NO_ANALYTICS). Best-effort: if the file can't
+// be written, returns an ephemeral id so a single run still reports.
+export function getOrCreateInstallId(installIdPath = DEFAULT_INSTALL_ID_PATH) {
+    const genId = () => {
+        try {
+            if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+                return globalThis.crypto.randomUUID();
+            }
+        } catch { /* fall through */ }
+        return `inst-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    };
+    try {
+        if (existsSync(installIdPath)) {
+            const id = String(readFileSync(installIdPath, 'utf-8')).trim();
+            if (/^[a-z0-9-]{8,64}$/i.test(id)) return id;
+        }
+    } catch { /* unreadable → regenerate */ }
+    const id = genId();
+    try {
+        ensureParentDir(installIdPath);
+        writeFileSync(installIdPath, id, 'utf-8');
+    } catch { /* ephemeral for this run if the write fails */ }
+    return id;
+}
+
+// Build the anonymous diagnostic headers sent on the version check. NO board
+// content, tickets, code, file paths, or account data — just install id, app
+// version, and runtime platform. Geo is derived server-side from the request IP
+// (same as any web request), never sent from here.
+export function telemetryHeaders({ currentVersion, installIdPath = DEFAULT_INSTALL_ID_PATH } = {}) {
+    const node = (process.versions && process.versions.node) || '';
+    const headers = {
+        'x-adhdev-install': getOrCreateInstallId(installIdPath),
+        'x-adhdev-platform': process.platform,
+        'x-adhdev-arch': process.arch,
+        'x-adhdev-node': node,
+        'User-Agent': `adhdev-board/${currentVersion || '?'} (${process.platform}; ${process.arch}; node ${node || '?'})`,
+    };
+    if (currentVersion) headers['x-adhdev-version'] = currentVersion;
+    return headers;
+}
+
 // Returns the parsed manifest object, or null on any failure. Hard 3s timeout
-// by default. Caller is responsible for caching.
-export async function fetchManifest(url, timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl = globalThis.fetch) {
+// by default. Caller is responsible for caching. `extraHeaders` carries the
+// anonymous diagnostics (empty when analytics is opted out).
+export async function fetchManifest(url, timeoutMs = DEFAULT_TIMEOUT_MS, fetchImpl = globalThis.fetch, extraHeaders = {}) {
     if (typeof fetchImpl !== 'function') return null;
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
     try {
         const res = await fetchImpl(url, {
             signal: ac.signal,
-            headers: { 'Accept': 'application/json' },
+            headers: { 'Accept': 'application/json', ...extraHeaders },
         });
         if (!res || !res.ok) return null;
         const data = await res.json();
@@ -120,8 +169,12 @@ export async function checkVersion({
     currentVersion,
     manifestUrl = process.env.ADHDEV_MANIFEST_URL || DEFAULT_MANIFEST_URL,
     noUpdateCheck = process.env.ADHDEV_NO_UPDATE_CHECK === '1',
+    // AD-373 follow-up: drop the anonymous diagnostics but still check for
+    // updates. ADHDEV_NO_UPDATE_CHECK=1 (above) disables the request entirely.
+    noAnalytics = process.env.ADHDEV_NO_ANALYTICS === '1',
     cachePath = DEFAULT_CACHE_PATH,
     featuresPath = DEFAULT_FEATURES_PATH,
+    installIdPath = DEFAULT_INSTALL_ID_PATH,
     cacheTtlMs = DEFAULT_CACHE_TTL_MS,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     fetchImpl = globalThis.fetch,
@@ -139,7 +192,11 @@ export async function checkVersion({
     let manifest = readCachedManifest(cachePath, cacheTtlMs, now);
 
     if (!manifest) {
-        manifest = await fetchManifest(manifestUrl, timeoutMs, fetchImpl);
+        // Build telemetry headers only when we actually hit the network (cold
+        // cache) and analytics isn't opted out — so a cache-hit run never even
+        // touches the install-id file.
+        const extraHeaders = noAnalytics ? {} : telemetryHeaders({ currentVersion, installIdPath });
+        manifest = await fetchManifest(manifestUrl, timeoutMs, fetchImpl, extraHeaders);
         if (manifest) writeCachedManifest(cachePath, manifest, now);
     }
 

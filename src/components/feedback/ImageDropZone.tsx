@@ -38,6 +38,55 @@ function getFileIcon(filename: string): string {
     return '📎';
 }
 
+// AD-374: caption UX. The old caption field was a permanent 64px-wide, 9px-font
+// input glued under every thumbnail — too small to read what you typed and
+// visually noisy across a strip of screenshots. This replaces it with a
+// click-to-edit affordance: collapsed it shows the caption (or a muted
+// "+ caption" prompt) sized to the thumbnail; clicking expands a readable,
+// properly-sized input that commits on blur / Enter / Escape. Same `caption`
+// data model — purely a presentation change, shared by every ImageDropZone
+// caller (New Ticket modal, comments, etc.).
+function CaptionEditor({ caption, editing, onStartEdit, onChange, onFinish, collapsedClassName }: {
+    caption: string;
+    editing: boolean;
+    onStartEdit: () => void;
+    onChange: (value: string) => void;
+    onFinish: () => void;
+    collapsedClassName: string;
+}) {
+    if (editing) {
+        return (
+            <input
+                autoFocus
+                value={caption}
+                onChange={(e) => onChange(e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                onBlur={onFinish}
+                onKeyDown={(e) => {
+                    // Enter / Escape commit and close — the value is already
+                    // live via onChange, so blur is all that's needed.
+                    if (e.key === 'Enter' || e.key === 'Escape') {
+                        e.preventDefault();
+                        (e.target as HTMLInputElement).blur();
+                    }
+                }}
+                placeholder="Describe this screenshot…"
+                className="w-44 max-w-[60vw] text-[11px] bg-vd-bg-input border border-vd-border rounded px-2 py-1 text-vd-text-primary placeholder-vd-text-tertiary/60 outline-none focus:border-vd-accent-gold"
+            />
+        );
+    }
+    return (
+        <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onStartEdit(); }}
+            title={caption || 'Add a caption'}
+            className={`block text-left text-[10px] truncate transition-colors ${collapsedClassName} ${caption ? 'text-vd-text-secondary hover:text-vd-text-primary' : 'text-vd-text-tertiary/70 hover:text-vd-accent-gold'}`}
+        >
+            {caption || '+ caption'}
+        </button>
+    );
+}
+
 // AD-314: per-file placeholder shown in the thumbnail strip while an upload
 // is in flight. `previewUrl` is an object URL we synthesize from the source
 // File so the user sees the picture immediately on paste/drop, with a spinner
@@ -54,6 +103,9 @@ export function ImageDropZone({ images, onImagesChange, onImageClick, maxImages 
     const [isDragOver, setIsDragOver] = useState(false);
     const [uploading, setUploading] = useState(false);
     const [pending, setPending] = useState<PendingUpload[]>([]);
+    // AD-374: which attachment's caption is currently being edited (index), or
+    // null. Click-to-edit so the strip stays compact until you choose to caption.
+    const [editingCaption, setEditingCaption] = useState<number | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const uploadFile = useCallback(async (file: File): Promise<UploadedFile | null> => {
@@ -149,6 +201,15 @@ export function ImageDropZone({ images, onImagesChange, onImageClick, maxImages 
 
     const removeFile = useCallback((index: number) => {
         onImagesChange(images.filter((_, i) => i !== index));
+        // AD-374: dropping a file invalidates the editing index — close the editor.
+        setEditingCaption(null);
+    }, [images, onImagesChange]);
+
+    // AD-374: commit a caption edit for attachment `index`.
+    const setCaption = useCallback((index: number, value: string) => {
+        const updated = [...images];
+        updated[index] = { ...updated[index], caption: value };
+        onImagesChange(updated);
     }, [images, onImagesChange]);
 
     return (
@@ -175,16 +236,13 @@ export function ImageDropZone({ images, onImagesChange, onImageClick, maxImages 
                                         ×
                                     </button>
                                 </div>
-                                <input
-                                    value={file.caption || ''}
-                                    onChange={(e) => {
-                                        const updated = [...images];
-                                        updated[i] = { ...updated[i], caption: e.target.value };
-                                        onImagesChange(updated);
-                                    }}
-                                    onClick={(e) => e.stopPropagation()}
-                                    placeholder="Caption..."
-                                    className="w-16 text-[9px] bg-transparent border-b border-vd-border text-vd-text-tertiary placeholder-vd-text-tertiary/50 outline-none focus:border-vd-accent-gold"
+                                <CaptionEditor
+                                    caption={file.caption || ''}
+                                    editing={editingCaption === i}
+                                    onStartEdit={() => setEditingCaption(i)}
+                                    onChange={(v) => setCaption(i, v)}
+                                    onFinish={() => setEditingCaption(null)}
+                                    collapsedClassName="w-16"
                                 />
                             </div>
                         ) : (
@@ -201,16 +259,13 @@ export function ImageDropZone({ images, onImagesChange, onImageClick, maxImages 
                                         ×
                                     </button>
                                 </div>
-                                <input
-                                    value={file.caption || ''}
-                                    onChange={(e) => {
-                                        const updated = [...images];
-                                        updated[i] = { ...updated[i], caption: e.target.value };
-                                        onImagesChange(updated);
-                                    }}
-                                    onClick={(e) => e.stopPropagation()}
-                                    placeholder="Caption..."
-                                    className="w-full max-w-[180px] text-[9px] bg-transparent border-b border-vd-border text-vd-text-tertiary placeholder-vd-text-tertiary/50 outline-none focus:border-vd-accent-gold"
+                                <CaptionEditor
+                                    caption={file.caption || ''}
+                                    editing={editingCaption === i}
+                                    onStartEdit={() => setEditingCaption(i)}
+                                    onChange={(v) => setCaption(i, v)}
+                                    onFinish={() => setEditingCaption(null)}
+                                    collapsedClassName="w-full max-w-[180px]"
                                 />
                             </div>
                         );

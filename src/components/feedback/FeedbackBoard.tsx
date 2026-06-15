@@ -1100,16 +1100,20 @@ export function FeedbackBoard({ embedded = false }: { embedded?: boolean }) {
         const explicit = params.get('wizard') === 'onboarding';
         const firstRun = !onboardingState.wizardCompleted && !onboardingState.welcomeSeen;
         if (explicit || firstRun) {
-            // AD-363: `adhdev init` already created the project we're looking at, so
-            // the wizard's Step 1 "Pick a folder" is a redundant second ask. When the
-            // active project already has a folder, pre-fill it and jump straight to
-            // "Connect an agent" (Step 2). Explicit replays (?wizard=onboarding) and
-            // the genuine no-project first-install case still start at Step 1.
+            // AD-363 / AD-373: `adhdev init` already created the project we're
+            // looking at, so re-typing the folder in Step 1 is redundant. PRE-FILL it
+            // (folderSource = existing + the known path) so Step 1 shows the project
+            // already chosen and validated — one click of Next.
+            // AD-373 fix: do NOT auto-jump to Step 2. The previous AD-363 behavior
+            // (setOnboardingWizardStartStep(2)) opened the wizard on "Step 2 of 4"
+            // under the "Welcome to ADHDev" header, which read as starting in the
+            // middle of the tutorial (Sameer's sandbox report). Starting at Step 1
+            // pre-filled keeps AD-363's no-re-ask intent while fixing the
+            // "didn't start at the welcome" regression.
             if (!explicit) {
                 const activeProject = projects.find(p => p.id === activeProjectId);
                 if (activeProject?.path) {
                     setOnboardingState(prev => ({ ...prev, folderPath: activeProject.path, folderSource: 'existing' }));
-                    setOnboardingWizardStartStep(prev => prev ?? 2);
                 }
             }
             setShowOnboardingWizard(true);
